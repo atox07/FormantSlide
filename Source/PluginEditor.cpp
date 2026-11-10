@@ -14,7 +14,13 @@ FormantSlideAudioProcessorEditor::FormantSlideAudioProcessorEditor(FormantSlideA
     mode.addItem("Channels 3-16", 2);
     glide.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     glide.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 85, 22);
-    for (auto* c : { static_cast<juce::Component*>(&loadButton), &fileLabel, &modeLabel, &glideLabel, &warningLabel, &mode, &glide }) addAndMakeVisible(c);
+    addAndMakeVisible(loadButton);
+    addAndMakeVisible(fileLabel);
+    addAndMakeVisible(modeLabel);
+    addAndMakeVisible(glideLabel);
+    addAndMakeVisible(warningLabel);
+    addAndMakeVisible(mode);
+    addAndMakeVisible(glide);
     modeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(p.parameters, "slideMode", mode);
     glideAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(p.parameters, "glideMs", glide);
     loadButton.onClick = [this]
