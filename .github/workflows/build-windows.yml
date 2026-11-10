@@ -1,21 +1,42 @@
-name: Build FormantSlide VST3 (Windows)
+name: Build FormantSlide FL Native (Windows)
+
 on:
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: windows-2022
+    permissions:
+      contents: read
     steps:
-      - name: Checkout
+      - name: Checkout source and SDK
         uses: actions/checkout@v4
-      - name: Configure JUCE and project
+
+      - name: Verify SDK is present
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'SDK/fp_plugclass.h')) {
+            throw 'SDK folder missing. Copy SDK/ from the FL Studio SDK template ZIP into the repository root.'
+          }
+
+      - name: Configure Windows native plugin
         shell: pwsh
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
-      - name: Build VST3
+
+      - name: Build FormantSlide native DLL
         shell: pwsh
-        run: cmake --build build --config Release --target FormantSlide_VST3 --parallel 2
-      - name: Upload plugin
+        run: cmake --build build --config Release --target FormantSlideNative --parallel 2
+
+      - name: Verify DLL exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'build/Release/FormantSlide_x64.dll')) {
+            throw 'FormantSlide_x64.dll was not produced at the expected location.'
+          }
+
+      - name: Upload native plugin
         uses: actions/upload-artifact@v4
         with:
-          name: FormantSlide-Windows-VST3
-          path: build/FormantSlide_artefacts/Release/VST3/*.vst3/**
+          name: FormantSlide-FL-Native-Windows
+          path: build/Release/FormantSlide_x64.dll
           if-no-files-found: error

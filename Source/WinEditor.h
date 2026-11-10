@@ -1,28 +1,22 @@
 #pragma once
+#include <memory>
 #include <windows.h>
-#include <string>
 
+namespace juce { class ScopedJuceInitialiser_GUI; }
 class FormantSlideNative;
+class FormantSlideView;
 
-class NativeEditor {
+// JUCE-rendered editor, hosted as a child HWND by the native FL Studio SDK.
+class NativeEditor final {
 public:
-    explicit NativeEditor(FormantSlideNative& plugin) : plugin_(plugin) {}
+    explicit NativeEditor(FormantSlideNative& plugin);
     ~NativeEditor();
-    void show(HWND parent);
+    HWND show(HWND parent);
     void hide();
     void close();
-    HWND handle() const { return window_; }
+    HWND handle() const;
 private:
     FormantSlideNative& plugin_;
-    HWND window_ = nullptr;
-    HWND wavLabel_ = nullptr, midiLabel_ = nullptr, statusLabel_ = nullptr;
-    HWND sliceMode_ = nullptr, sliceCount_ = nullptr, root_ = nullptr;
-    HWND slideMode_ = nullptr, fallback_ = nullptr, offset_ = nullptr;
-    static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM w, LPARAM l);
-    LRESULT onMessage(UINT message, WPARAM w, LPARAM l);
-    void createWidgets();
-    void syncUi();
-    void saveUi();
-    void browse(bool midi);
-    void dropFile(const std::wstring& path);
+    std::unique_ptr<juce::ScopedJuceInitialiser_GUI> juceLifetime_;
+    std::unique_ptr<FormantSlideView> view_;
 };

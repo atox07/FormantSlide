@@ -1,193 +1,351 @@
 #include "WinEditor.h"
 #include "FormantSlideNative.h"
+#include <juce_audio_utils/juce_audio_utils.h>
 #include <algorithm>
-#include <commdlg.h>
-#include <cwctype>
-#include <filesystem>
-#include <mutex>
-#include <shellapi.h>
-#include <string>
+#include <cmath>
+#include <memory>
+#include <vector>
 
 namespace {
-constexpr wchar_t kClass[] = L"FormantSlideNativeEditorV1";
-enum Ids { LoadWav = 101, LoadMidi, SliceMode, SliceCount, Root,
-           SlideMode, Fallback, Offset };
-HFONT textFont() { return static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)); }
-HWND child(HWND parent, const wchar_t* cls, const wchar_t* label,
-           DWORD style, int x, int y, int w, int h, int id = 0) {
-    HWND ctl = CreateWindowExW(0, cls, label, WS_CHILD | WS_VISIBLE | style,
-                              x, y, w, h, parent,
-                              reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                              GetModuleHandleW(nullptr), nullptr);
-    SendMessageW(ctl, WM_SETFONT, reinterpret_cast<WPARAM>(textFont()), TRUE);
-    return ctl;
-}
-int number(HWND edit, int fallback) {
-    wchar_t text[64]{};
-    GetWindowTextW(edit, text, 63);
-    wchar_t* end = nullptr;
-    const long result = wcstol(text, &end, 10);
-    return end == text ? fallback : static_cast<int>(result);
-}
-void numberText(HWND ctl, int v) { SetWindowTextW(ctl, std::to_wstring(v).c_str()); }
+constexpr int editorWidth = 760;
+constexpr int editorHeight = 520;
+
+juce::String fileName(const std::wstring& path) {
+    return path.empty() ? juce::String() : juce::String(path.c_str());
 }
 
+void setLabel(juce::Label& label, const juce::String& value) {
+    label.setText(value, juce::dontSendNotification);
+    label.setColour(juce::Label::textColourId, juce::Colour(0xffbed0e2));
+}
+}
+
+// Matches the graphical editor of the v0.2 VST3, without requiring a VST wrapper.
+class FormantSlideView final : public juce::Component,
+                             public juce::FileDragAndDropTarget,
+                             private juce::ChangeListener {
+public:
+    explicit FormantSlideView(FormantSlideNative& native)
+        : plugin_(native), thumbnail_(256, thumbnailFormats_, cache_) {
+        setOpaque(true);
+        setSize(editorWidth, editorHeight);
+        thumbnailFormats_.registerBasicFormats();
+        thumbnail_.addChangeListener(this);
+
+        theme_.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff2d4560));
+        theme_.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff273449));
+        theme_.setColour(juce::ComboBox::textColourId, juce::Colours::white);
+        theme_.setColour(juce::Slider::thumbColourId, juce::Colour(0xff74c9ff));
+        theme_.setColour(juce::Slider::trackColourId, juce::Colour(0xff3979b8));
+        theme_.setColour(juce::Slider::textBoxTextColourId, juce::Colours::white);
+        theme_.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour(0xff273449));
+        setLookAndFeel(&theme_);
+
+        addAndMakeVisible(loadButton_);
+        addAndMakeVisible(loadMidiButton_);
+        addAndMakeVisible(wavLabel_);
+        addAndMakeVisible(midiLabel_);
+        addAndMakeVisible(modeLabel_);
+        addAndMakeVisible(sliceModeLabel_);
+        addAndMakeVisible(countLabel_);
+        addAndMakeVisible(rootLabel_);
+        addAndMakeVisible(glideLabel_);
+        addAndMakeVisible(offsetLabel_);
+        addAndMakeVisible(statusLabel_);
+        addAndMakeVisible(warningLabel_);
+        addAndMakeVisible(mode_);
+        addAndMakeVisible(sliceMode_);
+        addAndMakeVisible(count_);
+        addAndMakeVisible(root_);
+        addAndMakeVisible(glide_);
+        addAndMakeVisible(offset_);
+
+        setLabel(modeLabel_, "Slide MIDI channels");
+        setLabel(sliceModeLabel_, "Slicer");
+        setLabel(countLabel_, "Equal divisions");
+        setLabel(rootLabel_, "First slice MIDI note");
+        setLabel(glideLabel_, "Fallback glide (ms)");
+        setLabel(offsetLabel_, "FL note calibration");
+        setLabel(warningLabel_, "Native slides: FL pitch curve  |  Color slides: SDK length / imported MIDI");
+        warningLabel_.setJustificationType(juce::Justification::centred);
+        warningLabel_.setColour(juce::Label::textColourId, juce::Colour(0xffffb65c));
+        wavLabel_.setJustificationType(juce::Justification::centredLeft);
+        midiLabel_.setJustificationType(juce::Justification::centredLeft);
+        midiLabel_.setColour(juce::Label::textColourId, juce::Colour(0xff8aa5be));
+        statusLabel_.setJustificationType(juce::Justification::centredLeft);
+
+        mode_.addItem("Channel 5", 1);
+        mode_.addItem("Channels 3-16", 2);
+        sliceMode_.addItem("Detect silence", 1);
+        sliceMode_.addItem("Equal divisions", 2);
+
+        for (auto* slider : { &count_, &root_, &glide_, &offset_ }) {
+            slider->setSliderStyle(juce::Slider::LinearHorizontal);
+            slider->setTextBoxStyle(juce::Slider::TextBoxRight, false, 54, 24);
+        }
+        count_.setRange(1.0, 64.0, 1.0);
+        root_.setRange(0.0, 127.0, 1.0);
+        glide_.setRange(10.0, 2000.0, 1.0);
+        offset_.setRange(-24.0, 24.0, 1.0);
+
+        loadButton_.onClick = [this] { choose(false); };
+        loadMidiButton_.onClick = [this] { choose(true); };
+        mode_.onChange = [this] { pushSettings(); };
+        sliceMode_.onChange = [this] { pushSettings(); };
+        count_.onValueChange = [this] { pushSettings(); };
+        root_.onValueChange = [this] { pushSettings(); };
+        glide_.onValueChange = [this] { pushSettings(); };
+        offset_.onValueChange = [this] { pushSettings(); };
+
+        pullSettings();
+        refreshFilePreview();
+        const auto saved = plugin_.display();
+        if (!saved.wavFullPath.empty()) {
+            juce::File existing(juce::String(saved.wavFullPath.c_str()));
+            if (existing.existsAsFile()) thumbnail_.setSource(new juce::FileInputSource(existing));
+        }
+        refreshStatus();
+    }
+
+    ~FormantSlideView() override {
+        thumbnail_.removeChangeListener(this);
+        setLookAndFeel(nullptr);
+    }
+
+    void paint(juce::Graphics& g) override {
+        g.fillAll(juce::Colour(0xff171c25));
+        g.setColour(juce::Colours::white);
+        g.setFont(juce::FontOptions(28.f, juce::Font::bold));
+        g.drawText("FormantSlide", 20, 14, editorWidth - 40, 35, juce::Justification::centred);
+        g.setFont(juce::FontOptions(13.f));
+        g.setColour(juce::Colour(0xff91a8bd));
+        g.drawText("CHROMATIC SLICER / MIDI SLIDES / FORMANT COMPENSATION", 20, 53,
+                   editorWidth - 40, 20, juce::Justification::centred);
+
+        g.setColour(juce::Colour(0xff233044));
+        g.fillRoundedRectangle(waveBounds_.toFloat(), 7.f);
+        if (thumbnail_.getTotalLength() > 0) {
+            g.setColour(juce::Colour(0xff74c9ff));
+            thumbnail_.drawChannels(g, waveBounds_.reduced(4), 0.0,
+                                    thumbnail_.getTotalLength(), 0.85f);
+        } else {
+            g.setColour(juce::Colour(0xff91a8bd));
+            g.drawFittedText("Load a chromatic-scale WAV to see slices", waveBounds_,
+                             juce::Justification::centred, 1);
+        }
+        const auto slices = plugin_.sliceSnapshot();
+        const int total = plugin_.wavFrameCount();
+        if (total > 0) {
+            for (size_t i = 0; i < slices.size(); ++i) {
+                const float left = float(waveBounds_.getX()) + float(waveBounds_.getWidth()) *
+                                   float(slices[i].begin) / float(total);
+                const float right = float(waveBounds_.getX()) + float(waveBounds_.getWidth()) *
+                                    float(slices[i].end) / float(total);
+                if (int(i) == selectedSlice_) {
+                    g.setColour(juce::Colours::yellow.withAlpha(0.15f));
+                    g.fillRect(juce::Rectangle<float>(left, float(waveBounds_.getY()),
+                                                     right - left, float(waveBounds_.getHeight())));
+                }
+                g.setColour(juce::Colours::white.withAlpha(0.55f));
+                g.drawVerticalLine(juce::roundToInt(left), float(waveBounds_.getY()),
+                                   float(waveBounds_.getBottom()));
+            }
+        }
+    }
+
+    void resized() override {
+        wavLabel_.setBounds(26, 85, 540, 27);
+        loadButton_.setBounds(605, 83, 125, 30);
+        waveBounds_ = {26, 125, 704, 125};
+        statusLabel_.setBounds(26, 261, 527, 26);
+        loadMidiButton_.setBounds(575, 260, 155, 28);
+        midiLabel_.setBounds(26, 287, 704, 19);
+
+        sliceModeLabel_.setBounds(26, 319, 140, 20);
+        sliceMode_.setBounds(26, 343, 205, 30);
+        countLabel_.setBounds(256, 319, 160, 20);
+        count_.setBounds(256, 344, 185, 28);
+        rootLabel_.setBounds(475, 319, 200, 20);
+        root_.setBounds(475, 344, 240, 28);
+
+        modeLabel_.setBounds(26, 388, 185, 20);
+        mode_.setBounds(26, 412, 205, 29);
+        glideLabel_.setBounds(280, 388, 205, 20);
+        glide_.setBounds(280, 413, 250, 28);
+        offsetLabel_.setBounds(543, 388, 190, 20);
+        offset_.setBounds(543, 413, 182, 28);
+        warningLabel_.setBounds(20, 457, 720, 24);
+    }
+
+    void mouseDown(const juce::MouseEvent& event) override {
+        if (!waveBounds_.contains(event.getPosition())) return;
+        const auto slices = plugin_.sliceSnapshot();
+        const int total = plugin_.wavFrameCount();
+        if (total <= 0) return;
+        const float normalized = float(event.x - waveBounds_.getX()) / float(waveBounds_.getWidth());
+        selectedSlice_ = -1;
+        for (size_t i = 0; i < slices.size(); ++i) {
+            if (normalized >= float(slices[i].begin) / float(total) &&
+                normalized < float(slices[i].end) / float(total)) {
+                selectedSlice_ = int(i);
+                break;
+            }
+        }
+        refreshStatus();
+        repaint();
+    }
+
+    bool isInterestedInFileDrag(const juce::StringArray& files) override {
+        for (const auto& path : files)
+            if (juce::File(path).hasFileExtension("wav;mid;midi")) return true;
+        return false;
+    }
+
+    void filesDropped(const juce::StringArray& files, int, int) override {
+        for (const auto& path : files) {
+            const juce::File file(path);
+            if (file.hasFileExtension("wav;mid;midi")) { loadFile(file); break; }
+        }
+    }
+
+private:
+    FormantSlideNative& plugin_;
+    juce::LookAndFeel_V4 theme_;
+    juce::TextButton loadButton_{"Load WAV"};
+    juce::TextButton loadMidiButton_{"Import MIDI"};
+    juce::Label wavLabel_, midiLabel_, modeLabel_, sliceModeLabel_, countLabel_, rootLabel_;
+    juce::Label glideLabel_, offsetLabel_, statusLabel_, warningLabel_;
+    juce::ComboBox mode_, sliceMode_;
+    juce::Slider count_, root_, glide_, offset_;
+    juce::AudioFormatManager thumbnailFormats_;
+    juce::AudioThumbnailCache cache_{5};
+    juce::AudioThumbnail thumbnail_;
+    juce::Rectangle<int> waveBounds_;
+    int selectedSlice_ = -1;
+    bool updatingControls_ = false;
+
+    void pullSettings() {
+        updatingControls_ = true;
+        const auto s = plugin_.display().settings;
+        mode_.setSelectedId(s.allSlideColors ? 2 : 1, juce::dontSendNotification);
+        sliceMode_.setSelectedId(s.equalSlices ? 2 : 1, juce::dontSendNotification);
+        count_.setValue(s.sliceCount, juce::dontSendNotification);
+        root_.setValue(s.firstNote, juce::dontSendNotification);
+        glide_.setValue(s.fallbackGlideMs, juce::dontSendNotification);
+        offset_.setValue(s.noteOffset, juce::dontSendNotification);
+        updatingControls_ = false;
+    }
+
+    void pushSettings() {
+        if (updatingControls_) return;
+        auto settings = plugin_.display().settings;
+        settings.allSlideColors = mode_.getSelectedId() == 2;
+        settings.equalSlices = sliceMode_.getSelectedId() == 2;
+        settings.sliceCount = int(std::lround(count_.getValue()));
+        settings.firstNote = int(std::lround(root_.getValue()));
+        settings.fallbackGlideMs = int(std::lround(glide_.getValue()));
+        settings.noteOffset = int(std::lround(offset_.getValue()));
+        plugin_.updateSettings(settings);
+        selectedSlice_ = -1;
+        refreshStatus();
+        repaint();
+    }
+
+    void refreshFilePreview() {
+        const auto data = plugin_.display();
+        wavLabel_.setText(data.wavName.empty() ? "No WAV loaded" : fileName(data.wavName),
+                          juce::dontSendNotification);
+        midiLabel_.setText(data.midiName.empty() ? "MIDI duration fallback: none" :
+                           "MIDI: " + fileName(data.midiName), juce::dontSendNotification);
+        // A JUCE thumbnail reproduces the same waveform display as our VST3.
+        // We only know the basename in Display, so the full path is passed to this
+        // method by loadFile() after each import.
+    }
+
+    void refreshStatus() {
+        const auto data = plugin_.display();
+        juce::String status = juce::String(data.slices) + " slices | MIDI " +
+                              juce::String(data.settings.firstNote) + " to " +
+                              juce::String(data.settings.firstNote + juce::jmax(0, data.slices - 1));
+        if (selectedSlice_ >= 0)
+            status = "Selected slice " + juce::String(selectedSlice_ + 1) +
+                     " | MIDI note " + juce::String(data.settings.firstNote + selectedSlice_);
+        else if (data.slices == 1 && !data.wavName.empty())
+            status += "  |  Only 1 slice: try Equal divisions";
+        statusLabel_.setText(status, juce::dontSendNotification);
+    }
+
+    void loadFile(const juce::File& file) {
+        if (!file.existsAsFile()) return;
+        const std::wstring path(file.getFullPathName().toWideCharPointer());
+        std::string error;
+        const bool wav = file.hasFileExtension("wav");
+        const bool ok = wav ? plugin_.loadWav(path, error) : plugin_.loadMidi(path, error);
+        if (!ok) {
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                                                   "FormantSlide", juce::String::fromUTF8(error.c_str()));
+            return;
+        }
+        selectedSlice_ = -1;
+        if (wav) thumbnail_.setSource(new juce::FileInputSource(file));
+        refreshFilePreview();
+        refreshStatus();
+        repaint();
+    }
+
+    void choose(bool midi) {
+        const auto title = midi ? "Choose a MIDI file" : "Choose a chromatic WAV";
+        auto chooser = std::make_shared<juce::FileChooser>(title, juce::File(),
+                                                            midi ? "*.mid;*.midi" : "*.wav");
+        juce::Component::SafePointer<FormantSlideView> safeThis(this);
+        chooser->launchAsync(juce::FileBrowserComponent::openMode |
+                             juce::FileBrowserComponent::canSelectFiles,
+                             [safeThis, chooser](const juce::FileChooser& fc) {
+                                 if (safeThis != nullptr && fc.getResult().existsAsFile())
+                                     safeThis->loadFile(fc.getResult());
+                             });
+    }
+
+    void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(); }
+};
+
+NativeEditor::NativeEditor(FormantSlideNative& plugin) : plugin_(plugin) {}
 NativeEditor::~NativeEditor() { close(); }
 
-void NativeEditor::show(HWND parent) {
-    if (!window_) {
-        static std::once_flag once;
-        std::call_once(once, [] {
-            WNDCLASSEXW cls{};
-            cls.cbSize = sizeof(cls);
-            cls.lpfnWndProc = &NativeEditor::windowProc;
-            cls.hInstance = GetModuleHandleW(nullptr);
-            cls.lpszClassName = kClass;
-            cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-            cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-            RegisterClassExW(&cls);
-        });
-        window_ = CreateWindowExW(0, kClass, L"FormantSlide Native",
-                                  WS_CHILD | WS_CLIPCHILDREN,
-                                  0, 0, 740, 425, parent, nullptr,
-                                  GetModuleHandleW(nullptr), this);
-        if (window_) { DragAcceptFiles(window_, TRUE); syncUi(); }
+HWND NativeEditor::show(HWND parent) {
+    if (!::IsWindow(parent)) return nullptr;
+    if (!juceLifetime_) juceLifetime_ = std::make_unique<juce::ScopedJuceInitialiser_GUI>();
+    if (!view_) view_ = std::make_unique<FormantSlideView>(plugin_);
+    if (view_->isOnDesktop()) {
+        const auto existing = static_cast<HWND>(view_->getPeer() ? view_->getPeer()->getNativeHandle() : nullptr);
+        if (!::IsWindow(existing) || ::GetParent(existing) != parent)
+            view_->removeFromDesktop();
     }
-    if (window_) {
-        SetParent(window_, parent);
-        SetWindowPos(window_, nullptr, 0, 0, 740, 425, SWP_NOZORDER | SWP_SHOWWINDOW);
-    }
+    if (!view_->isOnDesktop())
+        view_->addToDesktop(0, parent); // Native child HWND, as requested by FPD_ShowEditor
+    const auto handle = static_cast<HWND>(view_->getPeer() ? view_->getPeer()->getNativeHandle() : nullptr);
+    if (!::IsWindow(handle)) return nullptr;
+    view_->setVisible(true);
+    ::SetWindowPos(handle, nullptr, 0, 0, editorWidth, editorHeight,
+                   SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    return handle;
 }
-void NativeEditor::hide() { if (window_) ShowWindow(window_, SW_HIDE); }
+
+void NativeEditor::hide() {
+    if (!view_) return;
+    view_->setVisible(false);
+    if (const auto hwnd = handle()) ::ShowWindow(hwnd, SW_HIDE);
+}
+
 void NativeEditor::close() {
-    if (window_) {
-        DestroyWindow(window_);
-        window_ = nullptr;
-    }
+    // Destruction order is important: destroy all JUCE components before
+    // the JUCE message manager is shut down.
+    view_.reset();
+    juceLifetime_.reset();
 }
-LRESULT CALLBACK NativeEditor::windowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
-    NativeEditor* self = reinterpret_cast<NativeEditor*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (message == WM_NCCREATE) {
-        const auto* cs = reinterpret_cast<CREATESTRUCTW*>(l);
-        self = static_cast<NativeEditor*>(cs->lpCreateParams);
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-        self->window_ = window;
-    }
-    if (self && message == WM_NCDESTROY) {
-        LRESULT result = DefWindowProcW(window, message, w, l);
-        self->window_ = nullptr;
-        return result;
-    }
-    if (self) return self->onMessage(message, w, l);
-    return DefWindowProcW(window, message, w, l);
-}
-void NativeEditor::createWidgets() {
-    child(window_, L"STATIC", L"FormantSlide  /  FL Studio Native", 0, 20, 14, 580, 30);
-    child(window_, L"STATIC", L"Native slide notes are controlled by FL Studio's own pitch curve.",
-          0, 20, 48, 695, 25);
-    child(window_, L"BUTTON", L"Load chromatic WAV...", BS_PUSHBUTTON, 20, 82, 180, 31, LoadWav);
-    wavLabel_ = child(window_, L"STATIC", L"No WAV loaded", 0, 217, 87, 490, 25);
-    child(window_, L"BUTTON", L"Import MIDI (fallback)...", BS_PUSHBUTTON, 20, 123, 180, 31, LoadMidi);
-    midiLabel_ = child(window_, L"STATIC", L"No MIDI loaded", 0, 217, 129, 490, 25);
 
-    child(window_, L"STATIC", L"Slicer", 0, 20, 177, 175, 22);
-    sliceMode_ = child(window_, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL,
-                      20, 201, 184, 250, SliceMode);
-    SendMessageW(sliceMode_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Detect silence"));
-    SendMessageW(sliceMode_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Equal divisions"));
-    child(window_, L"STATIC", L"Divisions", 0, 223, 177, 100, 22);
-    sliceCount_ = child(window_, L"EDIT", L"12", WS_BORDER | ES_NUMBER, 223, 201, 86, 27, SliceCount);
-    child(window_, L"STATIC", L"First MIDI note", 0, 334, 177, 120, 22);
-    root_ = child(window_, L"EDIT", L"60", WS_BORDER | ES_NUMBER, 334, 201, 86, 27, Root);
-
-    child(window_, L"STATIC", L"Slide colors", 0, 20, 246, 180, 22);
-    slideMode_ = child(window_, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL,
-                      20, 270, 184, 250, SlideMode);
-    SendMessageW(slideMode_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Only channel 5"));
-    SendMessageW(slideMode_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Channels 3 to 16"));
-    child(window_, L"STATIC", L"Fallback glide (ms)", 0, 223, 246, 150, 22);
-    fallback_ = child(window_, L"EDIT", L"250", WS_BORDER | ES_NUMBER, 223, 270, 86, 27, Fallback);
-    child(window_, L"STATIC", L"MIDI offset (host ticks)", 0, 334, 246, 195, 22);
-    offset_ = child(window_, L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL,
-                    334, 270, 86, 27, Offset);
-
-    child(window_, L"STATIC", L"Native pitch slide: target & length from FL Studio, no MIDI import needed.",
-          0, 20, 312, 690, 23);
-    child(window_, L"STATIC", L"Color slides: SDK GetLength -> imported MIDI -> fallback glide.",
-          0, 20, 336, 690, 23);
-    statusLabel_ = child(window_, L"STATIC", L"", 0, 20, 377, 700, 26);
-}
-void NativeEditor::syncUi() {
-    if (!window_) return;
-    const auto d = plugin_.display();
-    SendMessageW(sliceMode_, CB_SETCURSEL, d.settings.equalSlices ? 1 : 0, 0);
-    SendMessageW(slideMode_, CB_SETCURSEL, d.settings.allSlideColors ? 1 : 0, 0);
-    numberText(sliceCount_, d.settings.sliceCount);
-    numberText(root_, d.settings.firstNote);
-    numberText(fallback_, d.settings.fallbackGlideMs);
-    numberText(offset_, d.settings.midiOffsetTicks);
-    SetWindowTextW(wavLabel_, d.wavName.empty() ? L"No WAV loaded" : d.wavName.c_str());
-    SetWindowTextW(midiLabel_, d.midiName.empty() ? L"No MIDI loaded" : d.midiName.c_str());
-    const std::wstring status = std::to_wstring(d.slices) + L" slices / " +
-                                std::to_wstring(d.midiNotes) + L" MIDI notes / " +
-                                std::wstring(d.status.begin(), d.status.end());
-    SetWindowTextW(statusLabel_, status.c_str());
-}
-void NativeEditor::saveUi() {
-    const auto old = plugin_.display().settings;
-    auto s = old;
-    s.equalSlices = SendMessageW(sliceMode_, CB_GETCURSEL, 0, 0) == 1;
-    s.allSlideColors = SendMessageW(slideMode_, CB_GETCURSEL, 0, 0) == 1;
-    s.sliceCount = number(sliceCount_, old.sliceCount);
-    s.firstNote = number(root_, old.firstNote);
-    s.fallbackGlideMs = number(fallback_, old.fallbackGlideMs);
-    s.midiOffsetTicks = number(offset_, old.midiOffsetTicks);
-    plugin_.updateSettings(s);
-    syncUi();
-}
-void NativeEditor::dropFile(const std::wstring& path) {
-    std::string error;
-    std::wstring ext = std::filesystem::path(path).extension().wstring();
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
-    bool ok = false;
-    if (ext == L".wav") ok = plugin_.loadWav(path, error);
-    else if (ext == L".mid" || ext == L".midi") ok = plugin_.loadMidi(path, error);
-    if (!ok) MessageBoxA(window_, error.empty() ? "Unsupported file type" : error.c_str(),
-                         "FormantSlide", MB_ICONWARNING | MB_OK);
-    syncUi();
-}
-void NativeEditor::browse(bool midi) {
-    wchar_t file[MAX_PATH]{};
-    OPENFILENAMEW ofn{};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = window_;
-    ofn.lpstrFile = file;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = midi ? L"MIDI files (*.mid)\0*.mid;*.midi\0All files\0*.*\0"
-                            : L"WAV files (*.wav)\0*.wav\0All files\0*.*\0";
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST;
-    if (GetOpenFileNameW(&ofn)) dropFile(file);
-}
-LRESULT NativeEditor::onMessage(UINT message, WPARAM w, LPARAM l) {
-    switch (message) {
-    case WM_CREATE: createWidgets(); return 0;
-    case WM_COMMAND: {
-        const int id = LOWORD(w), code = HIWORD(w);
-        if (code == BN_CLICKED && id == LoadWav) { browse(false); return 0; }
-        if (code == BN_CLICKED && id == LoadMidi) { browse(true); return 0; }
-        if ((code == CBN_SELCHANGE && (id == SliceMode || id == SlideMode)) ||
-            (code == EN_KILLFOCUS && (id == SliceCount || id == Root || id == Fallback || id == Offset))) {
-            saveUi(); return 0;
-        }
-        break;
-    }
-    case WM_DROPFILES: {
-        HDROP drop = reinterpret_cast<HDROP>(w);
-        wchar_t path[MAX_PATH]{};
-        if (DragQueryFileW(drop, 0, path, MAX_PATH)) dropFile(path);
-        DragFinish(drop);
-        return 0;
-    }
-    }
-    return DefWindowProcW(window_, message, w, l);
+HWND NativeEditor::handle() const {
+    if (!view_ || !view_->isOnDesktop()) return nullptr;
+    const auto hwnd = static_cast<HWND>(view_->getPeer() ? view_->getPeer()->getNativeHandle() : nullptr);
+    return ::IsWindow(hwnd) ? hwnd : nullptr;
 }

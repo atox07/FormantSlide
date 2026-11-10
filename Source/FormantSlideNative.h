@@ -18,6 +18,7 @@ public:
         bool equalSlices = false;
         int sliceCount = 12;
         int firstNote = 60;
+        int noteOffset = 0; // Native SDK pitch calibration (semitones)
         bool allSlideColors = true; // false = channel/color 5 only
         int fallbackGlideMs = 250;
         int midiOffsetTicks = 0;
@@ -27,6 +28,7 @@ public:
         int slices = 0;
         int midiNotes = 0;
         std::wstring wavName, midiName;
+        std::wstring wavFullPath, midiFullPath;
         std::string status;
     };
 
@@ -46,7 +48,8 @@ public:
     bool loadMidi(const std::wstring& path, std::string& error);
     void updateSettings(const Settings& value);
     Display display() const;
-    void setEditor(NativeEditor* editor) { editor_ = editor; }
+    std::vector<AudioSlice> sliceSnapshot() const;
+    int wavFrameCount() const;
 
 private:
     struct Voice {

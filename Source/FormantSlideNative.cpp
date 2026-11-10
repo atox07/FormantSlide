@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstddef>
 #include <cwchar>
 #include <filesystem>
 
@@ -14,11 +15,12 @@ TFruityPlugInfo kInfo = {CurrentSDKVersion, kName, kShort,
                           FPF_Type_FullGen, 0, 1, 0};
 struct SavedState {
     uint32_t magic = 0x46534e32; // FSN2
-    uint32_t version = 1;
+    uint32_t version = 2;
     uint32_t equal = 0, slices = 12, root = 60, all = 1, glide = 250;
     int32_t offset = 0;
     wchar_t wav[512]{};
     wchar_t midi[512]{};
+    int32_t noteOffset = 0; // appended so old project data stays compatible
 };
 float decodeFloat(intptr_t value) {
     const uint32_t bits = static_cast<uint32_t>(value);
@@ -27,7 +29,8 @@ float decodeFloat(intptr_t value) {
     return result;
 }
 int voiceNote(PVoiceParams p) {
-    // FL's pitch value is in cents relative to middle C (MIDI 60).
+    // FL native API gives cents relative to middle C (MIDI 60).
+    // Conversion is intentionally shared by vocal and slide notes.
     return std::clamp(60 + int(std::lround(double(p->InitLevels.Pitch) / 100.0)), 0, 127);
 }
 }
@@ -46,10 +49,9 @@ FormantSlideNative::FormantSlideNative(intptr_t tag, TFruityPlugHost* host)
 FormantSlideNative::~FormantSlideNative() = default;
 
 void FormantSlideNative::initStretch() {
-    // Larger than the old 1024-frame spectral window; improves formant stability
-    // at the cost of increased latency. May still be imperfect on quick slides.
-    stretch_.configure(2, 2048, 256, false);
-    stretch_.setFormantBase(180.0f / float(sampleRate_));
+    // Match the v0.2 VST3 engine settings to keep its familiar response.
+    stretch_.configure(2, 1024, 192, false);
+    stretch_.setFormantBase(200.0f / float(sampleRate_));
     stretch_.setFormantFactor(1.0f, true);
     stretch_.setTransposeSemitones(0.0f);
     stretch_.reset();
@@ -58,15 +60,24 @@ void FormantSlideNative::initStretch() {
 
 void _stdcall FormantSlideNative::DestroyObject() {
     if (editor_) { editor_->close(); delete editor_; editor_ = nullptr; }
+    EditorHandle = nullptr;
     TCPPFruityPlug::DestroyObject();
 }
 
 intptr_t _stdcall FormantSlideNative::Dispatcher(intptr_t id, intptr_t index, intptr_t value) {
     if (id == FPD_ShowEditor) {
-        if (!editor_) editor_ = new NativeEditor(*this);
-        if (value) editor_->show(reinterpret_cast<HWND>(value));
-        else editor_->hide();
-        EditorHandle = editor_->handle();
+        // The native host checks EditorHandle after this callback. Only publish
+        // a real, valid HWND; never leave a stale handle after editor teardown.
+        if (value) {
+            const auto parent = reinterpret_cast<HWND>(value);
+            if (!IsWindow(parent)) { EditorHandle = nullptr; return 0; }
+            if (!editor_) editor_ = new NativeEditor(*this);
+            EditorHandle = editor_->show(parent);
+            if (!IsWindow(EditorHandle)) EditorHandle = nullptr;
+        } else {
+            if (editor_) editor_->hide();
+            EditorHandle = editor_ ? editor_->handle() : nullptr;
+        }
         return 0;
     }
     if (id == FPD_SetSampleRate && value >= 8000 && value <= 384000) {
@@ -195,6 +206,7 @@ TVoiceHandle _stdcall FormantSlideNative::TriggerVoice(PVoiceParams params, intp
     Voice* ptr = entry.get();
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        ptr->note = std::clamp(ptr->note + settings_.noteOffset, 0, 127);
         const bool slide = settings_.allSlideColors ? color >= 2 : color == 4;
         voices_.push_back(std::move(entry));
         if (ptr->vocal) beginVocal(*ptr);
@@ -307,12 +319,18 @@ bool FormantSlideNative::loadMidi(const std::wstring& path, std::string& error) 
 }
 void FormantSlideNative::updateSettings(const Settings& input) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto previous = settings_;
     settings_ = input;
     settings_.sliceCount = std::clamp(settings_.sliceCount, 1, 64);
     settings_.firstNote = std::clamp(settings_.firstNote, 0, 127);
+    settings_.noteOffset = std::clamp(settings_.noteOffset, -24, 24);
     settings_.fallbackGlideMs = std::clamp(settings_.fallbackGlideMs, 1, 10000);
-    slices_ = sliceWav(wav_, settings_.equalSlices, settings_.sliceCount);
-    samplePlaying_ = false;
+    // Do not rebuild/silence a playing sample just because glide or pitch
+    // calibration has been adjusted with a slider.
+    if (settings_.equalSlices != previous.equalSlices || settings_.sliceCount != previous.sliceCount) {
+        slices_ = sliceWav(wav_, settings_.equalSlices, settings_.sliceCount);
+        samplePlaying_ = false;
+    }
 }
 FormantSlideNative::Display FormantSlideNative::display() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -321,9 +339,20 @@ FormantSlideNative::Display FormantSlideNative::display() const {
     d.slices = int(slices_.size());
     d.midiNotes = int(midi_.noteCount());
     if (!wavPath_.empty()) d.wavName = std::filesystem::path(wavPath_).filename().wstring();
+    d.wavFullPath = wavPath_;
     if (!midiPath_.empty()) d.midiName = std::filesystem::path(midiPath_).filename().wstring();
+    d.midiFullPath = midiPath_;
     d.status = status_;
     return d;
+}
+
+std::vector<AudioSlice> FormantSlideNative::sliceSnapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return slices_;
+}
+int FormantSlideNative::wavFrameCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return wav_.frames();
 }
 
 void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
@@ -337,13 +366,15 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         s.all = settings_.allSlideColors;
         s.glide = settings_.fallbackGlideMs;
         s.offset = settings_.midiOffsetTicks;
+        s.noteOffset = settings_.noteOffset;
         wcsncpy_s(s.wav, wavPath_.c_str(), _TRUNCATE);
         wcsncpy_s(s.midi, midiPath_.c_str(), _TRUNCATE);
         stream->Write(&s, sizeof(s), nullptr);
     } else {
         ULONG read = 0;
-        if (FAILED(stream->Read(&s, sizeof(s), &read)) || read != sizeof(s) ||
-            s.magic != 0x46534e32 || s.version != 1) return;
+        if (FAILED(stream->Read(&s, sizeof(s), &read)) ||
+            read < offsetof(SavedState, noteOffset) ||
+            s.magic != 0x46534e32 || (s.version != 1 && s.version != 2)) return;
         Settings restored;
         restored.equalSlices = s.equal != 0;
         restored.sliceCount = int(s.slices);
@@ -351,6 +382,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         restored.allSlideColors = s.all != 0;
         restored.fallbackGlideMs = int(s.glide);
         restored.midiOffsetTicks = s.offset;
+        restored.noteOffset = s.version >= 2 && read == sizeof(s) ? s.noteOffset : 0;
         updateSettings(restored);
         std::string error;
         if (s.wav[0]) loadWav(s.wav, error);
