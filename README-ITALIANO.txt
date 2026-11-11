@@ -1,51 +1,32 @@
-FormantSlide Native v0.4 - JUCE EDITOR RESTORE
-=============================================
+FormantSlide Native v0.5 — Auto MIDI anchor + editable slice boundaries
+==================================================================
 
-This patch replaces the broken Win32 edit-box UI of Native v0.3 with a JUCE
-editor styled and laid out after our working v0.2 VST3.
+MODIFICHE RISPETTO ALLA V0.4
+- Rimosso il controllo First slice MIDI note.
+- La PRIMA nota vocale riprodotta dopo il caricamento del WAV diventa il riferimento MIDI del primo slice. Il primo slice suona al pitch originale, senza trasposizione da una root fissata arbitrariamente.
+- Gli slice successivi vengono associati ai semitoni successivi del Piano Roll. Non e' un rilevamento automatico della frequenza fondamentale dentro il WAV: e' un ancoraggio MIDI automatico.
+- Se il rilevamento del silenzio produce un unico segmento in un WAV continuo di almeno 2 secondi, viene provata una divisione uguale con il numero impostato (default 12). E' una stima: controlla i confini sulla waveform.
+- I confini interni degli slice ora sono trascinabili col mouse: trascina le piccole maniglie azzurre sulla forma d'onda. I confini non si possono sovrapporre.
+- Salvataggio e ripristino delle posizioni dei tagli personalizzati nel progetto FL Studio.
+- Editor nativo: gestione HWND rafforzata e handle azzerato alla chiusura.
+- Restano import MIDI, slide per colori, FL native slides e Signalsmith Stretch.
 
-WHAT CHANGED
-- Rebuilt dark JUCE UI with waveform, slice boundaries and selectable slices.
-- Load WAV and Import MIDI via buttons, or drag and drop WAV/MID.
-- Fixed native editor window lifecycle: publish only a valid HWND to FL Studio.
-- Restored continuous JUCE sliders for First MIDI note, divisions, glide.
-- Added FL note calibration (-24 to +24 semitones) for host-note mapping.
-- Restored v0.2's Signalsmith window 1024 / interval 192 / formant base 200 Hz.
-- UI changes to glide and note calibration no longer stop the current voice.
-- Native FL Studio note slides still follow FinalLevels.Pitch from the SDK.
-- Colour slide duration: SDK FPV_GetLength, MIDI import, glide fallback.
-- Artifact is now named FormantSlide_x64.dll, matching FL native conventions.
-- WAV silence detector unchanged from v0.2; if only one slice is detected,
-  select Equal divisions and set the number of notes in the WAV.
+FILE MODIFICATI
+  Source/FormantSlideNative.h
+  Source/FormantSlideNative.cpp
+  Source/WinEditor.cpp
+  Source/WaveLoader.cpp
+  CMakeLists.txt (soltanto numero versione)
 
-INSTALL TO GITHUB (on the flnative branch)
-1. Replace CMakeLists.txt.
-2. Replace the full Source/ folder with Source/ from this patch.
-3. Replace .github/workflows/build-windows.yml.
-4. Keep the existing SDK/ directory in the repository root. No need to upload it again.
-5. Commit and manually run the GitHub Action on branch flnative.
-6. Copy the produced FormantSlide_x64.dll to
-   D:\FL STUDIO 24\Plugins\Fruity\Generators\FormantSlide\
-7. Close FL Studio fully before replacing the DLL, then start it again.
+INSTALLAZIONE SUL BRANCH flnative
+1. Copia i 4 file .cpp/.h modificati nelle rispettive posizioni di Source/.
+2. Sostituisci CMakeLists.txt se vuoi aggiornare anche il numero di versione (non obbligatorio).
+3. NON cancellare SDK/, NON sostituire il workflow YAML, NON cancellare altri sorgenti.
+4. Commit + Push origin; in Actions fai Run workflow selezionando flnative.
+5. Chiudi FL Studio prima di sostituire FormantSlide_x64.dll.
 
-TESTING
-- Open plugin, load a chromatic WAV; waveform and slice lines should appear.
-- Status text reports detected slice count. If 1: select Equal divisions,
-  set count to match WAV, then move First MIDI note to the note of slice 1.
-- Slide mode controls channels 5 only vs channels 3-16.
-- FL note calibration normally starts at 0. If pitch is one octave too low,
-  try +12; if one octave too high, try -12. This does NOT change target
-  note differences for the slide notes.
-- For colored slide-note length, imported MIDI remains an optional fallback.
-- FL-native triangle slides use the host-provided FinalLevels.Pitch curve.
-
-IMPORTANT LIMITS
-- We cannot test the FL Studio host/UI behavior or perform an MSVC Windows
-  build on this runner; compilation via GitHub Actions is required.
-- JUCE initialization and child-window embedding are based on JUCE's Windows
-  addToDesktop(native parent HWND) API; this has not yet been tested in FL 2025.
-- Audio formant quality is not guaranteed to be flawless. This patch restores
-  the original GUI and pitch-shifting configuration, not a new DSP algorithm.
-- A WAV with no detectable gaps may genuinely have only one auto-detected
-  slice; manual equal divisions is intentionally not guessed.
-- The SDK/ content is third-party/nonofficial; check its license and compatibility.
+LIMITI IMPORTANTI
+- Il primo campione non viene analizzato con un pitch detector: il primo tasto vocale stabilisce l'ancora MIDI. Se parti da un'altra nota, la mappatura cambia; ricarica il WAV per azzerarla.
+- Le divisioni di emergenza in parti uguali non sono necessariamente corrette per una chromatic con note di lunghezza diversa: regola manualmente le maniglie.
+- L'errore 'Invalid editor window handle' non e' verificabile in questo ambiente; il fix va provato sul tuo FL Studio.
+- Nessuna compilazione MSVC/FL Studio e' stata eseguita localmente; la build GitHub Actions resta il controllo effettivo.

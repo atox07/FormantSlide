@@ -117,6 +117,12 @@ std::vector<AudioSlice> sliceWav(const WaveData& wav, bool equal, int divisions)
     if (start >= 0 && last - start >= minSlice)
         slices.push_back({std::max(0, start - pad), std::min(frames, last + pad)});
     if (slices.empty()) slices.push_back({0, frames});
+    // Continuous chromatic WAVs often have no silence between phonemes.
+    // Offer immediately usable default divisions for long files; these are
+    // initial estimates that can now be dragged individually in the editor.
+    if (slices.size() == 1 && frames >= wav.sampleRate * 2 && divisions > 1) {
+        return sliceWav(wav, true, divisions);
+    }
     if (slices.size() > 64) slices.resize(64);
     return slices;
 }

@@ -48,7 +48,6 @@ public:
         addAndMakeVisible(modeLabel_);
         addAndMakeVisible(sliceModeLabel_);
         addAndMakeVisible(countLabel_);
-        addAndMakeVisible(rootLabel_);
         addAndMakeVisible(glideLabel_);
         addAndMakeVisible(offsetLabel_);
         addAndMakeVisible(statusLabel_);
@@ -56,17 +55,15 @@ public:
         addAndMakeVisible(mode_);
         addAndMakeVisible(sliceMode_);
         addAndMakeVisible(count_);
-        addAndMakeVisible(root_);
         addAndMakeVisible(glide_);
         addAndMakeVisible(offset_);
 
         setLabel(modeLabel_, "Slide MIDI channels");
         setLabel(sliceModeLabel_, "Slicer");
         setLabel(countLabel_, "Equal divisions");
-        setLabel(rootLabel_, "First slice MIDI note");
         setLabel(glideLabel_, "Fallback glide (ms)");
         setLabel(offsetLabel_, "FL note calibration");
-        setLabel(warningLabel_, "Native slides: FL pitch curve  |  Color slides: SDK length / imported MIDI");
+        setLabel(warningLabel_, "Drag slice markers to adjust cuts | First played vocal note anchors slice 1");
         warningLabel_.setJustificationType(juce::Justification::centred);
         warningLabel_.setColour(juce::Label::textColourId, juce::Colour(0xffffb65c));
         wavLabel_.setJustificationType(juce::Justification::centredLeft);
@@ -79,12 +76,11 @@ public:
         sliceMode_.addItem("Detect silence", 1);
         sliceMode_.addItem("Equal divisions", 2);
 
-        for (auto* slider : { &count_, &root_, &glide_, &offset_ }) {
+        for (auto* slider : { &count_, &glide_, &offset_ }) {
             slider->setSliderStyle(juce::Slider::LinearHorizontal);
             slider->setTextBoxStyle(juce::Slider::TextBoxRight, false, 54, 24);
         }
         count_.setRange(1.0, 64.0, 1.0);
-        root_.setRange(0.0, 127.0, 1.0);
         glide_.setRange(10.0, 2000.0, 1.0);
         offset_.setRange(-24.0, 24.0, 1.0);
 
@@ -93,7 +89,6 @@ public:
         mode_.onChange = [this] { pushSettings(); };
         sliceMode_.onChange = [this] { pushSettings(); };
         count_.onValueChange = [this] { pushSettings(); };
-        root_.onValueChange = [this] { pushSettings(); };
         glide_.onValueChange = [this] { pushSettings(); };
         offset_.onValueChange = [this] { pushSettings(); };
 
@@ -149,6 +144,11 @@ public:
                 g.setColour(juce::Colours::white.withAlpha(0.55f));
                 g.drawVerticalLine(juce::roundToInt(left), float(waveBounds_.getY()),
                                    float(waveBounds_.getBottom()));
+                if (i > 0) {
+                    g.setColour(juce::Colour(0xff74c9ff));
+                    g.fillRoundedRectangle(left - 4.f, float(waveBounds_.getY()) + 3.f,
+                                           8.f, 19.f, 3.f);
+                }
             }
         }
     }
@@ -164,9 +164,9 @@ public:
         sliceModeLabel_.setBounds(26, 319, 140, 20);
         sliceMode_.setBounds(26, 343, 205, 30);
         countLabel_.setBounds(256, 319, 160, 20);
-        count_.setBounds(256, 344, 185, 28);
-        rootLabel_.setBounds(475, 319, 200, 20);
-        root_.setBounds(475, 344, 240, 28);
+        count_.setBounds(256, 344, 450, 28);
+        // First slice MIDI note is intentionally absent. The first played
+        // vocal note establishes the anchor and sounds at the original pitch.
 
         modeLabel_.setBounds(26, 388, 185, 20);
         mode_.setBounds(26, 412, 205, 29);
@@ -182,17 +182,43 @@ public:
         const auto slices = plugin_.sliceSnapshot();
         const int total = plugin_.wavFrameCount();
         if (total <= 0) return;
-        const float normalized = float(event.x - waveBounds_.getX()) / float(waveBounds_.getWidth());
-        selectedSlice_ = -1;
-        for (size_t i = 0; i < slices.size(); ++i) {
-            if (normalized >= float(slices[i].begin) / float(total) &&
-                normalized < float(slices[i].end) / float(total)) {
-                selectedSlice_ = int(i);
-                break;
+        draggedBoundary_ = -1;
+        float bestDistance = 9.0f;
+        for (size_t i = 1; i < slices.size(); ++i) {
+            const float x = float(waveBounds_.getX()) +
+                            float(waveBounds_.getWidth()) * float(slices[i].begin) / float(total);
+            const float distance = std::abs(float(event.x) - x);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                draggedBoundary_ = int(i);
+            }
+        }
+        if (draggedBoundary_ > 0) {
+            selectedSlice_ = draggedBoundary_;
+            setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
+            updateDraggedBoundary(event.x);
+        } else {
+            const float position = float(event.x - waveBounds_.getX()) / float(waveBounds_.getWidth());
+            selectedSlice_ = -1;
+            for (size_t i = 0; i < slices.size(); ++i) {
+                if (position >= float(slices[i].begin) / float(total) &&
+                    position < float(slices[i].end) / float(total)) {
+                    selectedSlice_ = int(i);
+                    break;
+                }
             }
         }
         refreshStatus();
         repaint();
+    }
+
+    void mouseDrag(const juce::MouseEvent& event) override {
+        if (draggedBoundary_ > 0) updateDraggedBoundary(event.x);
+    }
+
+    void mouseUp(const juce::MouseEvent&) override {
+        draggedBoundary_ = -1;
+        setMouseCursor(juce::MouseCursor::NormalCursor);
     }
 
     bool isInterestedInFileDrag(const juce::StringArray& files) override {
@@ -213,16 +239,29 @@ private:
     juce::LookAndFeel_V4 theme_;
     juce::TextButton loadButton_{"Load WAV"};
     juce::TextButton loadMidiButton_{"Import MIDI"};
-    juce::Label wavLabel_, midiLabel_, modeLabel_, sliceModeLabel_, countLabel_, rootLabel_;
+    juce::Label wavLabel_, midiLabel_, modeLabel_, sliceModeLabel_, countLabel_;
     juce::Label glideLabel_, offsetLabel_, statusLabel_, warningLabel_;
     juce::ComboBox mode_, sliceMode_;
-    juce::Slider count_, root_, glide_, offset_;
+    juce::Slider count_, glide_, offset_;
     juce::AudioFormatManager thumbnailFormats_;
     juce::AudioThumbnailCache cache_{5};
     juce::AudioThumbnail thumbnail_;
     juce::Rectangle<int> waveBounds_;
     int selectedSlice_ = -1;
+    int draggedBoundary_ = -1;
     bool updatingControls_ = false;
+
+    void updateDraggedBoundary(int x) {
+        const int total = plugin_.wavFrameCount();
+        if (draggedBoundary_ < 1 || total < 2) return;
+        const double proportion = juce::jlimit(0.0, 1.0,
+            double(x - waveBounds_.getX()) / double(waveBounds_.getWidth()));
+        const int frame = juce::roundToInt(proportion * double(total));
+        if (plugin_.moveSliceBoundary(draggedBoundary_, frame)) {
+            refreshStatus();
+            repaint(waveBounds_);
+        }
+    }
 
     void pullSettings() {
         updatingControls_ = true;
@@ -230,7 +269,6 @@ private:
         mode_.setSelectedId(s.allSlideColors ? 2 : 1, juce::dontSendNotification);
         sliceMode_.setSelectedId(s.equalSlices ? 2 : 1, juce::dontSendNotification);
         count_.setValue(s.sliceCount, juce::dontSendNotification);
-        root_.setValue(s.firstNote, juce::dontSendNotification);
         glide_.setValue(s.fallbackGlideMs, juce::dontSendNotification);
         offset_.setValue(s.noteOffset, juce::dontSendNotification);
         updatingControls_ = false;
@@ -242,7 +280,6 @@ private:
         settings.allSlideColors = mode_.getSelectedId() == 2;
         settings.equalSlices = sliceMode_.getSelectedId() == 2;
         settings.sliceCount = int(std::lround(count_.getValue()));
-        settings.firstNote = int(std::lround(root_.getValue()));
         settings.fallbackGlideMs = int(std::lround(glide_.getValue()));
         settings.noteOffset = int(std::lround(offset_.getValue()));
         plugin_.updateSettings(settings);
@@ -264,12 +301,10 @@ private:
 
     void refreshStatus() {
         const auto data = plugin_.display();
-        juce::String status = juce::String(data.slices) + " slices | MIDI " +
-                              juce::String(data.settings.firstNote) + " to " +
-                              juce::String(data.settings.firstNote + juce::jmax(0, data.slices - 1));
+        juce::String status = juce::String(data.slices) + " slices | auto MIDI anchor";
         if (selectedSlice_ >= 0)
             status = "Selected slice " + juce::String(selectedSlice_ + 1) +
-                     " | MIDI note " + juce::String(data.settings.firstNote + selectedSlice_);
+                     " | drag a white marker to adjust its boundary";
         else if (data.slices == 1 && !data.wavName.empty())
             status += "  |  Only 1 slice: try Equal divisions";
         statusLabel_.setText(status, juce::dontSendNotification);
@@ -322,9 +357,13 @@ HWND NativeEditor::show(HWND parent) {
             view_->removeFromDesktop();
     }
     if (!view_->isOnDesktop())
-        view_->addToDesktop(0, parent); // Native child HWND, as requested by FPD_ShowEditor
+        view_->addToDesktop(0, parent); // Host-owned parent HWND
     const auto handle = static_cast<HWND>(view_->getPeer() ? view_->getPeer()->getNativeHandle() : nullptr);
     if (!::IsWindow(handle)) return nullptr;
+    // Ensure the JUCE peer really is a child window before publishing it to FL.
+    ::SetWindowLongPtrW(handle, GWL_STYLE,
+        (::GetWindowLongPtrW(handle, GWL_STYLE) & ~WS_POPUP) | WS_CHILD | WS_CLIPCHILDREN);
+    if (::GetParent(handle) != parent) ::SetParent(handle, parent);
     view_->setVisible(true);
     ::SetWindowPos(handle, nullptr, 0, 0, editorWidth, editorHeight,
                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);

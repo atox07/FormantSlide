@@ -16,11 +16,15 @@ TFruityPlugInfo kInfo = {CurrentSDKVersion, kName, kShort,
 struct SavedState {
     uint32_t magic = 0x46534e32; // FSN2
     uint32_t version = 2;
-    uint32_t equal = 0, slices = 12, root = 60, all = 1, glide = 250;
+    uint32_t equal = 0, slices = 12, root = 60, all = 1, glide = 250; // root retained for loading older projects
     int32_t offset = 0;
     wchar_t wav[512]{};
     wchar_t midi[512]{};
     int32_t noteOffset = 0; // appended so old project data stays compatible
+};
+struct SavedSliceMarkerHeader {
+    uint32_t magic = 0x534c4335; // SLC5
+    uint32_t count = 0;
 };
 float decodeFloat(intptr_t value) {
     const uint32_t bits = static_cast<uint32_t>(value);
@@ -76,7 +80,7 @@ intptr_t _stdcall FormantSlideNative::Dispatcher(intptr_t id, intptr_t index, in
             if (!IsWindow(EditorHandle)) EditorHandle = nullptr;
         } else {
             if (editor_) editor_->hide();
-            EditorHandle = editor_ ? editor_->handle() : nullptr;
+            EditorHandle = nullptr; // Never expose a hidden/stale HWND to the host.
         }
         return 0;
     }
@@ -157,8 +161,11 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     stretch_.reset();
     const int count = int(slices_.size());
     if (!count || !wav_.frames()) { samplePlaying_ = false; return; }
-    const int index = std::clamp(voice.note - settings_.firstNote, 0, count - 1);
-    voice.baseOffset = double(voice.note - (settings_.firstNote + index));
+    // The FIRST vocal note establishes the MIDI-to-WAV mapping. Its slice
+    // plays without transposition regardless of whether it is C3 or C6.
+    if (anchorNote_ < 0) anchorNote_ = voice.note;
+    const int index = std::clamp(voice.note - anchorNote_, 0, count - 1);
+    voice.baseOffset = double(voice.note - (anchorNote_ + index));
     playhead_ = slices_[size_t(index)].begin;
     sliceEnd_ = slices_[size_t(index)].end;
     samplePlaying_ = true;
@@ -303,6 +310,8 @@ bool FormantSlideNative::loadWav(const std::wstring& path, std::string& error) {
     wav_ = std::move(wav);
     wavPath_ = path;
     slices_ = sliceWav(wav_, settings_.equalSlices, settings_.sliceCount);
+    slicesManuallyEdited_ = false;
+    anchorNote_ = -1;
     samplePlaying_ = false;
     stretch_.reset();
     status_ = "WAV loaded";
@@ -322,13 +331,14 @@ void FormantSlideNative::updateSettings(const Settings& input) {
     const auto previous = settings_;
     settings_ = input;
     settings_.sliceCount = std::clamp(settings_.sliceCount, 1, 64);
-    settings_.firstNote = std::clamp(settings_.firstNote, 0, 127);
     settings_.noteOffset = std::clamp(settings_.noteOffset, -24, 24);
     settings_.fallbackGlideMs = std::clamp(settings_.fallbackGlideMs, 1, 10000);
     // Do not rebuild/silence a playing sample just because glide or pitch
     // calibration has been adjusted with a slider.
     if (settings_.equalSlices != previous.equalSlices || settings_.sliceCount != previous.sliceCount) {
         slices_ = sliceWav(wav_, settings_.equalSlices, settings_.sliceCount);
+        slicesManuallyEdited_ = false;
+        anchorNote_ = -1;
         samplePlaying_ = false;
     }
 }
@@ -350,6 +360,24 @@ std::vector<AudioSlice> FormantSlideNative::sliceSnapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return slices_;
 }
+bool FormantSlideNative::moveSliceBoundary(int boundaryIndex, int frame) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (boundaryIndex < 1 || boundaryIndex >= int(slices_.size())) return false;
+    auto& left = slices_[size_t(boundaryIndex - 1)];
+    auto& right = slices_[size_t(boundaryIndex)];
+    // Keep a minimum audible region on either side, and never cross markers.
+    const int minGap = std::max(2, wav_.sampleRate / 200); // 5 ms
+    const int low = left.begin + minGap;
+    const int high = right.end - minGap;
+    if (low > high) return false;
+    const int boundary = std::clamp(frame, low, high);
+    left.end = boundary;
+    right.begin = boundary;
+    slicesManuallyEdited_ = true;
+    // Current playback finishes with its original end until the next note.
+    return true;
+}
+
 int FormantSlideNative::wavFrameCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return wav_.frames();
@@ -362,7 +390,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         std::lock_guard<std::mutex> lock(mutex_);
         s.equal = settings_.equalSlices;
         s.slices = settings_.sliceCount;
-        s.root = settings_.firstNote;
+        s.root = 60; // historical field, ignored by automatic note anchoring
         s.all = settings_.allSlideColors;
         s.glide = settings_.fallbackGlideMs;
         s.offset = settings_.midiOffsetTicks;
@@ -370,6 +398,15 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         wcsncpy_s(s.wav, wavPath_.c_str(), _TRUNCATE);
         wcsncpy_s(s.midi, midiPath_.c_str(), _TRUNCATE);
         stream->Write(&s, sizeof(s), nullptr);
+        SavedSliceMarkerHeader markerHeader;
+        markerHeader.count = slicesManuallyEdited_ ? uint32_t(slices_.size()) : 0;
+        stream->Write(&markerHeader, sizeof(markerHeader), nullptr);
+        if (markerHeader.count > 0) {
+            for (const auto& slice : slices_) {
+                const int32_t frames[2] = {slice.begin, slice.end};
+                stream->Write(frames, sizeof(frames), nullptr);
+            }
+        }
     } else {
         ULONG read = 0;
         if (FAILED(stream->Read(&s, sizeof(s), &read)) ||
@@ -378,7 +415,6 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         Settings restored;
         restored.equalSlices = s.equal != 0;
         restored.sliceCount = int(s.slices);
-        restored.firstNote = int(s.root);
         restored.allSlideColors = s.all != 0;
         restored.fallbackGlideMs = int(s.glide);
         restored.midiOffsetTicks = s.offset;
@@ -387,5 +423,29 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         std::string error;
         if (s.wav[0]) loadWav(s.wav, error);
         if (s.midi[0]) loadMidi(s.midi, error);
+        SavedSliceMarkerHeader markerHeader{};
+        ULONG headerRead = 0;
+        if (SUCCEEDED(stream->Read(&markerHeader, sizeof(markerHeader), &headerRead)) &&
+            headerRead == sizeof(markerHeader) && markerHeader.magic == 0x534c4335 &&
+            markerHeader.count >= 2 && markerHeader.count <= 64) {
+            std::vector<AudioSlice> restoredSlices;
+            for (uint32_t i = 0; i < markerHeader.count; ++i) {
+                int32_t bounds[2]{};
+                ULONG got = 0;
+                if (FAILED(stream->Read(bounds, sizeof(bounds), &got)) || got != sizeof(bounds)) {
+                    restoredSlices.clear(); break;
+                }
+                restoredSlices.push_back({bounds[0], bounds[1]});
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            bool valid = restoredSlices.size() == markerHeader.count && wav_.frames() > 0;
+            for (size_t i = 0; valid && i < restoredSlices.size(); ++i) {
+                valid = restoredSlices[i].begin >= 0 &&
+                        restoredSlices[i].end <= wav_.frames() &&
+                        restoredSlices[i].begin < restoredSlices[i].end;
+                if (i > 0) valid = valid && restoredSlices[i-1].end <= restoredSlices[i].begin;
+            }
+            if (valid) { slices_ = std::move(restoredSlices); slicesManuallyEdited_ = true; }
+        }
     }
 }

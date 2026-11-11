@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FormantSlideNative VERSION 0.4.0 LANGUAGES CXX)
+project(FormantSlideNative VERSION 0.5.0 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "FormantSlide native target requires Windows + MSVC (GitHub Actions windows-2022).")

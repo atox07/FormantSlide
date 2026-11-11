@@ -17,7 +17,6 @@ public:
     struct Settings {
         bool equalSlices = false;
         int sliceCount = 12;
-        int firstNote = 60;
         int noteOffset = 0; // Native SDK pitch calibration (semitones)
         bool allSlideColors = true; // false = channel/color 5 only
         int fallbackGlideMs = 250;
@@ -50,6 +49,7 @@ public:
     Display display() const;
     std::vector<AudioSlice> sliceSnapshot() const;
     int wavFrameCount() const;
+    bool moveSliceBoundary(int boundaryIndex, int frame);
 
 private:
     struct Voice {
@@ -65,6 +65,8 @@ private:
     Settings settings_;
     WaveData wav_;
     std::vector<AudioSlice> slices_;
+    bool slicesManuallyEdited_ = false;
+    int anchorNote_ = -1; // first played vocal note maps to first WAV slice
     MidiFile midi_;
     std::wstring wavPath_, midiPath_;
     std::string status_ = "Load a chromatic WAV to begin";
