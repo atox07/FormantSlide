@@ -32,6 +32,15 @@ float decodeFloat(intptr_t value) {
     std::memcpy(&result, &bits, sizeof(result));
     return result;
 }
+void applyVoicePitch(RubberBand::RubberBandStretcher& engine, double noteShift, int knobCents) {
+    const double knobShift = knobCents / 100.0;
+    const double totalShift = std::clamp(noteShift + knobShift, -48.0, 48.0);
+    engine.setPitchScale(std::exp2(totalShift / 12.0));
+    // R3 applies this envelope correction in addition to the overall pitch shift.
+    // At neutral, use the original automatic formant preservation.
+    engine.setFormantScale(knobCents == 0 ? 0.0 : std::exp2((knobShift - totalShift) / 12.0));
+}
+
 int voiceNote(double cents) {
     return 60 + int(std::lround(std::clamp(cents, -6000.0, 6700.0) / 100.0));
 }
@@ -180,7 +189,7 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     voice.playhead_ = slices_[size_t(index)].begin;
     voice.sliceEnd_ = slices_[size_t(index)].end;
     voice.samplePlaying_ = true;
-    voice.stretch_->setPitchScale(std::exp2(std::clamp(voice.baseOffset + settings_.pitchCents / 100.0, -48.0, 48.0) / 12.0));
+    applyVoicePitch(*voice.stretch_, voice.baseOffset, settings_.pitchCents);
     float silence[64]{};
     const float* pad[] = {silence, silence};
     size_t padding = voice.stretch_->getPreferredStartPad();
@@ -292,8 +301,8 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
         if ((voice.samplePlaying_) || voice.drainRemaining_ > 0) {
             const double interpolation = double(pos + run) / double(length);
             const double hostPitch = hostStart + (nextHostSlide - hostStart) * interpolation;
-            const double semitones = hostPitch + voice.baseOffset + voice.customPitch_ + settings_.pitchCents / 100.0;
-            voice.stretch_->setPitchScale(std::exp2(std::clamp(semitones, -48.0, 48.0) / 12.0));
+            const double semitones = hostPitch + voice.baseOffset + voice.customPitch_;
+            applyVoicePitch(*voice.stretch_, semitones, settings_.pitchCents);
             while (voice.stretch_->available() < run && voice.samplePlaying_) {
                 int count = 0;
                 while (count < 64 && voice.playhead_ + 1 < voice.sliceEnd_) {
