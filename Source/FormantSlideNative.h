@@ -54,6 +54,8 @@ public:
     bool moveSliceBoundary(int boundaryIndex, int frame);
 
 private:
+    using Stretcher = signalsmith::stretch::SignalsmithStretch<float>;
+    std::vector<std::unique_ptr<Stretcher>> spareStretchers_;
     struct Voice {
         intptr_t hostTag = 0;
         PVoiceParams params = nullptr; // HOST-owned, live-updated for native slides
@@ -62,6 +64,16 @@ private:
         double baseOffset = 0;
         bool vocal = false;
         bool released = false;
+        double playhead_ = 0;
+        int releaseFrames = -1;
+        int sliceEnd_ = 0;
+        bool samplePlaying_ = false;
+        int drainRemaining_ = 0;
+        double customPitch_ = 0, customTarget_ = 0, customStep_ = 0;
+        double previousHostSlide_ = 0;
+        int customRemaining_ = 0;
+        std::unique_ptr<Stretcher> stretch_;
+
     };
     mutable std::mutex mutex_;
     Settings settings_;
@@ -77,22 +89,16 @@ private:
     Voice* current_ = nullptr;
     NativeEditor* editor_ = nullptr;
 
-    double sampleRate_ = 44100, playhead_ = 0;
+    double sampleRate_ = 44100;
     std::atomic<float> samplesPerTick_{0.f};
     std::atomic<float> bpm_{120.f};
     std::atomic<int> hostPpq_{192};
-    int sliceEnd_ = 0;
-    bool samplePlaying_ = false;
-    int drainRemaining_ = 0;
-    double customPitch_ = 0, customTarget_ = 0, customStep_ = 0;
-    double previousHostSlide_ = 0;
-    int customRemaining_ = 0;
-    signalsmith::stretch::SignalsmithStretch<float> stretch_;
     std::array<std::array<float, 64>, 2> in_{};
     std::array<std::array<float, 64>, 2> out_{};
 
-    void initStretch();
+    void initStretch(Voice& voice);
+    void stopVoices();
     void beginVocal(Voice& voice);
     void beginSlide(const Voice& slideVoice, int noteLengthTicks, double hostTick);
-    void render(PWAV32FS buffer, int length);
+    void render(Voice& voice, PWAV32FS buffer, int length);
 };
