@@ -232,8 +232,10 @@ TVoiceHandle _stdcall FormantSlideNative::TriggerVoice(PVoiceParams params, intp
     voice.hostTag = tag;
     voice.params = params;
     const float pitch = params->FinalLevels.Pitch;
-    if (!std::isfinite(pitch)) return FVH_Null;
-    voice.note = voiceNote(pitch);
+    const float keyPitch = params->InitLevels.Pitch;
+    if (!std::isfinite(pitch) || !std::isfinite(keyPitch)) return FVH_Null;
+    // Select the slice before channel tuning; render with the live final pitch.
+    voice.note = voiceNote(keyPitch);
     voice.startPitchCents = pitch;
     voice.color = color;
     voice.vocal = color <= 1;
