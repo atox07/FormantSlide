@@ -58,6 +58,15 @@ public:
         addAndMakeVisible(count_);
         addAndMakeVisible(glide_);
         addAndMakeVisible(root_);
+        addAndMakeVisible(pitchLabel_);
+        addAndMakeVisible(pitch_);
+        setLabel(pitchLabel_, "Pitch");
+        pitch_.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        pitch_.setTextBoxStyle(juce::Slider::TextBoxRight, false, 72, 24);
+        pitch_.setRange(-24.0, 24.0, 0.01);
+        pitch_.setTextValueSuffix(" st");
+        pitch_.setDoubleClickReturnValue(true, 0.0);
+        pitch_.onValueChange = [this] { pushSettings(); };
 
         setLabel(modeLabel_, "Slide MIDI channels");
         setLabel(sliceModeLabel_, "Slicer");
@@ -168,7 +177,9 @@ public:
         sliceModeLabel_.setBounds(26, 319, 140, 20);
         sliceMode_.setBounds(26, 343, 205, 30);
         countLabel_.setBounds(256, 319, 160, 20);
-        count_.setBounds(256, 344, 450, 28);
+        count_.setBounds(256, 344, 250, 28);
+        pitchLabel_.setBounds(543, 319, 180, 20);
+        pitch_.setBounds(543, 337, 165, 47);
 
         modeLabel_.setBounds(26, 388, 185, 20);
         mode_.setBounds(26, 412, 205, 29);
@@ -264,6 +275,8 @@ private:
     juce::Label wavLabel_, midiLabel_, modeLabel_, sliceModeLabel_, countLabel_;
     juce::Label glideLabel_, rootLabel_, statusLabel_, warningLabel_;
     juce::ComboBox mode_, sliceMode_;
+    juce::Label pitchLabel_;
+    juce::Slider pitch_;
     juce::Slider count_, glide_, root_;
     juce::AudioFormatManager thumbnailFormats_;
     juce::AudioThumbnailCache cache_{5};
@@ -298,6 +311,7 @@ private:
         sliceMode_.setSelectedId(s.equalSlices ? 2 : 1, juce::dontSendNotification);
         count_.setValue(s.sliceCount, juce::dontSendNotification);
         glide_.setValue(s.fallbackGlideMs, juce::dontSendNotification);
+        pitch_.setValue(s.pitchCents / 100.0, juce::dontSendNotification);
         root_.setValue(s.firstNote, juce::dontSendNotification);
         updatingControls_ = false;
     }
@@ -309,6 +323,7 @@ private:
         settings.equalSlices = sliceMode_.getSelectedId() == 2;
         settings.sliceCount = int(std::lround(count_.getValue()));
         settings.fallbackGlideMs = int(std::lround(glide_.getValue()));
+        settings.pitchCents = int(std::lround(pitch_.getValue() * 100.0));
         settings.firstNote = int(std::lround(root_.getValue()));
         plugin_.updateSettings(settings);
         selectedSlice_ = -1;
@@ -340,9 +355,6 @@ private:
                      " | drag a white marker to adjust its boundary";
         else if (data.slices == 1 && !data.wavName.empty())
             status += "  |  Only 1 slice: try Equal divisions";
-        if (data.lastMidiNote >= 0)
-            status = "Init " + juce::String(data.initCents, 2) + "   Final " + juce::String(data.lastPitchCents, 2) +
-                     "   Channel " + juce::String(data.channelCents) + "   Slice #" + juce::String(data.lastSlice + 1);
         statusLabel_.setText(status, juce::dontSendNotification);
     }
 

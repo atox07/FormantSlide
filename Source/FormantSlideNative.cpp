@@ -15,12 +15,12 @@ TFruityPlugInfo kInfo = {CurrentSDKVersion, kName, kShort,
                           FPF_Type_FullGen, 0, 0, 0};
 struct SavedState {
     uint32_t magic = 0x46534e32; // FSN2
-    uint32_t version = 3;
+    uint32_t version = 4;
     uint32_t equal = 0, slices = 12, root = 60, all = 1, glide = 250; // root retained for loading older projects
     int32_t offset = 0;
     wchar_t wav[512]{};
     wchar_t midi[512]{};
-    int32_t noteOffset = 0; // appended so old project data stays compatible
+    int32_t pitchOrLegacyOffset = 0; // v2: key calibration in semitones; v4: audio transpose in cents
 };
 struct SavedSliceMarkerHeader {
     uint32_t magic = 0x534c4335; // SLC5
@@ -177,12 +177,10 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     voice.sliceIndex = index;
     lastSlice_ = index;
     lastPitchCents_ = voice.startPitchCents;
-    lastInitCents_ = voice.params->InitLevels.Pitch;
-    lastChannelCents_ = channelPitchCents_.load();
     voice.playhead_ = slices_[size_t(index)].begin;
     voice.sliceEnd_ = slices_[size_t(index)].end;
     voice.samplePlaying_ = true;
-    voice.stretch_->setPitchScale(std::exp2(std::clamp(voice.baseOffset, -48.0, 48.0) / 12.0));
+    voice.stretch_->setPitchScale(std::exp2(std::clamp(voice.baseOffset + settings_.pitchCents / 100.0, -48.0, 48.0) / 12.0));
     float silence[64]{};
     const float* pad[] = {silence, silence};
     size_t padding = voice.stretch_->getPreferredStartPad();
@@ -294,7 +292,7 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
         if ((voice.samplePlaying_) || voice.drainRemaining_ > 0) {
             const double interpolation = double(pos + run) / double(length);
             const double hostPitch = hostStart + (nextHostSlide - hostStart) * interpolation;
-            const double semitones = hostPitch + voice.baseOffset + voice.customPitch_;
+            const double semitones = hostPitch + voice.baseOffset + voice.customPitch_ + settings_.pitchCents / 100.0;
             voice.stretch_->setPitchScale(std::exp2(std::clamp(semitones, -48.0, 48.0) / 12.0));
             while (voice.stretch_->available() < run && voice.samplePlaying_) {
                 int count = 0;
@@ -388,6 +386,7 @@ void FormantSlideNative::updateSettings(const Settings& input) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto previous = settings_;
     settings_ = input;
+    settings_.pitchCents = std::clamp(settings_.pitchCents, -2400, 2400);
     settings_.sliceCount = std::clamp(settings_.sliceCount, 1, 64);
     settings_.firstNote = std::clamp(settings_.firstNote, 0, 127);
     settings_.fallbackGlideMs = std::clamp(settings_.fallbackGlideMs, 1, 10000);
@@ -415,8 +414,6 @@ FormantSlideNative::Display FormantSlideNative::display() const {
     d.lastMidiNote = lastMidiNote_;
     d.lastSlice = lastSlice_;
     d.lastPitchCents = lastPitchCents_;
-    d.initCents = lastInitCents_;
-    d.channelCents = lastChannelCents_;
     return d;
 }
 
@@ -466,6 +463,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         s.root = settings_.firstNote;
         s.all = settings_.allSlideColors;
         s.glide = settings_.fallbackGlideMs;
+        s.pitchOrLegacyOffset = settings_.pitchCents;
         s.offset = settings_.midiOffsetTicks;
         wcsncpy_s(s.wav, wavPath_.c_str(), _TRUNCATE);
         wcsncpy_s(s.midi, midiPath_.c_str(), _TRUNCATE);
@@ -482,8 +480,8 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
     } else {
         ULONG read = 0;
         if (FAILED(stream->Read(&s, sizeof(s), &read)) ||
-            read < offsetof(SavedState, noteOffset) ||
-            s.magic != 0x46534e32 || (s.version < 1 || s.version > 3)) return;
+            read < offsetof(SavedState, pitchOrLegacyOffset) ||
+            s.magic != 0x46534e32 || (s.version < 1 || s.version > 4)) return;
         Settings restored;
         restored.equalSlices = s.equal != 0;
         restored.sliceCount = int(s.slices);
@@ -492,7 +490,8 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         restored.midiOffsetTicks = s.offset;
         restored.firstNote = std::clamp(int(s.root), 0, 127);
         if (s.version == 2 && read == sizeof(s))
-            restored.firstNote = std::clamp(restored.firstNote - std::clamp(s.noteOffset, -24, 24), 0, 127);
+            restored.firstNote = std::clamp(restored.firstNote - std::clamp(s.pitchOrLegacyOffset, -24, 24), 0, 127);
+        if (s.version == 4 && read == sizeof(s)) restored.pitchCents = s.pitchOrLegacyOffset;
         updateSettings(restored);
         std::string error;
         if (s.wav[0]) loadWav(s.wav, error);

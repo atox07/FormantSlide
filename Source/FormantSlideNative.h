@@ -20,6 +20,7 @@ public:
         int firstNote = 60; // MIDI key assigned to slice 1
         bool allSlideColors = true; // false = channel/color 5 only
         int fallbackGlideMs = 250;
+        int pitchCents = 0;
         int midiOffsetTicks = 0;
     };
     struct Display {
@@ -30,8 +31,7 @@ public:
         std::wstring wavFullPath, midiFullPath;
         std::string status;
         int rootMidi = 60, lastMidiNote = -1, lastSlice = -1;
-        float lastPitchCents = 0.f, initCents = 0.f;
-        int channelCents = 0;
+        float lastPitchCents = 0.f;
     };
 
     FormantSlideNative(intptr_t tag, TFruityPlugHost* host);
@@ -85,8 +85,7 @@ private:
     std::vector<AudioSlice> slices_;
     bool slicesManuallyEdited_ = false;
     int lastMidiNote_ = -1, lastSlice_ = -1;
-    float lastPitchCents_ = 0.f, lastInitCents_ = 0.f;
-    int lastChannelCents_ = 0;
+    float lastPitchCents_ = 0.f;
     MidiFile midi_;
     std::wstring wavPath_, midiPath_;
     std::string status_ = "Load a chromatic WAV to begin";
