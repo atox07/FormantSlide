@@ -23,7 +23,8 @@ void setLabel(juce::Label& label, const juce::String& value) {
 // Matches the graphical editor of the v0.2 VST3, without requiring a VST wrapper.
 class FormantSlideView final : public juce::Component,
                              public juce::FileDragAndDropTarget,
-                             private juce::ChangeListener {
+                             private juce::ChangeListener,
+                             private juce::Timer {
 public:
     explicit FormantSlideView(FormantSlideNative& native)
         : plugin_(native), thumbnail_(256, thumbnailFormats_, cache_) {
@@ -63,7 +64,7 @@ public:
         setLabel(countLabel_, "Equal divisions");
         setLabel(glideLabel_, "Fallback glide (ms)");
         setLabel(offsetLabel_, "FL note calibration");
-        setLabel(warningLabel_, "Drag slice markers to adjust cuts | First played vocal note anchors slice 1");
+        setLabel(warningLabel_, "Slice mapping from WAV pitch (not first key) | Drag markers to adjust cuts");
         warningLabel_.setJustificationType(juce::Justification::centred);
         warningLabel_.setColour(juce::Label::textColourId, juce::Colour(0xffffb65c));
         wavLabel_.setJustificationType(juce::Justification::centredLeft);
@@ -100,9 +101,11 @@ public:
             if (existing.existsAsFile()) thumbnail_.setSource(new juce::FileInputSource(existing));
         }
         refreshStatus();
+        startTimerHz(4); // refresh host pitch/slice diagnostics when FL plays notes
     }
 
     ~FormantSlideView() override {
+        stopTimer();
         thumbnail_.removeChangeListener(this);
         setLookAndFeel(nullptr);
     }
@@ -165,8 +168,7 @@ public:
         sliceMode_.setBounds(26, 343, 205, 30);
         countLabel_.setBounds(256, 319, 160, 20);
         count_.setBounds(256, 344, 450, 28);
-        // First slice MIDI note is intentionally absent. The first played
-        // vocal note establishes the anchor and sounds at the original pitch.
+        // No First slice MIDI note control. Root is detected from WAV audio.
 
         modeLabel_.setBounds(26, 388, 185, 20);
         mode_.setBounds(26, 412, 205, 29);
@@ -217,6 +219,7 @@ public:
     }
 
     void mouseUp(const juce::MouseEvent&) override {
+        if (draggedBoundary_ > 0) plugin_.finishSliceBoundaryEdit();
         draggedBoundary_ = -1;
         setMouseCursor(juce::MouseCursor::NormalCursor);
     }
@@ -301,7 +304,12 @@ private:
 
     void refreshStatus() {
         const auto data = plugin_.display();
-        juce::String status = juce::String(data.slices) + " slices | auto MIDI anchor";
+        juce::String status = juce::String(data.slices) + " slices | root " +
+            juce::String(data.rootMidi) + (data.detectedRoot ? " (WAV)" : " (fallback)");
+        if (data.lastMidiNote >= 0)
+            status += " | MIDI " + juce::String(data.lastMidiNote) +
+                      " [" + juce::String(data.lastPitchCents, 0) + "c]" +
+                      " -> #" + juce::String(data.lastSlice + 1);
         if (selectedSlice_ >= 0)
             status = "Selected slice " + juce::String(selectedSlice_ + 1) +
                      " | drag a white marker to adjust its boundary";
@@ -342,6 +350,7 @@ private:
     }
 
     void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(); }
+    void timerCallback() override { refreshStatus(); }
 };
 
 NativeEditor::NativeEditor(FormantSlideNative& plugin) : plugin_(plugin) {}

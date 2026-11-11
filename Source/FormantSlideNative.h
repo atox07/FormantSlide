@@ -29,6 +29,9 @@ public:
         std::wstring wavName, midiName;
         std::wstring wavFullPath, midiFullPath;
         std::string status;
+        int rootMidi = 60, lastMidiNote = -1, lastSlice = -1;
+        float lastPitchCents = 0.f;
+        bool detectedRoot = false;
     };
 
     FormantSlideNative(intptr_t tag, TFruityPlugHost* host);
@@ -50,6 +53,7 @@ public:
     std::vector<AudioSlice> sliceSnapshot() const;
     int wavFrameCount() const;
     bool moveSliceBoundary(int boundaryIndex, int frame);
+    void finishSliceBoundaryEdit();
 
 private:
     struct Voice {
@@ -66,7 +70,10 @@ private:
     WaveData wav_;
     std::vector<AudioSlice> slices_;
     bool slicesManuallyEdited_ = false;
-    int anchorNote_ = -1; // first played vocal note maps to first WAV slice
+    int rootMidi_ = 60; // inferred WAV first-note pitch; fallback = VST3 C5/MIDI60
+    bool detectedRoot_ = false;
+    int lastMidiNote_ = -1, lastSlice_ = -1;
+    float lastPitchCents_ = 0.f;
     MidiFile midi_;
     std::wstring wavPath_, midiPath_;
     std::string status_ = "Load a chromatic WAV to begin";
@@ -90,6 +97,7 @@ private:
 
     void initStretch();
     void beginVocal(Voice& voice);
+    void updateWavRoot();
     void beginSlide(const Voice& slideVoice, int noteLengthTicks, double hostTick);
     void render(PWAV32FS buffer, int length);
 };

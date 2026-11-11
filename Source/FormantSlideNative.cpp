@@ -35,7 +35,11 @@ float decodeFloat(intptr_t value) {
 int voiceNote(PVoiceParams p) {
     // FL native API gives cents relative to middle C (MIDI 60).
     // Conversion is intentionally shared by vocal and slide notes.
-    return std::clamp(60 + int(std::lround(double(p->InitLevels.Pitch) / 100.0)), 0, 127);
+    // FP_FullGen already includes FPF_NewVoiceParams: Pitch is float cents
+    // relative to MIDI 60 (FL Studio's C5). Reject host NaNs gracefully.
+    const double cents = p->InitLevels.Pitch;
+    if (!std::isfinite(cents)) return 60;
+    return std::clamp(60 + int(std::lround(std::clamp(cents, -6000.0, 6700.0) / 100.0)), 0, 127);
 }
 }
 
@@ -153,6 +157,34 @@ void _stdcall FormantSlideNative::GetName(int section, int index, int, char* nam
     }
 }
 
+void FormantSlideNative::updateWavRoot() {
+    // Must be called with mutex_ held.  No potentially expensive analysis
+    // happens on the audio thread. Check several slices: first can be noisy.
+    rootMidi_ = 60; // same fallback used by VST3 v0.2
+    detectedRoot_ = false;
+    if (slices_.empty() || wav_.frames() < 2) return;
+    struct Candidate { int root; float confidence; };
+    std::vector<Candidate> candidates;
+    for (int i = 0; i < std::min(12, int(slices_.size())); ++i) {
+        const auto pitch = estimateSlicePitch(wav_, slices_[size_t(i)]);
+        if (pitch.midi < 0 || pitch.confidence < 0.65f) continue;
+        const int note = int(std::lround(pitch.midi));
+        candidates.push_back({note - i, pitch.confidence});
+    }
+    if (candidates.empty()) return;
+    int best = 0; float bestScore = -1.f;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        float votes = 0.f;
+        for (const auto& c : candidates)
+            if (std::abs(c.root - candidates[i].root) <= 1) votes += c.confidence;
+        if (votes > bestScore) {bestScore = votes; best = int(i);}
+    }
+    // Do not trust an isolated artifact if other confident slices disagree.
+    if (candidates.size() > 2 && bestScore < float(candidates.size()) * 0.45f) return;
+    rootMidi_ = std::clamp(candidates[size_t(best)].root, 0, 127);
+    detectedRoot_ = true;
+}
+
 void FormantSlideNative::beginVocal(Voice& voice) {
     current_ = &voice;
     customPitch_ = customTarget_ = 0;
@@ -161,11 +193,13 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     stretch_.reset();
     const int count = int(slices_.size());
     if (!count || !wav_.frames()) { samplePlaying_ = false; return; }
-    // The FIRST vocal note establishes the MIDI-to-WAV mapping. Its slice
-    // plays without transposition regardless of whether it is C3 or C6.
-    if (anchorNote_ < 0) anchorNote_ = voice.note;
-    const int index = std::clamp(voice.note - anchorNote_, 0, count - 1);
-    voice.baseOffset = double(voice.note - (anchorNote_ + index));
+    // Match the working v0.2 VST3: a fixed root defines slice position.
+    // Root is estimated from the WAV, never from the order notes are pressed.
+    const int index = std::clamp(voice.note - rootMidi_, 0, count - 1);
+    voice.baseOffset = double(voice.note - (rootMidi_ + index));
+    lastMidiNote_ = voice.note;
+    lastSlice_ = index;
+    lastPitchCents_ = voice.startPitchCents;
     playhead_ = slices_[size_t(index)].begin;
     sliceEnd_ = slices_[size_t(index)].end;
     samplePlaying_ = true;
@@ -311,7 +345,8 @@ bool FormantSlideNative::loadWav(const std::wstring& path, std::string& error) {
     wavPath_ = path;
     slices_ = sliceWav(wav_, settings_.equalSlices, settings_.sliceCount);
     slicesManuallyEdited_ = false;
-    anchorNote_ = -1;
+    updateWavRoot();
+    lastMidiNote_ = lastSlice_ = -1;
     samplePlaying_ = false;
     stretch_.reset();
     status_ = "WAV loaded";
@@ -338,7 +373,8 @@ void FormantSlideNative::updateSettings(const Settings& input) {
     if (settings_.equalSlices != previous.equalSlices || settings_.sliceCount != previous.sliceCount) {
         slices_ = sliceWav(wav_, settings_.equalSlices, settings_.sliceCount);
         slicesManuallyEdited_ = false;
-        anchorNote_ = -1;
+        updateWavRoot();
+        lastMidiNote_ = lastSlice_ = -1;
         samplePlaying_ = false;
     }
 }
@@ -353,6 +389,11 @@ FormantSlideNative::Display FormantSlideNative::display() const {
     if (!midiPath_.empty()) d.midiName = std::filesystem::path(midiPath_).filename().wstring();
     d.midiFullPath = midiPath_;
     d.status = status_;
+    d.rootMidi = rootMidi_;
+    d.detectedRoot = detectedRoot_;
+    d.lastMidiNote = lastMidiNote_;
+    d.lastSlice = lastSlice_;
+    d.lastPitchCents = lastPitchCents_;
     return d;
 }
 
@@ -374,8 +415,14 @@ bool FormantSlideNative::moveSliceBoundary(int boundaryIndex, int frame) {
     left.end = boundary;
     right.begin = boundary;
     slicesManuallyEdited_ = true;
+    // Pitch analysis happens when the user releases the mouse, not on each drag.
     // Current playback finishes with its original end until the next note.
     return true;
+}
+
+void FormantSlideNative::finishSliceBoundaryEdit() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (slicesManuallyEdited_) updateWavRoot();
 }
 
 int FormantSlideNative::wavFrameCount() const {
@@ -390,7 +437,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         std::lock_guard<std::mutex> lock(mutex_);
         s.equal = settings_.equalSlices;
         s.slices = settings_.sliceCount;
-        s.root = 60; // historical field, ignored by automatic note anchoring
+        s.root = 60; // reserved legacy field: WAV pitch estimation is used instead
         s.all = settings_.allSlideColors;
         s.glide = settings_.fallbackGlideMs;
         s.offset = settings_.midiOffsetTicks;
@@ -445,7 +492,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
                         restoredSlices[i].begin < restoredSlices[i].end;
                 if (i > 0) valid = valid && restoredSlices[i-1].end <= restoredSlices[i].begin;
             }
-            if (valid) { slices_ = std::move(restoredSlices); slicesManuallyEdited_ = true; }
+            if (valid) { slices_ = std::move(restoredSlices); slicesManuallyEdited_ = true; updateWavRoot(); }
         }
     }
 }
