@@ -340,6 +340,9 @@ private:
                      " | drag a white marker to adjust its boundary";
         else if (data.slices == 1 && !data.wavName.empty())
             status += "  |  Only 1 slice: try Equal divisions";
+        if (data.lastMidiNote >= 0)
+            status = "Init " + juce::String(data.initCents, 2) + "   Final " + juce::String(data.lastPitchCents, 2) +
+                     "   Channel " + juce::String(data.channelCents) + "   Slice #" + juce::String(data.lastSlice + 1);
         statusLabel_.setText(status, juce::dontSendNotification);
     }
 

@@ -177,6 +177,8 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     voice.sliceIndex = index;
     lastSlice_ = index;
     lastPitchCents_ = voice.startPitchCents;
+    lastInitCents_ = voice.params->InitLevels.Pitch;
+    lastChannelCents_ = channelPitchCents_.load();
     voice.playhead_ = slices_[size_t(index)].begin;
     voice.sliceEnd_ = slices_[size_t(index)].end;
     voice.samplePlaying_ = true;
@@ -413,6 +415,8 @@ FormantSlideNative::Display FormantSlideNative::display() const {
     d.lastMidiNote = lastMidiNote_;
     d.lastSlice = lastSlice_;
     d.lastPitchCents = lastPitchCents_;
+    d.initCents = lastInitCents_;
+    d.channelCents = lastChannelCents_;
     return d;
 }
 
