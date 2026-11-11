@@ -1,96 +1,116 @@
-#include "FormantSlideNative.h"
-#include "WinEditor.h"
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <cstddef>
-#include <cwchar>
-#include <filesystem>
-
-namespace {
-char kName[] = "FormantSlide";
-char kShort[] = "FormantSlide";
-TFruityPlugInfo kInfo = {CurrentSDKVersion, kName, kShort,
-                          FPF_Type_FullGen, 0, 0, 0};
-struct SavedState {
-    uint32_t magic = 0x46534e32; // FSN2
-    uint32_t version = 4;
-    uint32_t equal = 0, slices = 12, root = 60, all = 1, glide = 250; // root retained for loading older projects
-    int32_t offset = 0;
-    wchar_t wav[512]{};
-    wchar_t midi[512]{};
-    int32_t pitchOrLegacyOffset = 0; // v2: key calibration in semitones; v4: audio transpose in cents
-};
-struct SavedSliceMarkerHeader {
-    uint32_t magic = 0x534c4335; // SLC5
-    uint32_t count = 0;
-};
-float decodeFloat(intptr_t value) {
-    const uint32_t bits = static_cast<uint32_t>(value);
-    float result = 0;
-    std::memcpy(&result, &bits, sizeof(result));
-    return result;
-}
-void applyVoicePitch(RubberBand::RubberBandStretcher& engine, double noteShift, int knobCents) {
-    const double knobShift = knobCents / 100.0;
-    const double totalShift = std::clamp(noteShift + knobShift, -48.0, 48.0);
-    engine.setPitchScale(std::exp2(totalShift / 12.0));
-    // R3 applies this envelope correction in addition to the overall pitch shift.
-    // At neutral, use the original automatic formant preservation.
-    engine.setFormantScale(knobCents == 0 ? 0.0 : std::exp2((knobShift - totalShift) / 12.0));
+    d.midiFullPath = midiPath_;
+    d.status = status_;
+    d.rootMidi = settings_.firstNote;
+    d.lastMidiNote = lastMidiNote_;
+    d.lastSlice = lastSlice_;
+    d.lastPitchCents = lastPitchCents_;
+    return d;
 }
 
-int voiceNote(double cents) {
-    return 60 + int(std::lround(std::clamp(cents, -6000.0, 6700.0) / 100.0));
+std::vector<AudioSlice> FormantSlideNative::sliceSnapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return slices_;
 }
+bool FormantSlideNative::moveSliceBoundary(int boundaryIndex, int frame) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (boundaryIndex < 1 || boundaryIndex >= int(slices_.size())) return false;
+    auto& left = slices_[size_t(boundaryIndex - 1)];
+    auto& right = slices_[size_t(boundaryIndex)];
+    // Keep a minimum audible region on either side, and never cross markers.
+    const int minGap = std::max(2, wav_.sampleRate / 200); // 5 ms
+    const int low = left.begin + minGap;
+    const int high = right.end - minGap;
+    if (low > high) return false;
+    const int boundary = std::clamp(frame, low, high);
+    left.end = boundary;
+    right.begin = boundary;
+    slicesManuallyEdited_ = true;
+    // Current playback finishes with its original end until the next note.
+    return true;
 }
 
-extern "C" __declspec(dllexport) TFruityPlug* _stdcall
-CreatePlugInstance(TFruityPlugHost* host, TPluginTag tag) {
-    return new FormantSlideNative(tag, host);
+std::vector<int> FormantSlideNative::playingSlices() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<int> active;
+    for (const auto& voice : voices_)
+        if (voice->releaseFrames != 0 && (voice->samplePlaying_ || voice->drainRemaining_ > 0))
+            active.push_back(voice->sliceIndex);
+    return active;
 }
 
-FormantSlideNative::FormantSlideNative(intptr_t tag, TFruityPlugHost* host)
-    : TCPPFruityPlug(tag, host, nullptr) {
-    Info = &kInfo;
-    PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, 0);
+int FormantSlideNative::wavFrameCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return wav_.frames();
 }
-FormantSlideNative::~FormantSlideNative() = default;
 
-void FormantSlideNative::initStretch(Voice& voice) {
-    // Match the v0.2 VST3 engine settings to keep its familiar response.
-    if (spareStretchers_.empty()) {
-        constexpr int options = Stretcher::OptionEngineFiner | Stretcher::OptionProcessRealTime |
-            Stretcher::OptionPitchHighConsistency | Stretcher::OptionFormantPreserved |
-            Stretcher::OptionChannelsTogether | Stretcher::OptionWindowShort | Stretcher::OptionThreadingNever;
-        voice.stretch_ = std::make_unique<Stretcher>(size_t(sampleRate_), 2, options);
-        voice.stretch_->setMaxProcessSize(64);
+void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
+    if (!stream) return;
+    SavedState s;
+    if (save) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        s.equal = settings_.equalSlices;
+        s.slices = settings_.sliceCount;
+        s.root = settings_.firstNote;
+        s.all = settings_.allSlideColors;
+        s.glide = settings_.fallbackGlideMs;
+        s.pitchOrLegacyOffset = settings_.pitchCents;
+        s.offset = settings_.midiOffsetTicks;
+        wcsncpy_s(s.wav, wavPath_.c_str(), _TRUNCATE);
+        wcsncpy_s(s.midi, midiPath_.c_str(), _TRUNCATE);
+        stream->Write(&s, sizeof(s), nullptr);
+        SavedSliceMarkerHeader markerHeader;
+        markerHeader.count = slicesManuallyEdited_ ? uint32_t(slices_.size()) : 0;
+        stream->Write(&markerHeader, sizeof(markerHeader), nullptr);
+        if (markerHeader.count > 0) {
+            for (const auto& slice : slices_) {
+                const int32_t frames[2] = {slice.begin, slice.end};
+                stream->Write(frames, sizeof(frames), nullptr);
+            }
+        }
     } else {
-        voice.stretch_ = std::move(spareStretchers_.back());
-        spareStretchers_.pop_back();
+        ULONG read = 0;
+        if (FAILED(stream->Read(&s, sizeof(s), &read)) ||
+            read < offsetof(SavedState, pitchOrLegacyOffset) ||
+            s.magic != 0x46534e32 || (s.version < 1 || s.version > 4)) return;
+        Settings restored;
+        restored.equalSlices = s.equal != 0;
+        restored.sliceCount = int(s.slices);
+        restored.allSlideColors = s.all != 0;
+        restored.fallbackGlideMs = int(s.glide);
+        restored.midiOffsetTicks = s.offset;
+        restored.firstNote = std::clamp(int(s.root), 0, 127);
+        if (s.version == 2 && read == sizeof(s))
+            restored.firstNote = std::clamp(restored.firstNote - std::clamp(s.pitchOrLegacyOffset, -24, 24), 0, 127);
+        if (s.version == 4 && read == sizeof(s)) restored.pitchCents = s.pitchOrLegacyOffset;
+        s.wav[511] = L'\0';
+        s.midi[511] = L'\0';
+        updateSettings(restored);
+        std::string error;
+        if (s.wav[0]) loadWav(s.wav, error);
+        if (s.midi[0]) loadMidi(s.midi, error);
+        SavedSliceMarkerHeader markerHeader{};
+        ULONG headerRead = 0;
+        if (SUCCEEDED(stream->Read(&markerHeader, sizeof(markerHeader), &headerRead)) &&
+            headerRead == sizeof(markerHeader) && markerHeader.magic == 0x534c4335 &&
+            markerHeader.count >= 2 && markerHeader.count <= uint32_t(wavFrameCount() / 2)) {
+            std::vector<AudioSlice> restoredSlices;
+            for (uint32_t i = 0; i < markerHeader.count; ++i) {
+                int32_t bounds[2]{};
+                ULONG got = 0;
+                if (FAILED(stream->Read(bounds, sizeof(bounds), &got)) || got != sizeof(bounds)) {
+                    restoredSlices.clear(); break;
+                }
+                restoredSlices.push_back({bounds[0], bounds[1]});
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            bool valid = restoredSlices.size() == markerHeader.count && wav_.frames() > 0;
+            for (size_t i = 0; valid && i < restoredSlices.size(); ++i) {
+                valid = restoredSlices[i].begin >= 0 &&
+                        restoredSlices[i].end <= wav_.frames() &&
+                        restoredSlices[i].begin < restoredSlices[i].end;
+                if (i > 0) valid = valid && restoredSlices[i-1].end <= restoredSlices[i].begin;
+            }
+            if (valid) { slices_ = std::move(restoredSlices); slicesManuallyEdited_ = true; }
+        }
     }
-    voice.engineRate = sampleRate_;
-    voice.stretch_->reset();
-    voice.drainRemaining_ = 0;
 }
-
-void _stdcall FormantSlideNative::DestroyObject() {
-    if (editor_) { editor_->close(); delete editor_; editor_ = nullptr; }
-    EditorHandle = nullptr;
-    TCPPFruityPlug::DestroyObject();
-}
-
-intptr_t _stdcall FormantSlideNative::Dispatcher(intptr_t id, intptr_t index, intptr_t value) {
-    if (id == FPD_ShowEditor) {
-        // The native host checks EditorHandle after this callback. Only publish
-        // a real, valid HWND; never leave a stale handle after editor teardown.
-        if (value) {
-            const auto parent = reinterpret_cast<HWND>(value);
-            if (!IsWindow(parent)) { EditorHandle = nullptr; return 0; }
-            if (!editor_) editor_ = new NativeEditor(*this);
-            EditorHandle = editor_->show(parent);
-            if (!IsWindow(EditorHandle)) EditorHandle = nullptr;
-        } else {
-            if (editor_) editor_->hide();
-            EditorHandle = nullptr; // Never expose a hidden/stale HWND to the host.
