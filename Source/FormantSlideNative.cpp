@@ -136,6 +136,7 @@ intptr_t _stdcall FormantSlideNative::Dispatcher(intptr_t id, intptr_t index, in
 }
 
 int _stdcall FormantSlideNative::ProcessEvent(int eventId, int eventValue, int flags) {
+    if (eventId == FPE_MIDI_Pitch) channelPitchCents_.store(eventValue);
     if (eventId == FPE_Tempo) {
         const float newTempo = decodeFloat(eventValue);
         if (std::isfinite(newTempo) && newTempo > 1.f && newTempo < 1000.f)
@@ -232,10 +233,9 @@ TVoiceHandle _stdcall FormantSlideNative::TriggerVoice(PVoiceParams params, intp
     voice.hostTag = tag;
     voice.params = params;
     const float pitch = params->FinalLevels.Pitch;
-    const float keyPitch = params->InitLevels.Pitch;
-    if (!std::isfinite(pitch) || !std::isfinite(keyPitch)) return FVH_Null;
-    // Select the slice before channel tuning; render with the live final pitch.
-    voice.note = voiceNote(keyPitch);
+    if (!std::isfinite(pitch)) return FVH_Null;
+    // FL supplies the sounding pitch relative to middle C. Remove only channel tuning for the key lookup.
+    voice.note = voiceNote(double(pitch) - channelPitchCents_.load());
     voice.startPitchCents = pitch;
     voice.color = color;
     voice.vocal = color <= 1;

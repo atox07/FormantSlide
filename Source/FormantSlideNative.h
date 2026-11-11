@@ -94,6 +94,7 @@ private:
 
     double sampleRate_ = 44100;
     std::atomic<float> samplesPerTick_{0.f};
+    std::atomic<int> channelPitchCents_{0};
     std::atomic<float> bpm_{120.f};
     std::atomic<int> hostPpq_{192};
     std::array<std::array<float, 64>, 2> in_{};
