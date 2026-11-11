@@ -12,10 +12,10 @@ namespace {
 char kName[] = "FormantSlide";
 char kShort[] = "FormantSlide";
 TFruityPlugInfo kInfo = {CurrentSDKVersion, kName, kShort,
-                          FPF_Type_FullGen, 0, 1, 0};
+                          FPF_Type_FullGen, 0, 0, 0};
 struct SavedState {
     uint32_t magic = 0x46534e32; // FSN2
-    uint32_t version = 2;
+    uint32_t version = 3;
     uint32_t equal = 0, slices = 12, root = 60, all = 1, glide = 250; // root retained for loading older projects
     int32_t offset = 0;
     wchar_t wav[512]{};
@@ -32,19 +32,13 @@ float decodeFloat(intptr_t value) {
     std::memcpy(&result, &bits, sizeof(result));
     return result;
 }
-int voiceNote(PVoiceParams p) {
-    // FL native API gives cents relative to middle C (MIDI 60).
-    // Conversion is intentionally shared by vocal and slide notes.
-    // FP_FullGen already includes FPF_NewVoiceParams: Pitch is float cents
-    // relative to MIDI 60 (FL Studio's C5). Reject host NaNs gracefully.
-    const double cents = p->InitLevels.Pitch;
-    if (!std::isfinite(cents)) return 60;
-    return std::clamp(60 + int(std::lround(std::clamp(cents, -6000.0, 6700.0) / 100.0)), 0, 127);
+int voiceNote(double cents) {
+    return 60 + int(std::lround(std::clamp(cents, -6000.0, 6700.0) / 100.0));
 }
 }
 
 extern "C" __declspec(dllexport) TFruityPlug* _stdcall
-CreatePlugInstance(TFruityPlugHost* host, int tag) {
+CreatePlugInstance(TFruityPlugHost* host, TPluginTag tag) {
     return new FormantSlideNative(tag, host);
 }
 
@@ -157,34 +151,6 @@ void _stdcall FormantSlideNative::GetName(int section, int index, int, char* nam
     }
 }
 
-void FormantSlideNative::updateWavRoot() {
-    // Must be called with mutex_ held.  No potentially expensive analysis
-    // happens on the audio thread. Check several slices: first can be noisy.
-    rootMidi_ = 60; // same fallback used by VST3 v0.2
-    detectedRoot_ = false;
-    if (slices_.empty() || wav_.frames() < 2) return;
-    struct Candidate { int root; float confidence; };
-    std::vector<Candidate> candidates;
-    for (int i = 0; i < std::min(12, int(slices_.size())); ++i) {
-        const auto pitch = estimateSlicePitch(wav_, slices_[size_t(i)]);
-        if (pitch.midi < 0 || pitch.confidence < 0.65f) continue;
-        const int note = int(std::lround(pitch.midi));
-        candidates.push_back({note - i, pitch.confidence});
-    }
-    if (candidates.empty()) return;
-    int best = 0; float bestScore = -1.f;
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        float votes = 0.f;
-        for (const auto& c : candidates)
-            if (std::abs(c.root - candidates[i].root) <= 1) votes += c.confidence;
-        if (votes > bestScore) {bestScore = votes; best = int(i);}
-    }
-    // Do not trust an isolated artifact if other confident slices disagree.
-    if (candidates.size() > 2 && bestScore < float(candidates.size()) * 0.45f) return;
-    rootMidi_ = std::clamp(candidates[size_t(best)].root, 0, 127);
-    detectedRoot_ = true;
-}
-
 void FormantSlideNative::beginVocal(Voice& voice) {
     current_ = &voice;
     customPitch_ = customTarget_ = 0;
@@ -194,9 +160,8 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     const int count = int(slices_.size());
     if (!count || !wav_.frames()) { samplePlaying_ = false; return; }
     // Match the working v0.2 VST3: a fixed root defines slice position.
-    // Root is estimated from the WAV, never from the order notes are pressed.
-    const int index = std::clamp(voice.note - rootMidi_, 0, count - 1);
-    voice.baseOffset = double(voice.note - (rootMidi_ + index));
+    const int index = std::clamp(voice.note - settings_.firstNote, 0, count - 1);
+    voice.baseOffset = 60.0 + voice.startPitchCents / 100.0 - (settings_.firstNote + index);
     lastMidiNote_ = voice.note;
     lastSlice_ = index;
     lastPitchCents_ = voice.startPitchCents;
@@ -213,20 +178,18 @@ void FormantSlideNative::beginSlide(const Voice& slide, int sdkLength, double ho
     if (ticks <= 0 || ticks > ppq * 256)
         ticks = midi_.durationTicks(slide.color + 1, slide.note, hostTick,
                                     ppq, settings_.midiOffsetTicks);
-    int frames = 0;
+    double duration = sampleRate_ * settings_.fallbackGlideMs / 1000.0;
     if (ticks > 0) {
-        const float samplesPerTick = samplesPerTick_.load();
-        if (samplesPerTick > 0)
-            frames = int(std::lround(double(ticks) * samplesPerTick));
-        else
-            frames = int(std::lround(double(ticks) * sampleRate_ * 60.0 /
-                         (double(bpm_.load()) * double(ppq))));
+        const double hostSamples = samplesPerTick_.load();
+        const double perTick = hostSamples > 0 ? hostSamples
+            : sampleRate_ * 60.0 / (double(bpm_.load()) * ppq);
+        duration = ticks * perTick;
     }
-    if (frames <= 0)
-        frames = int(std::lround(sampleRate_ * settings_.fallbackGlideMs / 1000.0));
-    frames = std::clamp(frames, 1, int(sampleRate_ * 20));
+    const int frames = int(std::lround(std::clamp(duration, 1.0, sampleRate_ * 20)));
     // Absolute destination is determined by slide pitch, NOT duration.
-    customTarget_ = double(slide.note) - double(current_->note);
+    const double liveCents = current_->params->FinalLevels.Pitch;
+    if (!std::isfinite(liveCents)) return;
+    customTarget_ = (slide.startPitchCents - liveCents) / 100.0;
     customRemaining_ = frames;
     customStep_ = (customTarget_ - customPitch_) / double(frames);
 }
@@ -237,23 +200,26 @@ TVoiceHandle _stdcall FormantSlideNative::TriggerVoice(PVoiceParams params, intp
     if (color < 0 || color > 15) color = 0;
     const int length = PlugHost->Voice_ProcessEvent(tag, FPV_GetLength, 0, 0);
     const double tick = PlugHost->GetSongMixingTime_A();
-    auto entry = std::make_unique<Voice>();
-    entry->hostTag = tag;
-    entry->params = params;
-    entry->note = voiceNote(params);
-    entry->startPitchCents = params->InitLevels.Pitch;
-    entry->color = color;
-    entry->vocal = color <= 1;
-    Voice* ptr = entry.get();
+    Voice voice;
+    voice.hostTag = tag;
+    voice.params = params;
+    const float pitch = params->FinalLevels.Pitch;
+    if (!std::isfinite(pitch)) return FVH_Null;
+    voice.note = voiceNote(pitch);
+    voice.startPitchCents = pitch;
+    voice.color = color;
+    voice.vocal = color <= 1;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        ptr->note = std::clamp(ptr->note + settings_.noteOffset, 0, 127);
-        const bool slide = settings_.allSlideColors ? color >= 2 : color == 4;
-        voices_.push_back(std::move(entry));
-        if (ptr->vocal) beginVocal(*ptr);
-        else if (slide) beginSlide(*ptr, length, tick);
+        if (!voice.vocal) {
+            const bool slide = settings_.allSlideColors || color == 4;
+            if (slide) beginSlide(voice, length, tick);
+            return FVH_Null; // Control event consumed; FL has no audio voice to release.
+        }
+        voices_.push_back(std::make_unique<Voice>(voice));
+        beginVocal(*voices_.back());
+        return reinterpret_cast<TVoiceHandle>(current_);
     }
-    return reinterpret_cast<TVoiceHandle>(ptr);
 }
 
 void _stdcall FormantSlideNative::Voice_Release(TVoiceHandle handle) {
@@ -262,8 +228,6 @@ void _stdcall FormantSlideNative::Voice_Release(TVoiceHandle handle) {
         if (reinterpret_cast<TVoiceHandle>(v.get()) != handle) continue;
         v->released = true;
         if (v.get() == current_) samplePlaying_ = false;
-        // A slide Note Off does NOT change the destination pitch. Its duration
-        // was used when the ramp started; the final pitch remains held.
         break;
     }
 }
@@ -283,7 +247,7 @@ void FormantSlideNative::render(PWAV32FS buffer, int length) {
     float* targets[] = {out_[0].data(), out_[1].data()};
     // FL computes native note slide pitch before each render block. Interpolate
     // the host values across this block to avoid control-rate stepping.
-    const double nextHostSlide = current_ && current_->params
+    const double nextHostSlide = current_ && std::isfinite(current_->params->FinalLevels.Pitch)
         ? (double(current_->params->FinalLevels.Pitch) - current_->startPitchCents) / 100.0 : 0.0;
     const double hostStart = previousHostSlide_;
     for (int pos = 0; pos < length; pos += 64) {
@@ -331,10 +295,29 @@ void FormantSlideNative::render(PWAV32FS buffer, int length) {
     previousHostSlide_ = nextHostSlide;
 }
 void _stdcall FormantSlideNative::Gen_Render(PWAV32FS buffer, int& length) {
-    if (length <= 0) return;
+    if (!buffer || length <= 0) { length = 0; return; }
     // Never wait for a GUI file operation in the audio thread.
     std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-    if (lock.owns_lock()) render(buffer, length);
+    if (!lock.owns_lock()) { length = 0; return; }
+    if (samplePlaying_ || drainRemaining_ > 0) {
+        render(buffer, length);
+    } else {
+        length = 0;
+    }
+    // Released handles belong to the host until acknowledged. Host callbacks
+    // can re-enter this plugin, so discard the local handle before notifying FL.
+    for (;;) {
+        const auto done = std::find_if(voices_.begin(), voices_.end(), [this](const auto& v) {
+            return v->released && (v.get() != current_ || drainRemaining_ == 0);
+        });
+        if (done == voices_.end()) break;
+        const auto tag = (*done)->hostTag;
+        if (done->get() == current_) current_ = nullptr;
+        voices_.erase(done);
+        lock.unlock();
+        PlugHost->Voice_Kill(tag, FALSE);
+        lock.lock();
+    }
 }
 
 bool FormantSlideNative::loadWav(const std::wstring& path, std::string& error) {
@@ -345,7 +328,6 @@ bool FormantSlideNative::loadWav(const std::wstring& path, std::string& error) {
     wavPath_ = path;
     slices_ = sliceWav(wav_, settings_.equalSlices, settings_.sliceCount);
     slicesManuallyEdited_ = false;
-    updateWavRoot();
     lastMidiNote_ = lastSlice_ = -1;
     samplePlaying_ = false;
     stretch_.reset();
@@ -366,14 +348,13 @@ void FormantSlideNative::updateSettings(const Settings& input) {
     const auto previous = settings_;
     settings_ = input;
     settings_.sliceCount = std::clamp(settings_.sliceCount, 1, 64);
-    settings_.noteOffset = std::clamp(settings_.noteOffset, -24, 24);
+    settings_.firstNote = std::clamp(settings_.firstNote, 0, 127);
     settings_.fallbackGlideMs = std::clamp(settings_.fallbackGlideMs, 1, 10000);
     // Do not rebuild/silence a playing sample just because glide or pitch
     // calibration has been adjusted with a slider.
     if (settings_.equalSlices != previous.equalSlices || settings_.sliceCount != previous.sliceCount) {
         slices_ = sliceWav(wav_, settings_.equalSlices, settings_.sliceCount);
         slicesManuallyEdited_ = false;
-        updateWavRoot();
         lastMidiNote_ = lastSlice_ = -1;
         samplePlaying_ = false;
     }
@@ -389,8 +370,7 @@ FormantSlideNative::Display FormantSlideNative::display() const {
     if (!midiPath_.empty()) d.midiName = std::filesystem::path(midiPath_).filename().wstring();
     d.midiFullPath = midiPath_;
     d.status = status_;
-    d.rootMidi = rootMidi_;
-    d.detectedRoot = detectedRoot_;
+    d.rootMidi = settings_.firstNote;
     d.lastMidiNote = lastMidiNote_;
     d.lastSlice = lastSlice_;
     d.lastPitchCents = lastPitchCents_;
@@ -415,14 +395,8 @@ bool FormantSlideNative::moveSliceBoundary(int boundaryIndex, int frame) {
     left.end = boundary;
     right.begin = boundary;
     slicesManuallyEdited_ = true;
-    // Pitch analysis happens when the user releases the mouse, not on each drag.
     // Current playback finishes with its original end until the next note.
     return true;
-}
-
-void FormantSlideNative::finishSliceBoundaryEdit() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (slicesManuallyEdited_) updateWavRoot();
 }
 
 int FormantSlideNative::wavFrameCount() const {
@@ -437,11 +411,10 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         std::lock_guard<std::mutex> lock(mutex_);
         s.equal = settings_.equalSlices;
         s.slices = settings_.sliceCount;
-        s.root = 60; // reserved legacy field: WAV pitch estimation is used instead
+        s.root = settings_.firstNote;
         s.all = settings_.allSlideColors;
         s.glide = settings_.fallbackGlideMs;
         s.offset = settings_.midiOffsetTicks;
-        s.noteOffset = settings_.noteOffset;
         wcsncpy_s(s.wav, wavPath_.c_str(), _TRUNCATE);
         wcsncpy_s(s.midi, midiPath_.c_str(), _TRUNCATE);
         stream->Write(&s, sizeof(s), nullptr);
@@ -458,14 +431,16 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         ULONG read = 0;
         if (FAILED(stream->Read(&s, sizeof(s), &read)) ||
             read < offsetof(SavedState, noteOffset) ||
-            s.magic != 0x46534e32 || (s.version != 1 && s.version != 2)) return;
+            s.magic != 0x46534e32 || (s.version < 1 || s.version > 3)) return;
         Settings restored;
         restored.equalSlices = s.equal != 0;
         restored.sliceCount = int(s.slices);
         restored.allSlideColors = s.all != 0;
         restored.fallbackGlideMs = int(s.glide);
         restored.midiOffsetTicks = s.offset;
-        restored.noteOffset = s.version >= 2 && read == sizeof(s) ? s.noteOffset : 0;
+        restored.firstNote = std::clamp(int(s.root), 0, 127);
+        if (s.version == 2 && read == sizeof(s))
+            restored.firstNote = std::clamp(restored.firstNote - std::clamp(s.noteOffset, -24, 24), 0, 127);
         updateSettings(restored);
         std::string error;
         if (s.wav[0]) loadWav(s.wav, error);
@@ -492,7 +467,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
                         restoredSlices[i].begin < restoredSlices[i].end;
                 if (i > 0) valid = valid && restoredSlices[i-1].end <= restoredSlices[i].begin;
             }
-            if (valid) { slices_ = std::move(restoredSlices); slicesManuallyEdited_ = true; updateWavRoot(); }
+            if (valid) { slices_ = std::move(restoredSlices); slicesManuallyEdited_ = true; }
         }
     }
 }

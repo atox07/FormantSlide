@@ -17,7 +17,7 @@ public:
     struct Settings {
         bool equalSlices = false;
         int sliceCount = 12;
-        int noteOffset = 0; // Native SDK pitch calibration (semitones)
+        int firstNote = 60; // MIDI key assigned to slice 1
         bool allSlideColors = true; // false = channel/color 5 only
         int fallbackGlideMs = 250;
         int midiOffsetTicks = 0;
@@ -31,7 +31,6 @@ public:
         std::string status;
         int rootMidi = 60, lastMidiNote = -1, lastSlice = -1;
         float lastPitchCents = 0.f;
-        bool detectedRoot = false;
     };
 
     FormantSlideNative(intptr_t tag, TFruityPlugHost* host);
@@ -53,7 +52,6 @@ public:
     std::vector<AudioSlice> sliceSnapshot() const;
     int wavFrameCount() const;
     bool moveSliceBoundary(int boundaryIndex, int frame);
-    void finishSliceBoundaryEdit();
 
 private:
     struct Voice {
@@ -70,8 +68,6 @@ private:
     WaveData wav_;
     std::vector<AudioSlice> slices_;
     bool slicesManuallyEdited_ = false;
-    int rootMidi_ = 60; // inferred WAV first-note pitch; fallback = VST3 C5/MIDI60
-    bool detectedRoot_ = false;
     int lastMidiNote_ = -1, lastSlice_ = -1;
     float lastPitchCents_ = 0.f;
     MidiFile midi_;
@@ -97,7 +93,6 @@ private:
 
     void initStretch();
     void beginVocal(Voice& voice);
-    void updateWavRoot();
     void beginSlide(const Voice& slideVoice, int noteLengthTicks, double hostTick);
     void render(PWAV32FS buffer, int length);
 };

@@ -50,21 +50,21 @@ public:
         addAndMakeVisible(sliceModeLabel_);
         addAndMakeVisible(countLabel_);
         addAndMakeVisible(glideLabel_);
-        addAndMakeVisible(offsetLabel_);
+        addAndMakeVisible(rootLabel_);
         addAndMakeVisible(statusLabel_);
         addAndMakeVisible(warningLabel_);
         addAndMakeVisible(mode_);
         addAndMakeVisible(sliceMode_);
         addAndMakeVisible(count_);
         addAndMakeVisible(glide_);
-        addAndMakeVisible(offset_);
+        addAndMakeVisible(root_);
 
         setLabel(modeLabel_, "Slide MIDI channels");
         setLabel(sliceModeLabel_, "Slicer");
         setLabel(countLabel_, "Equal divisions");
         setLabel(glideLabel_, "Fallback glide (ms)");
-        setLabel(offsetLabel_, "FL note calibration");
-        setLabel(warningLabel_, "Slice mapping from WAV pitch (not first key) | Drag markers to adjust cuts");
+        setLabel(rootLabel_, "First slice MIDI note");
+        setLabel(warningLabel_, "One slice per semitone from the first MIDI note | Drag markers to adjust cuts");
         warningLabel_.setJustificationType(juce::Justification::centred);
         warningLabel_.setColour(juce::Label::textColourId, juce::Colour(0xffffb65c));
         wavLabel_.setJustificationType(juce::Justification::centredLeft);
@@ -77,13 +77,13 @@ public:
         sliceMode_.addItem("Detect silence", 1);
         sliceMode_.addItem("Equal divisions", 2);
 
-        for (auto* slider : { &count_, &glide_, &offset_ }) {
+        for (auto* slider : { &count_, &glide_, &root_ }) {
             slider->setSliderStyle(juce::Slider::LinearHorizontal);
             slider->setTextBoxStyle(juce::Slider::TextBoxRight, false, 54, 24);
         }
         count_.setRange(1.0, 64.0, 1.0);
         glide_.setRange(10.0, 2000.0, 1.0);
-        offset_.setRange(-24.0, 24.0, 1.0);
+        root_.setRange(0.0, 127.0, 1.0);
 
         loadButton_.onClick = [this] { choose(false); };
         loadMidiButton_.onClick = [this] { choose(true); };
@@ -91,7 +91,7 @@ public:
         sliceMode_.onChange = [this] { pushSettings(); };
         count_.onValueChange = [this] { pushSettings(); };
         glide_.onValueChange = [this] { pushSettings(); };
-        offset_.onValueChange = [this] { pushSettings(); };
+        root_.onValueChange = [this] { pushSettings(); };
 
         pullSettings();
         refreshFilePreview();
@@ -168,14 +168,13 @@ public:
         sliceMode_.setBounds(26, 343, 205, 30);
         countLabel_.setBounds(256, 319, 160, 20);
         count_.setBounds(256, 344, 450, 28);
-        // No First slice MIDI note control. Root is detected from WAV audio.
 
         modeLabel_.setBounds(26, 388, 185, 20);
         mode_.setBounds(26, 412, 205, 29);
         glideLabel_.setBounds(280, 388, 205, 20);
         glide_.setBounds(280, 413, 250, 28);
-        offsetLabel_.setBounds(543, 388, 190, 20);
-        offset_.setBounds(543, 413, 182, 28);
+        rootLabel_.setBounds(543, 388, 190, 20);
+        root_.setBounds(543, 413, 182, 28);
         warningLabel_.setBounds(20, 457, 720, 24);
     }
 
@@ -219,7 +218,6 @@ public:
     }
 
     void mouseUp(const juce::MouseEvent&) override {
-        if (draggedBoundary_ > 0) plugin_.finishSliceBoundaryEdit();
         draggedBoundary_ = -1;
         setMouseCursor(juce::MouseCursor::NormalCursor);
     }
@@ -243,9 +241,9 @@ private:
     juce::TextButton loadButton_{"Load WAV"};
     juce::TextButton loadMidiButton_{"Import MIDI"};
     juce::Label wavLabel_, midiLabel_, modeLabel_, sliceModeLabel_, countLabel_;
-    juce::Label glideLabel_, offsetLabel_, statusLabel_, warningLabel_;
+    juce::Label glideLabel_, rootLabel_, statusLabel_, warningLabel_;
     juce::ComboBox mode_, sliceMode_;
-    juce::Slider count_, glide_, offset_;
+    juce::Slider count_, glide_, root_;
     juce::AudioFormatManager thumbnailFormats_;
     juce::AudioThumbnailCache cache_{5};
     juce::AudioThumbnail thumbnail_;
@@ -273,7 +271,7 @@ private:
         sliceMode_.setSelectedId(s.equalSlices ? 2 : 1, juce::dontSendNotification);
         count_.setValue(s.sliceCount, juce::dontSendNotification);
         glide_.setValue(s.fallbackGlideMs, juce::dontSendNotification);
-        offset_.setValue(s.noteOffset, juce::dontSendNotification);
+        root_.setValue(s.firstNote, juce::dontSendNotification);
         updatingControls_ = false;
     }
 
@@ -284,7 +282,7 @@ private:
         settings.equalSlices = sliceMode_.getSelectedId() == 2;
         settings.sliceCount = int(std::lround(count_.getValue()));
         settings.fallbackGlideMs = int(std::lround(glide_.getValue()));
-        settings.noteOffset = int(std::lround(offset_.getValue()));
+        settings.firstNote = int(std::lround(root_.getValue()));
         plugin_.updateSettings(settings);
         selectedSlice_ = -1;
         refreshStatus();
@@ -305,7 +303,7 @@ private:
     void refreshStatus() {
         const auto data = plugin_.display();
         juce::String status = juce::String(data.slices) + " slices | root " +
-            juce::String(data.rootMidi) + (data.detectedRoot ? " (WAV)" : " (fallback)");
+            juce::String(data.rootMidi);
         if (data.lastMidiNote >= 0)
             status += " | MIDI " + juce::String(data.lastMidiNote) +
                       " [" + juce::String(data.lastPitchCents, 0) + "c]" +
