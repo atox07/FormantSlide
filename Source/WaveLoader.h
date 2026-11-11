@@ -3,6 +3,7 @@
 #include <vector>
 
 struct WaveData {
+    std::vector<int> cueStarts;
     std::vector<float> stereo; // interleaved stereo
     int sampleRate = 44100;
     int frames() const { return static_cast<int>(stereo.size() / 2); }

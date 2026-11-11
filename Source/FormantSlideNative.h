@@ -50,6 +50,7 @@ public:
     void updateSettings(const Settings& value);
     Display display() const;
     std::vector<AudioSlice> sliceSnapshot() const;
+    std::vector<int> playingSlices() const;
     int wavFrameCount() const;
     bool moveSliceBoundary(int boundaryIndex, int frame);
 
@@ -65,6 +66,7 @@ private:
         bool vocal = false;
         bool released = false;
         double playhead_ = 0;
+        int sliceIndex = -1;
         int releaseFrames = -1;
         double engineRate = 0;
         int sliceEnd_ = 0;

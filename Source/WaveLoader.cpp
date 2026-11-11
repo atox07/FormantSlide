@@ -41,6 +41,7 @@ bool readWav(const std::wstring& path, WaveData& result, std::string& error) {
     }
     size_t pos = 12, dataStart = 0, dataSize = 0;
     int format = 0, channels = 0, sampleRate = 0, bits = 0, blockAlign = 0;
+    std::vector<uint32_t> cues;
     while (pos + 8 <= bytes.size()) {
         const uint32_t chunkSize = u32(bytes.data() + pos + 4);
         const size_t begin = pos + 8;
@@ -52,6 +53,17 @@ bool readWav(const std::wstring& path, WaveData& result, std::string& error) {
             if (format == 0xfffe && chunkSize >= 40) format = u16(p + 24);
         }
         if (!std::memcmp(bytes.data() + pos, "data", 4)) { dataStart = begin; dataSize = chunkSize; }
+        if (!std::memcmp(bytes.data() + pos, "cue ", 4) && chunkSize >= 4) {
+            const auto* chunk = bytes.data() + begin;
+            const auto count = u32(chunk);
+            if (count <= (chunkSize - 4) / 24) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    const auto* cue = chunk + 4 + size_t(i) * 24;
+                    if (!std::memcmp(cue + 8, "data", 4))
+                        cues.push_back(u32(cue + 20));
+                }
+            }
+        }
         pos = begin + chunkSize + (chunkSize & 1);
     }
     if ((format != 1 && format != 3) || channels < 1 || channels > 8 ||
@@ -66,6 +78,10 @@ bool readWav(const std::wstring& path, WaveData& result, std::string& error) {
         error = "WAV must be between 2 frames and 10 minutes"; return false;
     }
     WaveData tmp;
+    for (const auto offset : cues)
+        if (offset < frames - 1) tmp.cueStarts.push_back(int(offset));
+    std::sort(tmp.cueStarts.begin(), tmp.cueStarts.end());
+    tmp.cueStarts.erase(std::unique(tmp.cueStarts.begin(), tmp.cueStarts.end()), tmp.cueStarts.end());
     tmp.sampleRate = sampleRate;
     tmp.stereo.resize(frames * 2);
     for (size_t i = 0; i < frames; ++i) {
@@ -88,6 +104,13 @@ std::vector<AudioSlice> sliceWav(const WaveData& wav, bool equal, int divisions)
         const int n = std::clamp(divisions, 1, std::min(64, frames / 2));
         for (int i = 0; i < n; ++i)
             slices.push_back({int(int64_t(i) * frames / n), int(int64_t(i + 1) * frames / n)});
+        return slices;
+    }
+    if (!wav.cueStarts.empty()) {
+        for (size_t i = 0; i < wav.cueStarts.size(); ++i) {
+            const int end = i + 1 < wav.cueStarts.size() ? wav.cueStarts[i + 1] : frames;
+            if (end - wav.cueStarts[i] >= 2) slices.push_back({wav.cueStarts[i], end});
+        }
         return slices;
     }
     float maxPeak = 0;

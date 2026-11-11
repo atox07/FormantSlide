@@ -173,6 +173,7 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     const int index = std::clamp(voice.note - settings_.firstNote, 0, count - 1);
     voice.baseOffset = 60.0 + voice.startPitchCents / 100.0 - (settings_.firstNote + index);
     lastMidiNote_ = voice.note;
+    voice.sliceIndex = index;
     lastSlice_ = index;
     lastPitchCents_ = voice.startPitchCents;
     voice.playhead_ = slices_[size_t(index)].begin;
@@ -435,6 +436,15 @@ bool FormantSlideNative::moveSliceBoundary(int boundaryIndex, int frame) {
     return true;
 }
 
+std::vector<int> FormantSlideNative::playingSlices() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<int> active;
+    for (const auto& voice : voices_)
+        if (voice->releaseFrames != 0 && (voice->samplePlaying_ || voice->drainRemaining_ > 0))
+            active.push_back(voice->sliceIndex);
+    return active;
+}
+
 int FormantSlideNative::wavFrameCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return wav_.frames();
@@ -485,7 +495,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         ULONG headerRead = 0;
         if (SUCCEEDED(stream->Read(&markerHeader, sizeof(markerHeader), &headerRead)) &&
             headerRead == sizeof(markerHeader) && markerHeader.magic == 0x534c4335 &&
-            markerHeader.count >= 2 && markerHeader.count <= 64) {
+            markerHeader.count >= 2 && markerHeader.count <= uint32_t(wavFrameCount() / 2)) {
             std::vector<AudioSlice> restoredSlices;
             for (uint32_t i = 0; i < markerHeader.count; ++i) {
                 int32_t bounds[2]{};

@@ -27,7 +27,7 @@ class FormantSlideView final : public juce::Component,
                              private juce::Timer {
 public:
     explicit FormantSlideView(FormantSlideNative& native)
-        : plugin_(native), thumbnail_(256, thumbnailFormats_, cache_) {
+        : plugin_(native), thumbnail_(16, thumbnailFormats_, cache_) {
         setOpaque(true);
         setSize(editorWidth, editorHeight);
         thumbnailFormats_.registerBasicFormats();
@@ -64,7 +64,7 @@ public:
         setLabel(countLabel_, "Equal divisions");
         setLabel(glideLabel_, "Fallback glide (ms)");
         setLabel(rootLabel_, "First slice MIDI note");
-        setLabel(warningLabel_, "One slice per semitone from the first MIDI note | Drag markers to adjust cuts");
+        setLabel(warningLabel_, "Ctrl + wheel: zoom   |   Wheel: scroll   |   Double-click: fit   |   Drag a marker to edit");
         warningLabel_.setJustificationType(juce::Justification::centred);
         warningLabel_.setColour(juce::Label::textColourId, juce::Colour(0xffffb65c));
         wavLabel_.setJustificationType(juce::Justification::centredLeft);
@@ -74,7 +74,7 @@ public:
 
         mode_.addItem("Channel 5", 1);
         mode_.addItem("Channels 3-16", 2);
-        sliceMode_.addItem("Detect silence", 1);
+        sliceMode_.addItem("WAV markers / detect silence", 1);
         sliceMode_.addItem("Equal divisions", 2);
 
         for (auto* slider : { &count_, &glide_, &root_ }) {
@@ -101,7 +101,7 @@ public:
             if (existing.existsAsFile()) thumbnail_.setSource(new juce::FileInputSource(existing));
         }
         refreshStatus();
-        startTimerHz(4); // refresh host pitch/slice diagnostics when FL plays notes
+        startTimerHz(40); // refresh host pitch/slice diagnostics when FL plays notes
     }
 
     ~FormantSlideView() override {
@@ -124,8 +124,8 @@ public:
         g.fillRoundedRectangle(waveBounds_.toFloat(), 7.f);
         if (thumbnail_.getTotalLength() > 0) {
             g.setColour(juce::Colour(0xff74c9ff));
-            thumbnail_.drawChannels(g, waveBounds_.reduced(4), 0.0,
-                                    thumbnail_.getTotalLength(), 0.85f);
+            thumbnail_.drawChannels(g, waveBounds_, viewStart_ * thumbnail_.getTotalLength(),
+                                    (viewStart_ + viewSpan_) * thumbnail_.getTotalLength(), 0.85f);
         } else {
             g.setColour(juce::Colour(0xff91a8bd));
             g.drawFittedText("Load a chromatic-scale WAV to see slices", waveBounds_,
@@ -133,14 +133,15 @@ public:
         }
         const auto slices = plugin_.sliceSnapshot();
         const int total = plugin_.wavFrameCount();
+        g.reduceClipRegion(waveBounds_);
         if (total > 0) {
             for (size_t i = 0; i < slices.size(); ++i) {
-                const float left = float(waveBounds_.getX()) + float(waveBounds_.getWidth()) *
-                                   float(slices[i].begin) / float(total);
-                const float right = float(waveBounds_.getX()) + float(waveBounds_.getWidth()) *
-                                    float(slices[i].end) / float(total);
-                if (int(i) == selectedSlice_) {
-                    g.setColour(juce::Colours::yellow.withAlpha(0.15f));
+                const float left = screenX(double(slices[i].begin) / total);
+                const float right = screenX(double(slices[i].end) / total);
+                if (right < waveBounds_.getX() || left > waveBounds_.getRight()) continue;
+                const bool playing = std::find(active_.begin(), active_.end(), int(i)) != active_.end();
+                if (playing || int(i) == selectedSlice_) {
+                    g.setColour(playing ? juce::Colour(0x9954c996) : juce::Colours::yellow.withAlpha(0.15f));
                     g.fillRect(juce::Rectangle<float>(left, float(waveBounds_.getY()),
                                                      right - left, float(waveBounds_.getHeight())));
                 }
@@ -186,8 +187,7 @@ public:
         draggedBoundary_ = -1;
         float bestDistance = 9.0f;
         for (size_t i = 1; i < slices.size(); ++i) {
-            const float x = float(waveBounds_.getX()) +
-                            float(waveBounds_.getWidth()) * float(slices[i].begin) / float(total);
+            const float x = screenX(double(slices[i].begin) / total);
             const float distance = std::abs(float(event.x) - x);
             if (distance < bestDistance) {
                 bestDistance = distance;
@@ -199,7 +199,7 @@ public:
             setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
             updateDraggedBoundary(event.x);
         } else {
-            const float position = float(event.x - waveBounds_.getX()) / float(waveBounds_.getWidth());
+            const double position = viewStart_ + viewSpan_ * fraction(event.x);
             selectedSlice_ = -1;
             for (size_t i = 0; i < slices.size(); ++i) {
                 if (position >= float(slices[i].begin) / float(total) &&
@@ -211,6 +211,27 @@ public:
         }
         refreshStatus();
         repaint();
+    }
+
+    void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override {
+        if (!waveBounds_.contains(e.getPosition())) return;
+        const int frames = plugin_.wavFrameCount();
+        if (frames < 2) return;
+        if (e.mods.isCtrlDown()) {
+            const double anchor = fraction(e.x);
+            const double next = std::clamp(viewSpan_ * std::exp(-2.0 * wheel.deltaY),
+                                           std::min(1.0, 32.0 / frames), 1.0);
+            viewStart_ += anchor * (viewSpan_ - next);
+            viewSpan_ = next;
+        } else {
+            viewStart_ -= viewSpan_ * (wheel.deltaX + wheel.deltaY) * 0.4;
+        }
+        viewStart_ = std::clamp(viewStart_, 0.0, 1.0 - viewSpan_);
+        repaint(waveBounds_);
+    }
+
+    void mouseDoubleClick(const juce::MouseEvent& e) override {
+        if (waveBounds_.contains(e.getPosition())) { viewStart_ = 0; viewSpan_ = 1; repaint(waveBounds_); }
     }
 
     void mouseDrag(const juce::MouseEvent& event) override {
@@ -248,6 +269,12 @@ private:
     juce::AudioThumbnailCache cache_{5};
     juce::AudioThumbnail thumbnail_;
     juce::Rectangle<int> waveBounds_;
+    double viewStart_ = 0, viewSpan_ = 1;
+    std::vector<int> active_;
+    double fraction(int x) const { return double(x - waveBounds_.getX()) / waveBounds_.getWidth(); }
+    float screenX(double position) const {
+        return float(waveBounds_.getX() + waveBounds_.getWidth() * (position - viewStart_) / viewSpan_);
+    }
     int selectedSlice_ = -1;
     int draggedBoundary_ = -1;
     bool updatingControls_ = false;
@@ -257,7 +284,7 @@ private:
         if (draggedBoundary_ < 1 || total < 2) return;
         const double proportion = juce::jlimit(0.0, 1.0,
             double(x - waveBounds_.getX()) / double(waveBounds_.getWidth()));
-        const int frame = juce::roundToInt(proportion * double(total));
+        const int frame = juce::roundToInt((viewStart_ + proportion * viewSpan_) * total);
         if (plugin_.moveSliceBoundary(draggedBoundary_, frame)) {
             refreshStatus();
             repaint(waveBounds_);
@@ -328,7 +355,7 @@ private:
             return;
         }
         selectedSlice_ = -1;
-        if (wav) thumbnail_.setSource(new juce::FileInputSource(file));
+        if (wav) { viewStart_ = 0; viewSpan_ = 1; thumbnail_.setSource(new juce::FileInputSource(file)); }
         refreshFilePreview();
         refreshStatus();
         repaint();
@@ -348,7 +375,11 @@ private:
     }
 
     void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(); }
-    void timerCallback() override { refreshStatus(); }
+    void timerCallback() override {
+        auto playing = plugin_.playingSlices();
+        if (playing != active_) { active_ = std::move(playing); repaint(waveBounds_); }
+        refreshStatus();
+    }
 };
 
 NativeEditor::NativeEditor(FormantSlideNative& plugin) : plugin_(plugin) {}
