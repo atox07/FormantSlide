@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FormantSlideNative VERSION 0.5.0 LANGUAGES CXX)
+project(FormantSlideNative VERSION 0.9.0 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "FormantSlide native target requires Windows + MSVC (GitHub Actions windows-2022).")
@@ -19,11 +19,14 @@ FetchContent_Declare(juce
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(juce)
 
-FetchContent_Declare(signalsmith_stretch
-    GIT_REPOSITORY https://github.com/Signalsmith-Audio/signalsmith-stretch.git
-    GIT_TAG main
+FetchContent_Declare(rubberband
+    GIT_REPOSITORY https://github.com/breakfastquay/rubberband.git
+    GIT_TAG v4.0.0
     GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(signalsmith_stretch)
+FetchContent_MakeAvailable(rubberband)
+add_library(formantslide_r3 STATIC "${rubberband_SOURCE_DIR}/single/RubberBandSingle.cpp")
+target_include_directories(formantslide_r3 PUBLIC "${rubberband_SOURCE_DIR}")
+target_compile_definitions(formantslide_r3 PRIVATE NOMINMAX _USE_MATH_DEFINES)
 
 add_subdirectory(SDK)
 add_library(FormantSlideNative SHARED
@@ -33,8 +36,7 @@ add_library(FormantSlideNative SHARED
     Source/WinEditor.h Source/WinEditor.cpp)
 
 target_include_directories(FormantSlideNative PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/SDK"
-    "${signalsmith_stretch_SOURCE_DIR}")
+    "${CMAKE_CURRENT_SOURCE_DIR}/SDK")
 
 target_compile_definitions(FormantSlideNative PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
@@ -42,7 +44,7 @@ target_compile_definitions(FormantSlideNative PRIVATE
     JUCE_DISPLAY_SPLASH_SCREEN=0)
 
 target_link_libraries(FormantSlideNative PRIVATE
-    fl_sdk signalsmith-stretch
+    fl_sdk formantslide_r3
     juce::juce_audio_utils
     juce::juce_recommended_config_flags
     user32 gdi32 comdlg32 shell32 ole32)

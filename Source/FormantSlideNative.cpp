@@ -52,15 +52,16 @@ FormantSlideNative::~FormantSlideNative() = default;
 void FormantSlideNative::initStretch(Voice& voice) {
     // Match the v0.2 VST3 engine settings to keep its familiar response.
     if (spareStretchers_.empty()) {
-        voice.stretch_ = std::make_unique<Stretcher>();
-        voice.stretch_->configure(2, 1024, 192, false);
+        constexpr int options = Stretcher::OptionEngineFiner | Stretcher::OptionProcessRealTime |
+            Stretcher::OptionPitchHighConsistency | Stretcher::OptionFormantPreserved |
+            Stretcher::OptionChannelsTogether | Stretcher::OptionWindowShort | Stretcher::OptionThreadingNever;
+        voice.stretch_ = std::make_unique<Stretcher>(size_t(sampleRate_), 2, options);
+        voice.stretch_->setMaxProcessSize(64);
     } else {
         voice.stretch_ = std::move(spareStretchers_.back());
         spareStretchers_.pop_back();
     }
-    voice.stretch_->setFormantBase(200.0f / float(sampleRate_));
-    voice.stretch_->setFormantFactor(1.0f, true);
-    voice.stretch_->setTransposeSemitones(0.0f);
+    voice.engineRate = sampleRate_;
     voice.stretch_->reset();
     voice.drainRemaining_ = 0;
 }
@@ -91,6 +92,7 @@ intptr_t _stdcall FormantSlideNative::Dispatcher(intptr_t id, intptr_t index, in
         int latency = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            spareStretchers_.clear();
             sampleRate_ = double(value);
             AudioRenderer.setSmpRate(int(value));
             stopVoices();
@@ -176,11 +178,18 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     voice.playhead_ = slices_[size_t(index)].begin;
     voice.sliceEnd_ = slices_[size_t(index)].end;
     voice.samplePlaying_ = true;
-    voice.drainRemaining_ = voice.stretch_->inputLatency() + voice.stretch_->outputLatency() + 128;
-    // The entire slice is available now. Advance the spectral delay line
-    // before handing its first audible frame to FL.
+    voice.stretch_->setPitchScale(std::exp2(std::clamp(voice.baseOffset, -48.0, 48.0) / 12.0));
+    float silence[64]{};
+    const float* pad[] = {silence, silence};
+    size_t padding = voice.stretch_->getPreferredStartPad();
+    while (padding) {
+        const size_t run = std::min<size_t>(64, padding);
+        voice.stretch_->process(pad, run, false);
+        padding -= run;
+    }
     TWAV32FS discard[64]{};
-    int pending = voice.stretch_->inputLatency() + voice.stretch_->outputLatency();
+    int pending = int(voice.stretch_->getStartDelay());
+    voice.drainRemaining_ = 1; // Output may remain after final input.
     while (pending > 0) {
         const int run = std::min(64, pending);
         render(voice, discard, run);
@@ -254,7 +263,7 @@ void _stdcall FormantSlideNative::Voice_Kill(TVoiceHandle handle) {
     for (auto it = voices_.begin(); it != voices_.end(); ++it) {
         if (reinterpret_cast<TVoiceHandle>(it->get()) != handle) continue;
         if (it->get() == current_) current_ = nullptr;
-        if (spareStretchers_.size() < 16) spareStretchers_.push_back(std::move((*it)->stretch_));
+        if ((*it)->engineRate == sampleRate_ && spareStretchers_.size() < 16) spareStretchers_.push_back(std::move((*it)->stretch_));
         voices_.erase(it);
         break;
     }
@@ -276,36 +285,39 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
                 voice.customPitch_ += voice.customStep_;
                 if (--voice.customRemaining_ == 0) voice.customPitch_ = voice.customTarget_;
             }
-            float left = 0, right = 0;
-            if (voice.samplePlaying_ && wav_.frames() > 1 && voice.playhead_ + 1 < voice.sliceEnd_) {
-                const int idx = int(voice.playhead_);
-                const float frac = float(voice.playhead_ - idx);
-                const float fade = std::clamp(float(voice.sliceEnd_ - voice.playhead_) /
-                                std::max(8.0f, float(wav_.sampleRate) * 0.005f), 0.f, 1.f);
-                left = (wav_.stereo[size_t(idx) * 2] * (1.f - frac) +
-                        wav_.stereo[size_t(idx + 1) * 2] * frac) * fade;
-                right = (wav_.stereo[size_t(idx) * 2 + 1] * (1.f - frac) +
-                         wav_.stereo[size_t(idx + 1) * 2 + 1] * frac) * fade;
-                voice.playhead_ += double(wav_.sampleRate) / sampleRate_;
-            } else {
-                voice.samplePlaying_ = false;
-            }
-            in_[0][size_t(i)] = left;
-            in_[1][size_t(i)] = right;
-            if (!voice.samplePlaying_ && voice.drainRemaining_ > 0) --voice.drainRemaining_;
         }
         if ((voice.samplePlaying_) || voice.drainRemaining_ > 0) {
             const double interpolation = double(pos + run) / double(length);
             const double hostPitch = hostStart + (nextHostSlide - hostStart) * interpolation;
             const double semitones = hostPitch + voice.baseOffset + voice.customPitch_;
-            voice.stretch_->setTransposeSemitones(float(std::clamp(semitones, -48.0, 48.0)));
-            voice.stretch_->process(sources, run, targets, run);
+            voice.stretch_->setPitchScale(std::exp2(std::clamp(semitones, -48.0, 48.0) / 12.0));
+            while (voice.stretch_->available() < run && voice.samplePlaying_) {
+                int count = 0;
+                while (count < 64 && voice.playhead_ + 1 < voice.sliceEnd_) {
+                    const int idx = int(voice.playhead_);
+                    const float frac = float(voice.playhead_ - idx);
+                    const float fade = std::clamp(float(voice.sliceEnd_ - voice.playhead_) /
+                                    std::max(8.0f, float(wav_.sampleRate) * 0.005f), 0.f, 1.f);
+                    const float left = (wav_.stereo[size_t(idx) * 2] * (1.f - frac) +
+                            wav_.stereo[size_t(idx + 1) * 2] * frac) * fade;
+                    const float right = (wav_.stereo[size_t(idx) * 2 + 1] * (1.f - frac) +
+                             wav_.stereo[size_t(idx + 1) * 2 + 1] * frac) * fade;
+                    voice.playhead_ += double(wav_.sampleRate) / sampleRate_;
+                    in_[0][count] = left;
+                    in_[1][count++] = right;
+                }
+                voice.samplePlaying_ = voice.playhead_ + 1 < voice.sliceEnd_;
+                voice.stretch_->process(sources, count, !voice.samplePlaying_);
+            }
+            const int frames = int(voice.stretch_->retrieve(targets, run));
+            if (!voice.samplePlaying_ && voice.stretch_->available() <= 0)
+                voice.drainRemaining_ = 0;
             float vol = 1.f, pan = 0.f;
             if (voice.params) {
                 vol = std::max(0.f, voice.params->FinalLevels.Vol);
                 pan = std::clamp(voice.params->FinalLevels.Pan, -1.f, 1.f);
             }
-            for (int i = 0; i < run; ++i) {
+            for (int i = 0; i < frames; ++i) {
                 const float gain = voice.releaseFrames < 0 ? 1.f : float(voice.releaseFrames) / 64.f;
                 if (voice.releaseFrames > 0) --voice.releaseFrames;
                 buffer[pos + i][0] += out_[0][size_t(i)] * gain * vol * (pan > 0 ? 1.f - pan : 1.f);
@@ -337,7 +349,7 @@ void _stdcall FormantSlideNative::Gen_Render(PWAV32FS buffer, int& length) {
         if (done == voices_.end()) break;
         const auto tag = (*done)->hostTag;
         if (done->get() == current_) current_ = nullptr;
-        if (spareStretchers_.size() < 16) spareStretchers_.push_back(std::move((*done)->stretch_));
+        if ((*done)->engineRate == sampleRate_ && spareStretchers_.size() < 16) spareStretchers_.push_back(std::move((*done)->stretch_));
         voices_.erase(done);
         lock.unlock();
         PlugHost->Voice_Kill(tag, FALSE);

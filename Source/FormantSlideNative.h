@@ -2,7 +2,7 @@
 #include "fp_cplug.h"
 #include "MidiFile.h"
 #include "WaveLoader.h"
-#include <signalsmith-stretch.h>
+#include <rubberband/RubberBandStretcher.h>
 #include <array>
 #include <atomic>
 #include <memory>
@@ -54,7 +54,7 @@ public:
     bool moveSliceBoundary(int boundaryIndex, int frame);
 
 private:
-    using Stretcher = signalsmith::stretch::SignalsmithStretch<float>;
+    using Stretcher = RubberBand::RubberBandStretcher;
     std::vector<std::unique_ptr<Stretcher>> spareStretchers_;
     struct Voice {
         intptr_t hostTag = 0;
@@ -66,6 +66,7 @@ private:
         bool released = false;
         double playhead_ = 0;
         int releaseFrames = -1;
+        double engineRate = 0;
         int sliceEnd_ = 0;
         bool samplePlaying_ = false;
         int drainRemaining_ = 0;
