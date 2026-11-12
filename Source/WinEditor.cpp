@@ -1,6 +1,5 @@
 #include "WinEditor.h"
 #include "FormantSlideNative.h"
-#include "StftDevParams.h"
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <algorithm>
 #include <cmath>
@@ -175,17 +174,6 @@ public:
 }
 
 // Matches the graphical editor of the v0.2 VST3, without requiring a VST wrapper.
-// Slider senza limiti: se scrivi nel box un valore fuori range, il range si allarga.
-class FreeSlider final : public juce::Slider {
-public:
-    double getValueFromText(const juce::String& text) override {
-        const double v = text.replaceCharacter(',', '.').getDoubleValue();
-        if (v < getMinimum() || v > getMaximum())
-            setRange(std::min(getMinimum(), v), std::max(getMaximum(), v), 0.0);
-        return v;
-    }
-};
-
 class FormantSlideView final : public juce::Component,
                              public juce::FileDragAndDropTarget,
                              private juce::ChangeListener,
@@ -212,8 +200,6 @@ public:
         addAndMakeVisible(root_);
         addAndMakeVisible(pitchLabel_);
         addAndMakeVisible(pitch_);
-        addAndMakeVisible(devButton_);
-        setupDevControls();
 
         for (auto* label : { &wavLabel_, &sliceModeLabel_, &countLabel_, &rootLabel_,
                              &statusLabel_, &warningLabel_ })
@@ -252,18 +238,11 @@ public:
         root_.setRange(0.0, 127.0, 1.0);
 
         loadButton_.onClick = [this] { chooseWav(); };
-        devButton_.onClick = [this] {
-            devPage_ = (devPage_ + 1) % 3;
-            devButton_.setButtonText(devPage_ == 0 ? "DEV" : devPage_ == 1 ? "DEV 1" : "DEV 2");
-            updateDevVisibility();
-            repaint(panelSlicer_);
-        };
         sliceMode_.onChange = [this] { pushSettings(); };
         count_.onValueChange = [this] { pushSettings(); };
         root_.onValueChange = [this] { pushSettings(); };
 
         pullSettings();
-        updateDevVisibility();
         refreshFilePreview();
         const auto saved = plugin_.display();
         if (!saved.wavFullPath.empty()) {
@@ -283,9 +262,7 @@ public:
     void paint(juce::Graphics& g) override {
         g.fillAll(ui::bg);
 
-        drawPanel(g, panelSlicer_, devPage_ == 1 ? "DEV 1 - live (scrivi nel box: nessun limite)"
-                                 : devPage_ == 2 ? "DEV 2 - FFT / crossover: valgono dalla PROSSIMA nota"
-                                                 : "SLICER");
+        drawPanel(g, panelSlicer_, "SLICER");
         drawPanel(g, panelPitch_, nullptr); // its header is pitchLabel_
 
         // Waveform well / drop zone.
@@ -355,8 +332,7 @@ public:
         const int w = getWidth();
 
         // Top strip: file name + Load WAV.
-        wavLabel_.setBounds(m, 10, w - 2 * m - 210, 26);
-        devButton_.setBounds(w - m - 110 - 8 - 62, 9, 62, 28);
+        wavLabel_.setBounds(m, 10, w - 2 * m - 130, 26);
         loadButton_.setBounds(w - m - 110, 9, 110, 28);
 
         // Waveform / drop zone.
@@ -381,12 +357,6 @@ public:
             count_.setBounds(cx, py + 58, cw, 26);
             rootLabel_.setBounds(lx, py + 88, 124, 26);
             root_.setBounds(cx, py + 88, cw, 26);
-
-            // DEV: stessa area dello SLICER, 4 righe da 22 px.
-            for (int i = 0; i < 8; ++i) {
-                devLabel_[i].setBounds(lx, py + 24 + (i % 4) * 23, 120, 22);
-                devSlider_[i].setBounds(cx - 14, py + 24 + (i % 4) * 23, cw + 14, 22);
-            }
         }
 
         // PITCH: header + big knob with its value underneath.
@@ -494,10 +464,6 @@ private:
     juce::Label pitchLabel_;
     juce::Slider pitch_;
     juce::Slider count_, root_;
-    juce::TextButton devButton_{"DEV"};
-    juce::Label devLabel_[8];
-    FreeSlider devSlider_[8];
-    int devPage_ = 0; // 0 = Slicer, 1 = DEV 1 (live), 2 = DEV 2 (alla prossima nota)
     juce::AudioFormatManager thumbnailFormats_;
     juce::AudioThumbnailCache cache_{5};
     juce::AudioThumbnail thumbnail_;
@@ -537,61 +503,6 @@ private:
         if (plugin_.moveSliceBoundary(draggedBoundary_, frame)) {
             refreshStatus();
             repaint(waveBounds_);
-        }
-    }
-
-    // ---- DEV sliders: nessun limite, valori applicati dal motore al volo ----
-    void setupDevControls() {
-        auto& p = StftDevParams::instance();
-        struct Def { const char* name; double lo, hi, init, reset; int dec; };
-        const Def defs[8] = {
-            {"envSmooth",       0.0, 1.0,     p.envSmooth.load(),      0.30,   3},
-            {"envSmoothSlide",  0.0, 1.0,     p.envSmoothSlide.load(), 0.05,   3},
-            {"maxGain",         0.0, 20.0,    p.maxGain.load(),        6.0,    3},
-            {"quefrency (ms)",  0.1, 20.0,    p.quefrencyMs.load(),    2.0,    3},
-            {"FFT bassa",       128, 8192,    double(p.fftLow.load()), 2048,   0},
-            {"FFT alta",        128, 8192,    double(p.fftHigh.load()),512,    0},
-            {"Crossover da Hz", 0.0, 20000.0, p.crossLowHz.load(),     2200.0, 1},
-            {"Crossover a Hz",  0.0, 20000.0, p.crossHighHz.load(),    2800.0, 1},
-        };
-        for (int i = 0; i < 8; ++i) {
-            auto& s = devSlider_[i];
-            addChildComponent(devLabel_[i]);
-            addChildComponent(s);
-            setLabel(devLabel_[i], defs[i].name);
-            devLabel_[i].setFont(ui::font(12.f));
-            devLabel_[i].setColour(juce::Label::textColourId, ui::dim);
-            s.setSliderStyle(juce::Slider::LinearHorizontal);
-            s.setTextBoxStyle(juce::Slider::TextBoxRight, false, 78, 22);
-            s.setNumDecimalPlacesToDisplay(defs[i].dec);
-            s.setRange(std::min(defs[i].lo, defs[i].init), std::max(defs[i].hi, defs[i].init), 0.0);
-            s.setValue(defs[i].init, juce::dontSendNotification);
-            s.setDoubleClickReturnValue(true, defs[i].reset);
-            s.onValueChange = [this] { pushDev(); };
-        }
-    }
-
-    void pushDev() {
-        auto& p = StftDevParams::instance();
-        p.envSmooth.store(float(devSlider_[0].getValue()));
-        p.envSmoothSlide.store(float(devSlider_[1].getValue()));
-        p.maxGain.store(float(devSlider_[2].getValue()));
-        p.quefrencyMs.store(devSlider_[3].getValue());
-        p.fftLow.store(int(std::clamp(std::llround(devSlider_[4].getValue()), 128LL, 16384LL)));
-        p.fftHigh.store(int(std::clamp(std::llround(devSlider_[5].getValue()), 128LL, 16384LL)));
-        p.crossLowHz.store(devSlider_[6].getValue());
-        p.crossHighHz.store(devSlider_[7].getValue());
-        p.version.fetch_add(1, std::memory_order_release);
-    }
-
-    void updateDevVisibility() {
-        for (auto* c : std::initializer_list<juce::Component*>{ &sliceModeLabel_, &sliceMode_,
-                 &countLabel_, &count_, &rootLabel_, &root_ })
-            c->setVisible(devPage_ == 0);
-        for (int i = 0; i < 8; ++i) {
-            const bool show = devPage_ != 0 && (i / 4) == devPage_ - 1;
-            devLabel_[i].setVisible(show);
-            devSlider_[i].setVisible(show);
         }
     }
 
