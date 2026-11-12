@@ -7,6 +7,8 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <condition_variable>
 #include <string>
 #include <vector>
 
@@ -78,7 +80,12 @@ private:
     };
     mutable std::mutex mutex_;
     Settings settings_;
-    WaveData wav_;
+    std::shared_ptr<const WaveData> wav_ = std::make_shared<WaveData>();
+    std::condition_variable analysisWake_;
+    std::shared_ptr<const WaveData> pendingAnalysis_;
+    bool closing_ = false;
+    std::thread analysisThread_;
+    void analysePendingWavs();
     std::shared_ptr<const WorldAnalysis> analysis_;
     std::vector<AudioSlice> slices_;
     bool slicesManuallyEdited_ = false;

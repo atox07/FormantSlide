@@ -51,7 +51,39 @@ FormantSlideNative::FormantSlideNative(intptr_t tag, TFruityPlugHost* host)
     Info = &kInfo;
     PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, 0);
 }
-FormantSlideNative::~FormantSlideNative() = default;
+FormantSlideNative::~FormantSlideNative() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closing_ = true;
+    }
+    analysisWake_.notify_one();
+    if (analysisThread_.joinable()) analysisThread_.join();
+}
+
+void FormantSlideNative::analysePendingWavs() {
+    for (;;) {
+        std::shared_ptr<const WaveData> wav;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            analysisWake_.wait(lock, [this] { return closing_ || pendingAnalysis_; });
+            if (closing_) return;
+            wav = std::move(pendingAnalysis_);
+        }
+        std::shared_ptr<const WorldAnalysis> result;
+        std::string status;
+        try {
+            result = WorldAnalysis::analyse(*wav);
+            status = "WAV analysed (WORLD, mono)";
+        } catch (const std::exception& e) {
+            status = std::string("WORLD analysis failed: ") + e.what();
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!closing_ && wav == wav_) {
+            analysis_ = std::move(result);
+            status_ = std::move(status);
+        }
+    }
+}
 
 void _stdcall FormantSlideNative::DestroyObject() {
     if (editor_) { editor_->close(); delete editor_; editor_ = nullptr; }
@@ -157,7 +189,7 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     voice.previousHostSlide_ = 0;
     voice.customRemaining_ = 0;
     const int count = int(slices_.size());
-    if (!count || !wav_.frames()) { voice.samplePlaying_ = false; return; }
+    if (!analysis_ || !count || !wav_->frames()) { voice.samplePlaying_ = false; return; }
     // Match the working v0.2 VST3: a fixed root defines slice position.
     const int index = std::clamp(voice.note - settings_.firstNote, 0, count - 1);
     voice.baseOffset = 60.0 + voice.startPitchCents / 100.0 - (settings_.firstNote + index);
@@ -275,11 +307,11 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
             const float gain = voice.releaseFrames < 0 ? 1.f : float(voice.releaseFrames) / 64.f;
             if (voice.releaseFrames > 0) --voice.releaseFrames;
             const float fade = std::clamp(float(voice.sliceEnd_ - voice.playhead_) /
-                std::max(8.0f, float(wav_.sampleRate) * 0.005f), 0.f, 1.f);
+                std::max(8.0f, float(wav_->sampleRate) * 0.005f), 0.f, 1.f);
             const float sample = out_[0][size_t(i)] * gain * fade * vol;
             buffer[pos + i][0] += sample * (pan > 0 ? 1.f - pan : 1.f);
             buffer[pos + i][1] += sample * (pan < 0 ? 1.f + pan : 1.f);
-            voice.playhead_ += double(wav_.sampleRate) / sampleRate_;
+            voice.playhead_ += double(wav_->sampleRate) / sampleRate_;
         }
         if (frames < run || voice.playhead_ >= voice.sliceEnd_) voice.samplePlaying_ = false;
     }
@@ -327,20 +359,23 @@ void _stdcall FormantSlideNative::Gen_Render(PWAV32FS buffer, int& length) {
 }
 
 bool FormantSlideNative::loadWav(const std::wstring& path, std::string& error) {
-    WaveData wav;
-    if (!readWav(path, wav, error)) return false;
-    std::shared_ptr<const WorldAnalysis> analysis;
-    try { analysis = WorldAnalysis::analyse(wav); }
-    catch (const std::exception& e) { error = e.what(); return false; }
+    auto wav = std::make_shared<WaveData>();
+    if (!readWav(path, *wav, error)) return false;
     std::lock_guard<std::mutex> lock(mutex_);
-    analysis_ = std::move(analysis);
+    if (!analysisThread_.joinable()) {
+        try { analysisThread_ = std::thread(&FormantSlideNative::analysePendingWavs, this); }
+        catch (const std::exception& e) { error = e.what(); return false; }
+    }
     wav_ = std::move(wav);
+    analysis_.reset();
     wavPath_ = path;
-    slices_ = sliceWav(wav_, settings_.equalSlices, settings_.sliceCount);
+    slices_ = sliceWav(*wav_, settings_.equalSlices, settings_.sliceCount);
     slicesManuallyEdited_ = false;
     lastMidiNote_ = lastSlice_ = -1;
     stopVoices();
-    status_ = "WAV analysed (WORLD, mono)";
+    status_ = "Analysing chromatic (WORLD)...";
+    pendingAnalysis_ = wav_;
+    analysisWake_.notify_one();
     return true;
 }
 bool FormantSlideNative::loadMidi(const std::wstring& path, std::string& error) {
@@ -363,7 +398,7 @@ void FormantSlideNative::updateSettings(const Settings& input) {
     // Do not rebuild/silence a playing sample just because glide or pitch
     // calibration has been adjusted with a slider.
     if (settings_.equalSlices != previous.equalSlices || settings_.sliceCount != previous.sliceCount) {
-        slices_ = sliceWav(wav_, settings_.equalSlices, settings_.sliceCount);
+        slices_ = sliceWav(*wav_, settings_.equalSlices, settings_.sliceCount);
         slicesManuallyEdited_ = false;
         lastMidiNote_ = lastSlice_ = -1;
         stopVoices();
@@ -397,7 +432,7 @@ bool FormantSlideNative::moveSliceBoundary(int boundaryIndex, int frame) {
     auto& left = slices_[size_t(boundaryIndex - 1)];
     auto& right = slices_[size_t(boundaryIndex)];
     // Keep a minimum audible region on either side, and never cross markers.
-    const int minGap = std::max(2, wav_.sampleRate / 200); // 5 ms
+    const int minGap = std::max(2, wav_->sampleRate / 200); // 5 ms
     const int low = left.begin + minGap;
     const int high = right.end - minGap;
     if (low > high) return false;
@@ -420,7 +455,7 @@ std::vector<int> FormantSlideNative::playingSlices() const {
 
 int FormantSlideNative::wavFrameCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return wav_.frames();
+    return wav_->frames();
 }
 
 void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
@@ -483,10 +518,10 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
                 restoredSlices.push_back({bounds[0], bounds[1]});
             }
             std::lock_guard<std::mutex> lock(mutex_);
-            bool valid = restoredSlices.size() == markerHeader.count && wav_.frames() > 0;
+            bool valid = restoredSlices.size() == markerHeader.count && wav_->frames() > 0;
             for (size_t i = 0; valid && i < restoredSlices.size(); ++i) {
                 valid = restoredSlices[i].begin >= 0 &&
-                        restoredSlices[i].end <= wav_.frames() &&
+                        restoredSlices[i].end <= wav_->frames() &&
                         restoredSlices[i].begin < restoredSlices[i].end;
                 if (i > 0) valid = valid && restoredSlices[i-1].end <= restoredSlices[i].begin;
             }
