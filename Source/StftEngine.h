@@ -8,33 +8,30 @@
 #include <StftPitchShift/RFFT.h>
 #include <StftPitchShift/Cepster.h>
 
-// Pitch shifter with formant preservation used by one sample voice.
 class StftVoice {
 public:
     StftVoice(std::shared_ptr<const WaveData>, int begin, int end, double hostRate);
     int render(float* left, float* right, int count, double scale);
+    void setFormantScale(double scale);   // [KNOB-FORMANT] 1.0 = preserve, 2.0 = +12 st
 
 private:
-    // ---- tuning (safe to experiment with) --------------------------------
-    static constexpr double kQuefrency          = 0.002;   // formant envelope detail
-    static constexpr double kSmoothMs           = 6.0;     // pitch factor smoothing time
-    static constexpr double kFadeMs             = 8.0;     // dry/wet crossfade time
-    static constexpr float  kMaxGain            = 6.0f;    // max formant correction per bin
-    static constexpr float  kPeakFloor          = 1e-4f;   // peaks below this * frame max are ignored
-    static constexpr float  kEnvSmoothCoef      = 0.3f;    // envelope smoothing when pitch is stable
-    static constexpr float  kEnvSmoothCoefSlide = 0.05f;   // [FIX EH→I] very slow during slides
+    // ---- tuning ----------------------------------------------------------
+    static constexpr double kQuefrency          = 0.002;
+    static constexpr double kSmoothMs           = 6.0;
+    static constexpr double kFadeMs             = 8.0;
+    static constexpr float  kMaxGain            = 6.0f;
+    static constexpr float  kPeakFloor          = 1e-4f;
+    static constexpr float  kEnvSmoothCoef      = 0.3f;
+    static constexpr float  kEnvSmoothCoefSlide = 0.05f;
 
-    struct Track {            // one spectral peak of the previous frame
-        float freq;
-        float phase;
-    };
+    struct Track { float freq; float phase; };
 
     struct Channel {
         std::vector<float> overlap;
         std::vector<float> prevPhase;
         std::vector<float> envSmooth;
         std::vector<Track> tracks;
-        double prevAlpha = 1.0;   // [FIX EH→I] last pitch factor seen, to detect slides
+        double prevAlpha = 1.0;
         bool havePrev = false;
     };
 
@@ -57,6 +54,11 @@ private:
     double smoothLog = 0.0;
     bool smoothInit = false;
     float wet = 0.f;
+
+    // [KNOB-FORMANT] formant scale state
+    double formantScaleTarget_   = 1.0;
+    double formantScaleSmoothed_ = 1.0;
+    double formantSmoothCoef_    = 0.0;
 
     std::shared_ptr<stftpitchshift::FFT> fftp;
     stftpitchshift::Cepster<float> cepster;
