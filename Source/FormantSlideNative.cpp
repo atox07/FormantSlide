@@ -9,6 +9,9 @@
 #include <filesystem>
 
 namespace {
+// Extra (non-native) slides: only notes in this color group / MIDI channel act as slides.
+// FL color index 15 == MIDI channel 16 (the channel number reported to MidiFile is color + 1).
+constexpr int kSlideColor = 15;
 char kName[] = "FormantSlide";
 char kShort[] = "FormantSlide";
 TFruityPlugInfo kInfo = {CurrentSDKVersion, kName, kShort,
@@ -162,7 +165,8 @@ void _stdcall FormantSlideNative::GetName(int section, int index, int, char* nam
     name[0] = '\0';
     if (section == FPN_VoiceColor && index >= 0 && index < 16) {
         if (index == 0 || index == 1) strcpy_s(name, 256, "Vocal note");
-        else strcpy_s(name, 256, "Pitch slide");
+        else if (index == kSlideColor) strcpy_s(name, 256, "Pitch slide");
+        else strcpy_s(name, 256, "Unused");
     }
 }
 
@@ -254,7 +258,9 @@ TVoiceHandle _stdcall FormantSlideNative::TriggerVoice(PVoiceParams params, intp
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!voice.vocal) {
-            const bool slide = settings_.allSlideColors || color == 4;
+            // settings_.allSlideColors is kept only so old saved projects still load;
+            // the slide channel is no longer configurable.
+            const bool slide = color == kSlideColor;
             if (slide) beginSlide(voice, length, tick);
             return FVH_Null; // Control event consumed; FL has no audio voice to release.
         }
