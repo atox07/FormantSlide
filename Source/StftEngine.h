@@ -18,6 +18,7 @@ public:
     StftVoice(std::shared_ptr<const WaveData>, int begin, int end, double hostRate);
     int render(float* left, float* right, int count, double scale);
     void setDevParams(float envSmooth, float envSmoothSlide, float maxGain, double quefrency);
+    void jumpPitch();                   // salta subito al pitch richiesto, senza lo smoothing da 6 ms
     void setFormantScale(double scale); // 1.0 = preserve; 2.0 = +12 semitones
 
 private:
@@ -106,6 +107,7 @@ private:
     bool smoothInit = false;
     float wet = 0.f;
 
+    bool snapPending_ = false;
     bool formantInit_ = false; // la prima volta niente glide verso il formante del knob
     double formantScaleTarget_ = 1.0;
     double formantScaleSmoothed_ = 1.0;
