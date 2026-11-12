@@ -20,13 +20,13 @@ public:
     void setFormantScale(double scale); // 1.0 = preserve; 2.0 = +12 semitones
 
 private:
-    double kQuefrency          = 0.002;
+    double kQuefrency          = 0.0025;
     static constexpr double kSmoothMs           = 6.0;
     static constexpr double kFadeMs             = 8.0;
-    float kMaxGain            = 6.0f;
+    float kMaxGain            = 12.0f;
     static constexpr float  kPeakFloor          = 1e-4f;
-    float kEnvSmoothCoef      = 0.3f;
-    float kEnvSmoothCoefSlide = 0.05f;
+    float kEnvSmoothCoef      = 0.20f;
+    float kEnvSmoothCoefSlide = 0.02f;
     static constexpr double kCrossLowHz         = 2200.0;
     static constexpr double kCrossHighHz        = 2800.0;
 
@@ -84,7 +84,8 @@ private:
 
     float read(double sourcePosition, int channel) const;
     void frame(Band& band, long long start, double alpha, double phaseAlpha);
-    void shift(Band& band, Channel& channel, double alpha, double phaseAlpha);
+    double estimateF0(long long centre, int ch, double rate) const;
+    void shift(Band& band, Channel& channel, double alpha, double phaseAlpha, double f0);
     void advanceBand(Band& band, double alpha);
     void resetState();
 
