@@ -21,7 +21,8 @@ StftVoice::StftVoice(std::shared_ptr<const WaveData> data, int first, int last, 
       fftp(std::make_shared<stftpitchshift::RFFT>()),
       cepster(fftp, size_t(N), rate) {
     cepster.quefrency(kQuefrency);
-    smoothCoef = 1.0 - std::exp(-1.0 / (kSmoothMs * 0.001 * rate));
+    smoothCoef        = 1.0 - std::exp(-1.0 / (kSmoothMs * 0.001 * rate));
+    formantSmoothCoef_ = smoothCoef;   // same time constant
     fadeStep = float(1.0 / (kFadeMs * 0.001 * rate));
     outNorm = float(H / (0.375 * N));
 
@@ -53,13 +54,18 @@ StftVoice::StftVoice(std::shared_ptr<const WaveData> data, int first, int last, 
         if (s[size_t(i) * 2] != s[size_t(i) * 2 + 1]) { mono = false; break; }
 }
 
+void StftVoice::setFormantScale(double scale) {
+    // [KNOB-FORMANT] only updates the target; render() smooths it per sample.
+    formantScaleTarget_ = std::clamp(scale, 1.0 / 64.0, 64.0);
+}
+
 void StftVoice::resetState() {
     for (auto& c : chan) {
         std::fill(c.overlap.begin(), c.overlap.end(), 0.f);
         std::fill(c.prevPhase.begin(), c.prevPhase.end(), 0.f);
         std::fill(c.envSmooth.begin(), c.envSmooth.end(), 0.f);
         c.tracks.clear();
-        c.prevAlpha = 1.0;   // [FIX EH→I]
+        c.prevAlpha = 1.0;
         c.havePrev = false;
     }
     cursor = 0;
@@ -133,11 +139,7 @@ void StftVoice::shift(Channel& c, double alpha) {
         regionLo[size_t(i + 1)] = valley + 1;
     }
 
-    // ---- formant envelope with temporal smoothing ----
-    // [FIX EH→I] Adaptive coefficient: while the pitch is stable we track the
-    // envelope normally (0.3). While a slide is in progress (alpha changing),
-    // we slow the tracking down to 0.05 so the envelope stays anchored to the
-    // "Eh" it was at the start of the slide instead of drifting into "I".
+    // ---- formant envelope with adaptive smoothing
     const double alphaSpeed = std::abs(alpha - c.prevAlpha);
     c.prevAlpha = alpha;
     const float envCoef = (alphaSpeed > 1e-4) ? kEnvSmoothCoefSlide : kEnvSmoothCoef;
@@ -154,6 +156,20 @@ void StftVoice::shift(Channel& c, double alpha) {
             c.envSmooth[size_t(k)] = logNow;
         env[size_t(k)] = std::exp(c.envSmooth[size_t(k)]);
     }
+
+    // [KNOB-FORMANT] beta = formant scale. Sampling env at kk/beta instead of
+    // kk means:
+    //   beta = 1  -> standard preservation (formants stay on original pitch)
+    //   beta = a  -> formants follow only the knob by 'a', regardless of slide
+    //   beta = alpha (total) -> chipmunk, formants follow everything
+    const float beta = float(std::clamp(formantScaleSmoothed_, 1.0 / 64.0, 64.0));
+    auto sampleEnv = [&](float pos) -> float {
+        pos = std::clamp(pos, 1.f, float(K - 2));
+        const int lo = int(std::floor(pos));
+        const int hi = std::min(lo + 1, K - 2);
+        const float frac = pos - lo;
+        return env[size_t(lo)] * (1.f - frac) + env[size_t(hi)] * frac;
+    };
 
     std::fill(synMag.begin(), synMag.end(), 0.f);
     newTracks.clear();
@@ -193,14 +209,18 @@ void StftVoice::shift(Channel& c, double alpha) {
             const int kkLo = k + deltaLo;
             const int kkHi = k + deltaHi;
             const std::complex<float> base = bins[size_t(k)];
+            const float envK = env[size_t(k)];
             if (fracLo > 0.f && kkLo >= 1 && kkLo <= K - 2) {
-                const float g = std::clamp(env[size_t(kkLo)] / env[size_t(k)], 0.f, kMaxGain);
+                // [KNOB-FORMANT] sample env at kkLo/beta
+                const float envT = sampleEnv(float(kkLo) / beta);
+                const float g = std::clamp(envT / envK, 0.f, kMaxGain);
                 const std::complex<float> v = base * rotLo * g * fracLo;
                 const float m2 = std::norm(v);
                 if (m2 > synMag[size_t(kkLo)]) { spec[size_t(kkLo)] = v; synMag[size_t(kkLo)] = m2; }
             }
             if (fracHi > 0.f && kkHi >= 1 && kkHi <= K - 2) {
-                const float g = std::clamp(env[size_t(kkHi)] / env[size_t(k)], 0.f, kMaxGain);
+                const float envT = sampleEnv(float(kkHi) / beta);
+                const float g = std::clamp(envT / envK, 0.f, kMaxGain);
                 const std::complex<float> v = base * rotHi * g * fracHi;
                 const float m2 = std::norm(v);
                 if (m2 > synMag[size_t(kkHi)]) { spec[size_t(kkHi)] = v; synMag[size_t(kkHi)] = m2; }
@@ -239,6 +259,9 @@ int StftVoice::render(float* left, float* right, int count, double scale) {
         if (target == 0.0 && std::abs(smoothLog) < 1e-4) smoothLog = 0.0;
         const bool shifted = std::abs(smoothLog) > 1e-5;
         const double factor = std::exp2(smoothLog);
+
+        // [KNOB-FORMANT] smooth the formant scale too, so a knob move doesn't click.
+        formantScaleSmoothed_ += (formantScaleTarget_ - formantScaleSmoothed_) * formantSmoothCoef_;
 
         if (shifted && !active) {
             resetState();
