@@ -51,39 +51,7 @@ FormantSlideNative::FormantSlideNative(intptr_t tag, TFruityPlugHost* host)
     Info = &kInfo;
     PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, 0);
 }
-FormantSlideNative::~FormantSlideNative() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        closing_ = true;
-    }
-    analysisWake_.notify_one();
-    if (analysisThread_.joinable()) analysisThread_.join();
-}
-
-void FormantSlideNative::analysePendingWavs() {
-    for (;;) {
-        std::shared_ptr<const WaveData> wav;
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            analysisWake_.wait(lock, [this] { return closing_ || pendingAnalysis_; });
-            if (closing_) return;
-            wav = std::move(pendingAnalysis_);
-        }
-        std::shared_ptr<const WorldAnalysis> result;
-        std::string status;
-        try {
-            result = WorldAnalysis::analyse(*wav);
-            status = "WAV analysed (WORLD, mono)";
-        } catch (const std::exception& e) {
-            status = std::string("WORLD analysis failed: ") + e.what();
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!closing_ && wav == wav_) {
-            analysis_ = std::move(result);
-            status_ = std::move(status);
-        }
-    }
-}
+FormantSlideNative::~FormantSlideNative() = default;
 
 void _stdcall FormantSlideNative::DestroyObject() {
     if (editor_) { editor_->close(); delete editor_; editor_ = nullptr; }
@@ -189,7 +157,7 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     voice.previousHostSlide_ = 0;
     voice.customRemaining_ = 0;
     const int count = int(slices_.size());
-    if (!analysis_ || !count || !wav_->frames()) { voice.samplePlaying_ = false; return; }
+    if (!count || !wav_->frames()) { voice.samplePlaying_ = false; return; }
     // Match the working v0.2 VST3: a fixed root defines slice position.
     const int index = std::clamp(voice.note - settings_.firstNote, 0, count - 1);
     voice.baseOffset = 60.0 + voice.startPitchCents / 100.0 - (settings_.firstNote + index);
@@ -200,7 +168,7 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     voice.playhead_ = slices_[size_t(index)].begin;
     voice.sliceEnd_ = slices_[size_t(index)].end;
     voice.samplePlaying_ = true;
-    voice.world_ = std::make_unique<WorldVoice>(analysis_, int(voice.playhead_), voice.sliceEnd_, sampleRate_);
+    voice.engine_ = std::make_unique<StftVoice>(wav_, int(voice.playhead_), voice.sliceEnd_, sampleRate_);
     voice.drainRemaining_ = 0;
 }
 
@@ -286,7 +254,7 @@ void _stdcall FormantSlideNative::Voice_Kill(TVoiceHandle handle) {
 }
 
 void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
-    if (!buffer || length <= 0 || !voice.params || !voice.world_) return;
+    if (!buffer || length <= 0 || !voice.params || !voice.engine_) return;
     const double nextHostSlide = std::isfinite(voice.params->FinalLevels.Pitch)
         ? (double(voice.params->FinalLevels.Pitch) - voice.startPitchCents) / 100.0 : 0.0;
     const double hostStart = voice.previousHostSlide_;
@@ -300,7 +268,7 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
         }
         const double hostPitch = hostStart + (nextHostSlide - hostStart) * double(pos + run) / length;
         const double shift = std::clamp(hostPitch + voice.baseOffset + voice.customPitch_ + settings_.pitchCents / 100.0, -48.0, 48.0);
-        const int frames = voice.world_->render(out_[0].data(), run, std::exp2(shift / 12.0));
+        const int frames = voice.engine_->render(out_[0].data(), out_[1].data(), run, std::exp2(shift / 12.0));
         const float vol = std::max(0.f, voice.params->FinalLevels.Vol);
         const float pan = std::clamp(voice.params->FinalLevels.Pan, -1.f, 1.f);
         for (int i = 0; i < frames; ++i) {
@@ -310,7 +278,7 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
                 std::max(8.0f, float(wav_->sampleRate) * 0.005f), 0.f, 1.f);
             const float sample = out_[0][size_t(i)] * gain * fade * vol;
             buffer[pos + i][0] += sample * (pan > 0 ? 1.f - pan : 1.f);
-            buffer[pos + i][1] += sample * (pan < 0 ? 1.f + pan : 1.f);
+            buffer[pos + i][1] += out_[1][size_t(i)] * gain * fade * vol * (pan < 0 ? 1.f + pan : 1.f);
             voice.playhead_ += double(wav_->sampleRate) / sampleRate_;
         }
         if (frames < run || voice.playhead_ >= voice.sliceEnd_) voice.samplePlaying_ = false;
@@ -334,7 +302,7 @@ void _stdcall FormantSlideNative::Gen_Render(PWAV32FS buffer, int& length) {
                 v->drainRemaining_ = 0;
                 v->releaseFrames = 0;
                 v->released = true;
-                v->world_.reset();
+                v->engine_.reset();
             }
         }
     }
@@ -362,20 +330,14 @@ bool FormantSlideNative::loadWav(const std::wstring& path, std::string& error) {
     auto wav = std::make_shared<WaveData>();
     if (!readWav(path, *wav, error)) return false;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!analysisThread_.joinable()) {
-        try { analysisThread_ = std::thread(&FormantSlideNative::analysePendingWavs, this); }
-        catch (const std::exception& e) { error = e.what(); return false; }
-    }
+    stopVoices();
     wav_ = std::move(wav);
-    analysis_.reset();
     wavPath_ = path;
     slices_ = sliceWav(*wav_, settings_.equalSlices, settings_.sliceCount);
     slicesManuallyEdited_ = false;
     lastMidiNote_ = lastSlice_ = -1;
     stopVoices();
-    status_ = "Analysing chromatic (WORLD)...";
-    pendingAnalysis_ = wav_;
-    analysisWake_.notify_one();
+    status_ = "WAV loaded (stftPitchShift ready)";
     return true;
 }
 bool FormantSlideNative::loadMidi(const std::wstring& path, std::string& error) {

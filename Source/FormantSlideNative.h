@@ -2,13 +2,11 @@
 #include "fp_cplug.h"
 #include "MidiFile.h"
 #include "WaveLoader.h"
-#include "WorldEngine.h"
+#include "StftEngine.h"
 #include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
-#include <thread>
-#include <condition_variable>
 #include <string>
 #include <vector>
 
@@ -75,18 +73,12 @@ private:
         double customPitch_ = 0, customTarget_ = 0, customStep_ = 0;
         double previousHostSlide_ = 0;
         int customRemaining_ = 0;
-        std::unique_ptr<WorldVoice> world_;
+        std::unique_ptr<StftVoice> engine_;
 
     };
     mutable std::mutex mutex_;
     Settings settings_;
     std::shared_ptr<const WaveData> wav_ = std::make_shared<WaveData>();
-    std::condition_variable analysisWake_;
-    std::shared_ptr<const WaveData> pendingAnalysis_;
-    bool closing_ = false;
-    std::thread analysisThread_;
-    void analysePendingWavs();
-    std::shared_ptr<const WorldAnalysis> analysis_;
     std::vector<AudioSlice> slices_;
     bool slicesManuallyEdited_ = false;
     int lastMidiNote_ = -1, lastSlice_ = -1;

@@ -1,3 +1,0 @@
-https://github.com/mmorise/World
-Commit: c794856b537758a3d300757db2e5e31685a822c2
-Unmodified src/ and LICENSE.txt.

@@ -44,15 +44,14 @@ Distribuisci build/Release/FormantSlide_x64.dll insieme a
 build/Release/THIRD_PARTY_LICENSES.txt. Chiudi FL prima di sostituire la DLL.
 Non distribuire vecchie DLL o usare vecchie build/cache per questa versione.
 
-WORLD e incluso in third_party/World con revisione fissata e licenza BSD-3-Clause.
-L'analisi Harvest/CheapTrick/D4C (5 ms) avviene una volta al caricamento WAV,
-prima di acquisire il mutex audio. Il caricamento puo richiedere tempo.
-La sintesi usa WorldSynthesizer, con altezza variabile e inviluppo conservato.
-Il WAV stereo viene analizzato come downmix mono; l'uscita e dual mono con pan.
-La conversione alla frequenza host usa interpolazione lineare.
-Questa prima integrazione richiede verifica sonora in FL (attacchi, slide,
-polifonia e frequenze host differenti). Non garantisce assenza di aliasing,
-allocazioni nel thread audio o latenza algoritmica nulla.
+stftPitchShift e incluso in third_party/stftPitchShift, con licenza MIT.
+Richiede C++20. Il WAV viene letto e diviso in slice senza preanalisi vocale.
+Le note ad altezza originale leggono il WAV stereo direttamente.
+Il pitch variabile usa il core STFT con preservazione cepstrale dei formanti,
+finestre di 1024 campioni e aggiornamenti ogni 64 campioni.
+La prima trasposizione prepara brevemente le finestre della voce corrente.
+Il lookahead sul WAV evita di attendere audio in ingresso, ma le finestre
+possono smussare gli slide molto rapidi. Qualita e CPU vanno provate in FL.
 
 JUCE resta fissato a 8.0.10. Si prevede l'uso secondo l'EULA JUCE 8,
 piano Starter, anziche la licenza alternativa AGPLv3. Starter e gratuito
@@ -62,4 +61,4 @@ I due flag splash/usage a 1 sono impostazioni richieste, non una licenza.
 L'ammissibilita Starter e i diritti di distribuzione dell'SDK FL devono essere
 verificati dal titolare: il solo CMake non puo certificarli.
 Riferimenti: https://juce.com/legal/juce-8-licence/
-             https://github.com/mmorise/World/blob/master/LICENSE.txt
+             https://github.com/jurihock/stftPitchShift/blob/main/LICENSE
