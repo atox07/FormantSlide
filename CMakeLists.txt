@@ -20,9 +20,17 @@ FetchContent_Declare(juce
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(juce)
 
-# Header-only DSP core with its bundled MIT FFT.
+set(stft_headers "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stftPitchShift/cpp")
+if(NOT EXISTS "${stft_headers}/StftPitchShift/StftPitchShiftCore.h")
+    FetchContent_Declare(stft_source
+        GIT_REPOSITORY https://github.com/jurihock/stftPitchShift.git
+        GIT_TAG 70c96db087458f8631edbc1bb4068d42ea5b52cc
+        SOURCE_SUBDIR formantslide_headers_only)
+    FetchContent_MakeAvailable(stft_source)
+    set(stft_headers "${stft_source_SOURCE_DIR}/cpp")
+endif()
 add_library(formantslide_stft INTERFACE)
-target_include_directories(formantslide_stft INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stftPitchShift/cpp")
+target_include_directories(formantslide_stft INTERFACE "${stft_headers}")
 target_compile_features(formantslide_stft INTERFACE cxx_std_20)
 
 add_subdirectory("${FL_SDK_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/fl_sdk")
