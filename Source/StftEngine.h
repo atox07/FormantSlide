@@ -24,10 +24,10 @@ private:
     double kQuefrency          = 0.002;
     static constexpr double kSmoothMs           = 6.0;
     static constexpr double kFadeMs             = 8.0;
-    float kMaxGain            = 6.0f;
+    float kMaxGain            = 9.118f;
     static constexpr float  kPeakFloor          = 1e-4f;
     float kEnvSmoothCoef      = 0.3f;
-    float kEnvSmoothCoefSlide = 0.05f;
+    float kEnvSmoothCoefSlide = 0.566f;
 
     struct Track {
         float freq = 0.f;  // Analysis frequency in (possibly fractional) FFT bins
