@@ -106,6 +106,7 @@ private:
     bool smoothInit = false;
     float wet = 0.f;
 
+    bool formantInit_ = false; // la prima volta niente glide verso il formante del knob
     double formantScaleTarget_ = 1.0;
     double formantScaleSmoothed_ = 1.0;
     double formantSmoothCoef_ = 0.0;
