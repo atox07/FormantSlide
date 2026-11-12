@@ -12,64 +12,60 @@ int pickSize(double rate, int base) {
     return base * 4;
 }
 
-double wrapPhase(double value) {
-    return value - kTwoPi * std::floor(value / kTwoPi + 0.5);
-}
-
-float saturate(float value) { return std::clamp(value, 0.f, 1.f); }
-
-// Two non-negative fractional-bin taps. The old four-tap Lagrange
-// interpolation generated negative side-lobes around bright consonants,
-// making high upward slides sound like a ringing/sizzling whistle.
-// Fractional frequency accuracy is preserved by phase tracking independently.
-void fractionalWeights(float t, float (&w)[2]) {
-    w[0] = 1.f - t;
-    w[1] = t;
+double wrapPhase(double p) {
+    return p - kTwoPi * std::floor(p / kTwoPi + 0.5);
 }
 } // namespace
 
 StftVoice::Band::Band(int fftSize, double sampleRate, bool upperBand)
-    : N(fftSize), H(fftSize / 4), K(fftSize / 2 + 1),
-      rate(sampleRate), high(upperBand),
+    : N(fftSize),
+      H(fftSize / 4),
+      K(fftSize / 2 + 1),
+      rate(sampleRate),
+      high(upperBand),
       fftp(std::make_shared<stftpitchshift::RFFT>()),
       cepster(fftp, size_t(fftSize), sampleRate),
-      window(size_t(N), 0.f), crossover(size_t(K), 0.f),
-      time(size_t(N), 0.f), bins(size_t(K)), spec(size_t(K)),
-      mag(size_t(K), 0.f), ph(size_t(K), 0.f),
-      env(size_t(K), 0.f), freqBin(size_t(K), 0.f),
-      tonalMask(size_t(K), 0.f), overlapWeights(size_t(K), 0.f),
-      peakBin(size_t(K), 0), regionLo(size_t(K), 0),
-      regionHi(size_t(K), 0), peakTrackIndex(size_t(K), -1),
+      window(size_t(N), 0.f),
+      crossover(size_t(K), 0.f),
+      time(size_t(N), 0.f),
+      bins(size_t(K)),
+      spec(size_t(K)),
+      mag(size_t(K), 0.f),
+      ph(size_t(K), 0.f),
+      env(size_t(K), 0.f),
+      freqBin(size_t(K), 0.f),
+      peakBin(size_t(K), 0),
+      regionLo(size_t(K), 0),
+      regionHi(size_t(K), 0),
       newTracks(size_t(K)) {
     cepster.quefrency(kQuefrency);
     for (int i = 0; i < N; ++i)
         window[size_t(i)] = float(0.5 - 0.5 * std::cos(kTwoPi * i / N));
 
+    // Complementary frequency-domain crossover.  We filter each *synthesized*
+    // spectrum, so an upward/downward shift is split by its OUTPUT frequency.
     for (int k = 0; k < K; ++k) {
         const double hz = double(k) * rate / N;
-        const float upperWeight = float(std::clamp(
+        const float highWeight = float(std::clamp(
             (hz - kCrossLowHz) / (kCrossHighHz - kCrossLowHz), 0.0, 1.0));
-        crossover[size_t(k)] = high ? upperWeight : 1.f - upperWeight;
+        crossover[size_t(k)] = high ? highWeight : 1.f - highWeight;
     }
-    // 4x overlap / periodic Hann analysis and synthesis window.
+
+    // The periodic Hann window squared has sum 1.5 at 4x overlap.
     outNorm = 2.f / 3.f;
     for (auto& c : channels) {
         c.overlap.assign(size_t(N), 0.f);
         c.prevPhase.assign(size_t(K), 0.f);
         c.prevMagnitude.assign(size_t(K), 0.f);
         c.envSmooth.assign(size_t(K), 0.f);
-        c.tonalHistory.assign(size_t(K), 0.f);
-        c.trackMatched.assign(size_t(K), 0);
         c.tracks.resize(size_t(K));
     }
 
-    // The libraries can lazily create plans/caches. Prime FFT and cepstral
-    // paths at construction so the first MIDI trigger does not create a plan.
+    // RFFT lazily builds a per-transform-size cache on its first call.
+    // Prime both directions HERE, not in render()/frame()/shift().  Cepster
+    // uses this same FFT instance and the same N in its lifter() call.
     fftp->fft(time, bins);
     fftp->ifft(bins, time);
-    std::fill(env.begin(), env.end(), 1.f);
-    cepster.lifter(env);
-    std::fill(env.begin(), env.end(), 0.f);
 }
 
 StftVoice::StftVoice(std::shared_ptr<const WaveData> data,
@@ -84,10 +80,12 @@ StftVoice::StftVoice(std::shared_ptr<const WaveData> data,
     smoothCoef = 1.0 - std::exp(-1.0 / (kSmoothMs * 0.001 * hostRate));
     formantSmoothCoef_ = smoothCoef;
     fadeStep = float(1.0 / (kFadeMs * 0.001 * hostRate));
+
+    // No scanning or allocations are performed on the audio callback.
     mono = true;
-    const auto& samples = wav->stereo;
+    const auto& s = wav->stereo;
     for (int i = begin; i < end; ++i) {
-        if (samples[size_t(i) * 2] != samples[size_t(i) * 2 + 1]) {
+        if (s[size_t(i) * 2] != s[size_t(i) * 2 + 1]) {
             mono = false;
             break;
         }
@@ -100,20 +98,18 @@ void StftVoice::setFormantScale(double scale) {
 }
 
 void StftVoice::resetState() {
-    auto resetBand = [](Band& b) {
-        b.cursor = 0;
-        b.hopPitchSum = 0.0;
-        for (auto& c : b.channels) {
+    auto resetBand = [](Band& band) {
+        band.cursor = 0;
+        band.hopPitchSum = 0.0;
+        for (auto& c : band.channels) {
             std::fill(c.overlap.begin(), c.overlap.end(), 0.f);
             std::fill(c.prevPhase.begin(), c.prevPhase.end(), 0.f);
             std::fill(c.prevMagnitude.begin(), c.prevMagnitude.end(), 0.f);
             std::fill(c.envSmooth.begin(), c.envSmooth.end(), 0.f);
-            std::fill(c.tonalHistory.begin(), c.tonalHistory.end(), 0.f);
             c.trackCount = 0;
             c.prevAlpha = 1.0;
             c.prevFluxEnergy = 0.f;
             c.fluxBaseline = 0.f;
-            c.voicedConfidence = 0.f;
             c.transientHold = 0;
             c.havePrev = false;
         }
@@ -122,28 +118,34 @@ void StftVoice::resetState() {
     resetBand(highBand);
 }
 
-float StftVoice::read(double where, int channel) const {
+float StftVoice::read(double where, int ch) const {
     if (where < begin || where >= end) return 0.f;
     const float* s = wav->stereo.data();
     const int a = int(where);
-    const float t = float(where - a);
-    auto at = [&](int idx) {
-        return s[size_t(std::clamp(idx, begin, end - 1)) * 2 + size_t(channel)];
+    const float f = float(where - a);
+    auto at = [&](int i) {
+        return s[size_t(std::clamp(i, begin, end - 1)) * 2 + size_t(ch)];
     };
-    if (t == 0.f) return at(a);
+    if (f == 0.f) return at(a);
     const float y0 = at(a - 1), y1 = at(a), y2 = at(a + 1), y3 = at(a + 2);
     const float c1 = 0.5f * (y2 - y0);
     const float c2 = y0 - 2.5f * y1 + 2.f * y2 - 0.5f * y3;
     const float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
-    return ((c3 * t + c2) * t + c1) * t + y1;
+    return ((c3 * f + c2) * f + c1) * f + y1;
 }
 
-void StftVoice::shift(Band& b, Channel& c, int channelIndex,
-                      double alpha, double phaseAlpha) {
-    const bool hadPrev = c.havePrev;
+void StftVoice::shift(Band& b, Channel& c, double alpha,
+                      double phaseAlpha) {
     const double omega = kTwoPi * b.H / b.N;
+    const bool hadPrev = c.havePrev;
+
     float maxMag = 0.f;
-    float fluxPositive = 0.f, fluxTotal = 0.f, fluxEnergy = 0.f;
+    float fluxPositive = 0.f;
+    float fluxTotal = 0.f;
+    float fluxEnergy = 0.f;
+
+    // Analyze the whole frame, but detect transients primarily in the band
+    // that this STFT contributes to the finished signal.
     const int fluxFirst = std::max(1, int(std::floor(
         (b.high ? 1800.0 : 80.0) * b.N / b.rate)));
     const int fluxLast = std::min(b.K - 2, int(std::ceil(
@@ -151,92 +153,53 @@ void StftVoice::shift(Band& b, Channel& c, int channelIndex,
 
     for (int k = 0; k < b.K; ++k) {
         const size_t ix = size_t(k);
-        const float m = std::abs(b.bins[ix]);
-        const float p = std::arg(b.bins[ix]);
-        b.mag[ix] = m;
-        b.ph[ix] = p;
-        maxMag = std::max(maxMag, m);
+        const float magnitude = std::abs(b.bins[ix]);
+        const float phase = std::arg(b.bins[ix]);
+        b.mag[ix] = magnitude;
+        b.ph[ix] = phase;
+        maxMag = std::max(maxMag, magnitude);
+
         if (k >= fluxFirst && k <= fluxLast) {
-            fluxEnergy += m;
+            fluxEnergy += magnitude;
             if (hadPrev)
-                fluxPositive += std::max(0.f, m - c.prevMagnitude[ix]);
-            fluxTotal += m;
+                fluxPositive += std::max(0.f, magnitude - c.prevMagnitude[ix]);
+            fluxTotal += magnitude;
         }
-        c.prevMagnitude[ix] = m;
+        c.prevMagnitude[ix] = magnitude;
+
         double f = k;
         if (hadPrev) {
-            const double error = wrapPhase(double(p) -
+            const double err = wrapPhase(double(phase) -
                 double(c.prevPhase[ix]) - k * omega);
-            f += error / omega;
+            f += err / omega;
         }
         b.freqBin[ix] = float(f);
-        c.prevPhase[ix] = p;
+        c.prevPhase[ix] = phase;
     }
+
     const float flux = fluxPositive / std::max(fluxTotal, 1e-9f);
     const float threshold = b.high ? 0.17f : 0.22f;
     const bool onset = hadPrev && c.transientHold == 0 &&
         flux > std::max(threshold, c.fluxBaseline * 1.75f) &&
         (fluxEnergy > 1.08f * c.prevFluxEnergy || flux > 0.42f);
-    c.fluxBaseline = hadPrev
-        ? 0.94f * c.fluxBaseline + 0.06f * flux : 0.25f * flux;
-    c.prevFluxEnergy = fluxEnergy;
 
-    // Long-window evidence tells the short window whether a frame is
-    // voiced. A short FFT on its own cannot reliably distinguish harmonic
-    // vocal texture from a noisy consonant above 3 kHz.
-    if (!b.high) {
-        const int lo = std::max(1, int(130.0 * b.N / b.rate));
-        const int hi = std::min(b.K - 2, int(2300.0 * b.N / b.rate));
-        if (hi > lo) {
-            double sum = 0.0, logSum = 0.0;
-            for (int k = lo; k <= hi; ++k) {
-                const double m = std::max(1e-8, double(b.mag[size_t(k)]));
-                sum += m;
-                logSum += std::log(m);
-            }
-            const double bins = double(hi - lo + 1);
-            const double flatness = std::exp(logSum / bins) /
-                std::max(1e-9, sum / bins);
-            const float voiced = saturate(float((0.72 - flatness) / 0.50));
-            c.voicedConfidence = hadPrev ?
-                0.35f * voiced + 0.65f * c.voicedConfidence : voiced;
-        }
-    }
+    c.fluxBaseline = hadPrev
+        ? (0.94f * c.fluxBaseline + 0.06f * flux)
+        : (0.25f * flux);
+    c.prevFluxEnergy = fluxEnergy;
     if (c.transientHold > 0) --c.transientHold;
     if (onset) c.transientHold = b.high ? 3 : 2;
 
-    std::fill(b.spec.begin(), b.spec.end(), std::complex<float>{});
+    std::fill(b.spec.begin(), b.spec.end(), std::complex<float>{0.f, 0.f});
     if (maxMag < 1e-9f) {
         c.trackCount = 0;
         c.havePrev = false;
         c.fluxBaseline = 0.f;
-        c.voicedConfidence = 0.f;
         c.prevAlpha = alpha;
-        std::fill(c.tonalHistory.begin(), c.tonalHistory.end(), 0.f);
         return;
     }
 
-    // Spectral flatness is only a noise hint, never a global treble cut.
-    // The long-window voicing estimate below prevents ordinary breathy
-    // vowels from being mistaken for completely unpitched consonants.
-    float noiseDominance = 0.f;
-    if (b.high) {
-        const int lo = std::max(1, int(2500.0 * b.N / b.rate));
-        const int hi = std::min(b.K - 2, int(12000.0 * b.N / b.rate));
-        if (hi > lo) {
-            double linear = 0.0, logarithmic = 0.0;
-            for (int k = lo; k <= hi; ++k) {
-                const double value = std::max(1e-8, double(b.mag[size_t(k)]));
-                linear += value;
-                logarithmic += std::log(value);
-            }
-            const double count = hi - lo + 1;
-            const double flatness = std::exp(logarithmic / count) /
-                std::max(1e-9, linear / count);
-            noiseDominance = saturate(float((flatness - 0.42) / 0.38));
-        }
-    }
-
+    // Find spectral peaks.  All arrays are full-size and allocated at creation.
     const float peakThreshold = maxMag * kPeakFloor;
     int peakCount = 0;
     for (int k = 2; k < b.K - 2; ++k) {
@@ -244,22 +207,22 @@ void StftVoice::shift(Band& b, Channel& c, int channelIndex,
         if (m > peakThreshold &&
             m > b.mag[size_t(k - 1)] && m >= b.mag[size_t(k + 1)] &&
             m > b.mag[size_t(k - 2)] && m >= b.mag[size_t(k + 2)]) {
-            if (peakCount && k - b.peakBin[size_t(peakCount - 1)] < 4) {
-                const int prev = b.peakBin[size_t(peakCount - 1)];
-                if (m > b.mag[size_t(prev)])
+            if (peakCount > 0 && k - b.peakBin[size_t(peakCount - 1)] < 4) {
+                if (m > b.mag[size_t(b.peakBin[size_t(peakCount - 1)])])
                     b.peakBin[size_t(peakCount - 1)] = k;
             } else {
                 b.peakBin[size_t(peakCount++)] = k;
             }
         }
     }
-    if (!peakCount) {
+    if (peakCount == 0) {
         int best = 1;
         for (int k = 2; k < b.K - 1; ++k)
             if (b.mag[size_t(k)] > b.mag[size_t(best)]) best = k;
         b.peakBin[0] = best;
         peakCount = 1;
     }
+
     for (int i = 0; i < peakCount; ++i) {
         b.regionLo[size_t(i)] = 1;
         b.regionHi[size_t(i)] = b.K - 2;
@@ -272,282 +235,156 @@ void StftVoice::shift(Band& b, Channel& c, int channelIndex,
         b.regionLo[size_t(i + 1)] = valley + 1;
     }
 
+    // Smoothed cepstral envelope for formant restoration / formant knob.
+    const double slideSpeed = std::abs(alpha - c.prevAlpha);
     c.prevAlpha = alpha;
-    // Per-band hop sizes differ by x4. Using the same 0.05 coefficient
-    // was equivalent to ~230 ms smoothing on the long band during slides,
-    // lagging vowels and making them sound dark/"closed" near +1 octave.
-    // Use an actual 26 ms time constant, and re-acquire transients quickly.
-    const double envTau = b.high ? 0.026 : 0.226;   // 26 ms high, 226 ms low
-    const float envCoef = onset ? 0.80f : float(1.0 - std::exp(-double(b.H) / (envTau * b.rate)));
+    const float envCoef = slideSpeed > 1e-4
+        ? kEnvSmoothCoefSlide : kEnvSmoothCoef;
     for (int k = 0; k < b.K; ++k)
         b.env[size_t(k)] = std::max(b.mag[size_t(k)], 1e-9f);
     b.cepster.lifter(b.env);
     for (int k = 0; k < b.K; ++k) {
         const size_t ix = size_t(k);
         const float logNow = std::log(std::max(b.env[ix], 1e-9f));
+        // IMPORTANT: don't smooth a first frame against zero log-magnitude.
         c.envSmooth[ix] = hadPrev
             ? envCoef * logNow + (1.f - envCoef) * c.envSmooth[ix]
             : logNow;
+        b.env[ix] = std::exp(c.envSmooth[ix]);
     }
 
-    // Formant knob semantics retained from StftVoice: 1 = preserve the
-    // original formant position; >1 raises it, <1 lowers it. The R3 wrapper
-    // supplied by the user uses 0 = automatic compensation, which is a
-    // different public API; do not reinterpret this knob as an R3 ratio.
-    const double beta = std::clamp(formantScaleSmoothed_, 1.0 / 64.0, 64.0);
-    // Compute high-band gains from the *long* FFT's cepstral log-envelope.
-    // Its frequency resolution is x4 better than a 512-point FFT, yielding
-    // much less flutter and avoiding a separate high-band 'dark voice'.
-    const Band& envelopeBand = (b.high && lowBand.channels[size_t(channelIndex)].havePrev)
-        ? lowBand : b;
-    const Channel& envelopeChannel = (b.high && lowBand.channels[size_t(channelIndex)].havePrev)
-        ? lowBand.channels[size_t(channelIndex)] : c;
-    auto sampleLogEnvelopeHz = [&](double hz) -> float {
-        const double index = std::clamp(hz * envelopeBand.N / envelopeBand.rate,
-                                        1.0, double(envelopeBand.K - 2));
-        const int lo = int(index);
-        const int hi = std::min(lo + 1, envelopeBand.K - 2);
-        const float frac = float(index - double(lo));
-        return envelopeChannel.envSmooth[size_t(lo)] * (1.f - frac) +
-               envelopeChannel.envSmooth[size_t(hi)] * frac;
+    const float beta = float(std::clamp(
+        formantScaleSmoothed_, 1.0 / 64.0, 64.0));
+    auto sampleEnv = [&](float binPos) -> float {
+        binPos = std::clamp(binPos, 1.f, float(b.K - 2));
+        const int lo = int(std::floor(binPos));
+        const int hi = std::min(lo + 1, b.K - 2);
+        const float frac = binPos - lo;
+        return b.env[size_t(lo)] * (1.f - frac) + b.env[size_t(hi)] * frac;
     };
 
-    // Greedy one-to-one sinusoidal association. Avoids two new peaks inheriting
-    // the same previous track (a frequent cause of a "second note" on slides).
-    std::fill(c.trackMatched.begin(), c.trackMatched.end(), 0);
-    std::fill(b.tonalMask.begin(), b.tonalMask.end(), 0.f);
     int nextTrackCount = 0;
+    int trackCursor = 0;
     for (int i = 0; i < peakCount; ++i) {
-        b.peakTrackIndex[size_t(i)] = -1;
         const int kp = b.peakBin[size_t(i)];
-        const float m = b.mag[size_t(kp)];
-        const double fp = std::clamp(double(b.freqBin[size_t(kp)]),
-                                      kp - 1.5, kp + 1.5);
-        if (alpha * fp <= 0.0) continue;
-        const double centreAna = wrapPhase(
-            double(b.ph[size_t(kp)]) + kPi * kp);
+        const double fp = std::clamp(
+            double(b.freqBin[size_t(kp)]), kp - 1.5, kp + 1.5);
+        const double shiftedFrequency = alpha * fp;
+        if (shiftedFrequency <= 0.0) continue;
+        if (shiftedFrequency >= b.K - 1.0) break;
 
-        int match = -1;
-        float matchScore = 1e10f;
-        for (int j = 0; j < c.trackCount; ++j) {
-            if (c.trackMatched[size_t(j)]) continue;
-            const Track& p = c.tracks[size_t(j)];
-            const float distance = float(std::abs(fp - p.freq));
-            if (distance > (b.high ? 1.20f : 1.45f)) continue;
-            const float magPenalty = 0.15f * std::abs(std::log(
-                (m + 1e-7f) / (p.magnitude + 1e-7f)));
-            const float score = distance + magPenalty -
-                0.02f * float(std::min(p.age, 8));
-            if (score < matchScore) { matchScore = score; match = j; }
-        }
-        Track track;
-        track.freq = float(fp);
-        track.analysisPhase = float(centreAna);
-        track.magnitude = m;
-        track.age = match >= 0 ? std::min(c.tracks[size_t(match)].age + 1, 255) : 1;
+        // Integer bin relocation + *explicit* fractional remainder.
+        // This fixes the phase progression at a continuous, sub-bin target,
+        // instead of advancing it at a rounded destination frequency.
+        const double exactShift = (alpha - 1.0) * fp;
+        const int delta = int(std::lround(exactShift));
+        const double fractional = exactShift - delta; // [-0.5, +0.5]
+        const int neighbour = delta + (fractional >= 0.0 ? 1 : -1);
+        const float primaryWeight = float(1.0 - std::abs(fractional));
+        const float neighbourWeight = float(std::abs(fractional));
+
+        const double centreAna = double(b.ph[size_t(kp)]) + kPi * kp;
         double centreSyn = centreAna;
-        if (match >= 0) {
-            c.trackMatched[size_t(match)] = 1;
-            if (!onset) {
-                const Track& old = c.tracks[size_t(match)];
-                const double avgFreq = 0.5 * (double(old.freq) + fp);
-                centreSyn = wrapPhase(double(old.phase) +
-                                      avgFreq * phaseAlpha * omega);
+        if (hadPrev && !onset && c.trackCount > 0) {
+            while (trackCursor + 1 < c.trackCount &&
+                   c.tracks[size_t(trackCursor + 1)].freq <= fp)
+                ++trackCursor;
+            int best = trackCursor;
+            if (trackCursor + 1 < c.trackCount &&
+                std::abs(c.tracks[size_t(trackCursor + 1)].freq - fp) <
+                std::abs(c.tracks[size_t(best)].freq - fp))
+                best = trackCursor + 1;
+            if (std::abs(double(c.tracks[size_t(best)].freq) - fp) < 1.75) {
+                // Advance at the *hop-averaged* MIDI pitch, not merely its
+                // last sample.  This is essential on fast continuous slides.
+                // The first terms explicitly retain the fractional offset;
+                // the final term integrates the pitch ramp within this hop.
+                const double advanceBins =
+                    double(kp + delta) + (fp - kp) + fractional +
+                    (phaseAlpha - alpha) * fp;
+                centreSyn = double(c.tracks[size_t(best)].phase) +
+                    advanceBins * omega;
             }
         }
+        // On a transient, centreSyn deliberately resets to the current
+        // analysis phase.  This prevents prolonged phase smearing on attacks.
+        centreSyn = wrapPhase(centreSyn);
+        b.newTracks[size_t(nextTrackCount++)] = {
+            float(fp), float(centreSyn)
+        };
 
-        // Stereo-link only a confidently shared peak. Apply the same phase
-        // correction as left, retaining the original L-R analysis phase gap.
-        // Do not force this on independent/panned right-only components.
-        if (channelIndex == 1 && !onset && track.age >= 2) {
-            const Channel& reference = b.channels[0];
-            int common = -1;
-            float nearest = b.high ? 0.75f : 0.90f;
-            for (int j = 0; j < reference.trackCount; ++j) {
-                const Track& r = reference.tracks[size_t(j)];
-                const float distance = float(std::abs(fp - r.freq));
-                const float ratio = m / std::max(r.magnitude, 1e-7f);
-                if (distance < nearest && ratio > 0.35f && ratio < 2.8f &&
-                    r.age >= 2) {
-                    nearest = distance;
-                    common = j;
-                }
-            }
-            if (common >= 0) {
-                const Track& r = reference.tracks[size_t(common)];
-                const double correction = wrapPhase(
-                    double(r.phase) - double(r.analysisPhase));
-                const double desired = wrapPhase(centreAna + correction);
-                const double mix = b.high ? 0.45 : 0.70;
-                centreSyn = wrapPhase(centreSyn +
-                            mix * wrapPhase(desired - centreSyn));
-            }
-        }
-        track.phase = float(wrapPhase(centreSyn));
-        b.peakTrackIndex[size_t(i)] = nextTrackCount;
-        b.newTracks[size_t(nextTrackCount++)] = track;
+        // Continuous, fractional-bin phase rotation.  Each of the two target
+        // integer bins is corrected relative to the *same* non-integer peak
+        // position; their phases therefore coincide at the frame centre.
+        const double continuousRotation = centreSyn -
+            double(b.ph[size_t(kp)]) - kPi * (kp + exactShift);
+        const double rotationPrimary = wrapPhase(
+            continuousRotation + kPi * (exactShift - delta));
+        const double rotationNeighbour = wrapPhase(
+            continuousRotation + kPi * (exactShift - neighbour));
+        const std::complex<float> rot0(float(std::cos(rotationPrimary)),
+                                        float(std::sin(rotationPrimary)));
+        const std::complex<float> rot1(float(std::cos(rotationNeighbour)),
+                                        float(std::sin(rotationNeighbour)));
 
-        if (b.high) {
-            // Tonal/noise separation: high-frequency *stable, prominent*
-            // partials shift; hiss, breath, S/SH/F and random peaks stay at
-            // their original frequencies. No artificial high-pitch noise note.
-            float neighbours = 0.f;
-            int neighboursCount = 0;
-            for (int offset = -6; offset <= 6; ++offset) {
-                if (std::abs(offset) < 3) continue;
-                const int q = kp + offset;
-                if (q >= 1 && q < b.K - 1) {
-                    neighbours += b.mag[size_t(q)];
-                    ++neighboursCount;
-                }
+        for (int k = b.regionLo[size_t(i)];
+             k <= b.regionHi[size_t(i)]; ++k) {
+            const float originalEnvelope = std::max(b.env[size_t(k)], 1e-9f);
+            const std::complex<float> base = b.bins[size_t(k)];
+            const int d0 = k + delta;
+            const int d1 = k + neighbour;
+            if (primaryWeight > 0.f && d0 >= 1 && d0 < b.K - 1) {
+                const float targetEnvelope = sampleEnv(float(d0) / beta);
+                const float gain = std::clamp(
+                    targetEnvelope / originalEnvelope, 0.f, kMaxGain);
+                b.spec[size_t(d0)] += base * rot0 * (gain * primaryWeight);
             }
-            const float surroundings = neighbours /
-                float(std::max(1, neighboursCount));
-            const float prominence = m / std::max(surroundings, 1e-8f);
-            const float sharpness = saturate((prominence - 1.35f) / 1.45f);
-            const float maturity = saturate(float(track.age - 1) / 3.f);
-            const float voiced = lowBand.channels[size_t(channelIndex)].voicedConfidence;
-            float confidence = sharpness * (0.65f + 0.35f * maturity);
-            confidence *= voiced * (1.f - 0.85f * noiseDominance);
-            if (onset) confidence *= 0.85f;
-            for (int k = std::max(1, kp - 4);
-                 k <= std::min(b.K - 2, kp + 4); ++k) {
-                const int distance = std::abs(k - kp);
-                const float lobe = distance <= 1 ? 1.f :
-                                   distance == 2 ? 0.87f :
-                                   distance == 3 ? 0.40f : 0.12f;
-                b.tonalMask[size_t(k)] = std::max(
-                    b.tonalMask[size_t(k)], confidence * lobe);
+            if (neighbourWeight > 0.f && d1 >= 1 && d1 < b.K - 1) {
+                const float targetEnvelope = sampleEnv(float(d1) / beta);
+                const float gain = std::clamp(
+                    targetEnvelope / originalEnvelope, 0.f, kMaxGain);
+                b.spec[size_t(d1)] += base * rot1 * (gain * neighbourWeight);
             }
         }
     }
 
+    // Destination frequency, not source frequency, controls the crossover.
+    for (int k = 1; k < b.K - 1; ++k)
+        b.spec[size_t(k)] *= b.crossover[size_t(k)];
+    b.spec.front() = b.spec.back() = {};
+
+    // No resizing/swapping/push_back on the audio thread: fixed track arrays.
     for (int i = 0; i < nextTrackCount; ++i)
         c.tracks[size_t(i)] = b.newTracks[size_t(i)];
     c.trackCount = nextTrackCount;
-
-    // A vocal is broadband *and* harmonic: don't leave most of its upper
-    // partials at their original pitch (that sounds like a low second voice).
-    // Only retain the truly unvoiced residual at its original frequency.
-    // A gentle de-esser targets that residual, rather than cutting the
-    // shifted vocal harmonics and closing the vowel again.
-    if (b.high) {
-        const float voiced = lowBand.channels[size_t(channelIndex)].voicedConfidence;
-        const float baseline = 0.965f * voiced * (1.f - noiseDominance);
-        const float slide = saturate(float((alpha - 1.05) / 0.85));
-        for (int k = 1; k < b.K - 1; ++k) {
-            const size_t ix = size_t(k);
-            const float raw = saturate(std::max(baseline, b.tonalMask[ix]));
-            const float stable = (hadPrev && !onset)
-                ? 0.20f * c.tonalHistory[ix] + 0.80f * raw : raw;
-            c.tonalHistory[ix] = stable;
-            b.tonalMask[ix] = stable;
-            const float hz = float(double(k) * b.rate / b.N);
-            const float sibilance = saturate((hz - 4300.f) / 3200.f) *
-                saturate((13500.f - hz) / 4500.f);
-            const float deEss = 1.f - 0.34f * slide * noiseDominance * sibilance;
-            b.spec[ix] = b.bins[ix] * ((1.f - stable) * deEss);
-        }
-    } else {
-        std::fill(b.tonalMask.begin(), b.tonalMask.end(), 1.f);
-    }
-
-    // Shift coherent harmonic regions with sub-bin accurate phase advance.
-    // Only non-negative interpolation weights are used: no high-frequency
-    // side-lobes are synthesized near the tip of an upward slide.
-    std::fill(b.overlapWeights.begin(), b.overlapWeights.end(), 0.f);
-    for (int i = 0; i < peakCount; ++i) {
-        const int kp = b.peakBin[size_t(i)];
-        const int trackIndex = b.peakTrackIndex[size_t(i)];
-        if (trackIndex < 0) continue;
-        const Track& track = b.newTracks[size_t(trackIndex)];
-        const double exactShift = (alpha - 1.0) * track.freq;
-        const int deltaFloor = int(std::floor(exactShift));
-        const float fraction = float(exactShift - deltaFloor);
-        float weights[2];
-        fractionalWeights(fraction, weights);
-        std::complex<float> rotation[2];
-        for (int tap = 0; tap < 2; ++tap) {
-            const int delta = deltaFloor + tap;
-            const double theta = wrapPhase(double(track.phase) -
-                double(b.ph[size_t(kp)]) - kPi * (kp + delta));
-            rotation[tap] = {float(std::cos(theta)), float(std::sin(theta))};
-        }
-        for (int k = b.regionLo[size_t(i)];
-             k <= b.regionHi[size_t(i)]; ++k) {
-            const float tonal = b.tonalMask[size_t(k)];
-            if (tonal <= 1e-5f) continue;
-            const std::complex<float> base = b.bins[size_t(k)] * tonal;
-            for (int tap = 0; tap < 2; ++tap) {
-                const float weight = weights[tap];
-                if (weight < 1e-6f) continue;
-                const int dst = k + deltaFloor + tap;
-                if (dst < 1 || dst >= b.K - 1) continue;
-                const double targetHz = double(dst) * b.rate / b.N;
-                // Correct the *already pitch-shifted* envelope rather than
-                // dividing by the level of a single noisy source FFT bin.
-                // R3-like principle: target / uncorrected spectral envelope.
-                const double srcHz = targetHz / alpha;
-                const double formantHz = targetHz / beta;
-                const float logGain = sampleLogEnvelopeHz(formantHz) -
-                                      sampleLogEnvelopeHz(srcHz);
-                // Above the main vocal presence range the original
-                // envelope often falls by 15-25 dB. A fixed -2 dB minimum
-                // incorrectly resurrected high harmonics as prominent hiss.
-                const float highFloor = 0.89f - 0.77f *
-                    saturate(float((targetHz - 4700.0) / 2350.0));
-                const float gain = std::exp(std::clamp(logGain,
-                    std::log(b.high ? highFloor : 0.62f),
-                    b.high ? std::log(2.40f) : std::log(6.00f)));
-                b.spec[size_t(dst)] += base * rotation[tap] * (gain * weight);
-                b.overlapWeights[size_t(dst)] += tonal * weight;
-            }
-        }
-    }
-
-    // Limit accidental pile-ups without boosting weak bins. The residual
-    // was de-essed before pitch processing; keep that gain when limiting.
-    for (int k = 1; k < b.K - 1; ++k) {
-        const size_t ix = size_t(k);
-        const float weight = b.overlapWeights[ix];
-        if (weight > 1.30f) {
-            const float limiter = 1.30f / weight;
-            if (b.high) {
-                const float hz = float(double(k) * b.rate / b.N);
-                const float slide = saturate(float((alpha - 1.05) / 0.85));
-                const float sibilance = saturate((hz - 4300.f) / 3200.f) *
-                    saturate((13500.f - hz) / 4500.f);
-                const float deEss = 1.f - 0.34f * slide * noiseDominance * sibilance;
-                const std::complex<float> noise = b.bins[ix] *
-                    ((1.f - b.tonalMask[ix]) * deEss);
-                b.spec[ix] = noise + (b.spec[ix] - noise) * limiter;
-            } else {
-                b.spec[ix] *= limiter;
-            }
-        }
-        b.spec[ix] *= b.crossover[ix];
-    }
-    b.spec.front() = b.spec.back() = {};
     c.havePrev = true;
 }
 
 void StftVoice::frame(Band& b, long long start, double alpha,
                       double phaseAlpha) {
-    const int count = mono ? 1 : 2;
-    for (int ch = 0; ch < count; ++ch) {
-        // Identical source/output sample timebase for both STFT sizes.
-        for (int i = 0; i < b.N; ++i)
+    const int channelCount = mono ? 1 : 2;
+    for (int ch = 0; ch < channelCount; ++ch) {
+        // start is an ABSOLUTE time index in the output/source timebase.
+        // Both windows read and overlap-add at that same index.  The FFT
+        // centre is start + N/2, but there is NO extra N/2 sample offset on
+        // either read or write.  Consequently the 512/2048 window difference
+        // introduces no relative latency, including on the pre-roll frames.
+        for (int i = 0; i < b.N; ++i) {
+            const long long sampleIndex = start + i;
             b.time[size_t(i)] = read(
-                begin + double(start + i) * step, ch) * b.window[size_t(i)];
+                begin + double(sampleIndex) * step, ch) * b.window[size_t(i)];
+        }
         b.fftp->fft(b.time, b.bins);
-        shift(b, b.channels[size_t(ch)], ch, alpha, phaseAlpha);
+        shift(b, b.channels[size_t(ch)], alpha, phaseAlpha);
         b.fftp->ifft(b.spec, b.time);
+
         auto& overlap = b.channels[size_t(ch)].overlap;
         for (int i = 0; i < b.N; ++i) {
             const long long offset = start + i - position;
-            if (offset >= 0 && offset < b.N)
+            if (offset >= 0 && offset < b.N) {
                 overlap[size_t(offset)] += b.time[size_t(i)] *
                     b.window[size_t(i)] * b.outNorm;
+            }
         }
     }
 }
@@ -584,6 +421,8 @@ int StftVoice::render(float* left, float* right, int count, double scale) {
 
         if (shifted && !active) {
             resetState();
+            // Each band gets its OWN correctly centered warm-up frames; no
+            // heap allocation, no waiting for a future audio callback.
             for (int offset = -lowBand.N + lowBand.H;
                  offset <= 0; offset += lowBand.H)
                 frame(lowBand, position + offset, factor, factor);
@@ -593,12 +432,15 @@ int StftVoice::render(float* left, float* right, int count, double scale) {
             active = true;
             wet = position == 0 ? 1.f : 0.f;
         }
+
         if (active) {
             advanceBand(lowBand, factor);
             advanceBand(highBand, factor);
         }
+
         const float wetTarget = shifted ? 1.f : 0.f;
         wet += std::clamp(wetTarget - wet, -fadeStep, fadeStep);
+
         float dl = 0.f, dr = 0.f, wl = 0.f, wr = 0.f;
         if (wet < 1.f) {
             dl = read(begin + double(position) * step, 0);
