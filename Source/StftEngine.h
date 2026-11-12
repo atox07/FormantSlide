@@ -23,7 +23,7 @@ private:
     double kQuefrency          = 0.0025;
     static constexpr double kSmoothMs           = 6.0;
     static constexpr double kFadeMs             = 8.0;
-    float kMaxGain            = 12.0f;
+    float kMaxGain            = 40.0f;
     static constexpr float  kPeakFloor          = 1e-4f;
     float kEnvSmoothCoef      = 0.20f;
     float kEnvSmoothCoefSlide = 0.02f;
@@ -41,6 +41,7 @@ private:
         std::vector<float> prevMagnitude; // Magnitude from previous frame (flux)
         std::vector<float> envSmooth;     // Log-spectral envelope smoother
         std::vector<Track> tracks;        // Fixed-size peak track array
+        double lastF0 = 0.0;
         int trackCount = 0;
         double prevAlpha = 1.0;
         float prevFluxEnergy = 0.f;
