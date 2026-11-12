@@ -44,6 +44,7 @@ StftVoice::StftVoice(std::shared_ptr<const WaveData> data, int first, int last, 
     for (auto& c : chan) {
         c.overlap.assign(size_t(N), 0.f);
         c.prevPhase.assign(size_t(K), 0.f);
+        c.envSmooth.assign(size_t(K), 0.f);   // [FIX FORMANT]
         c.tracks.reserve(size_t(K));
     }
 
@@ -59,6 +60,7 @@ void StftVoice::resetState() {
     for (auto& c : chan) {
         std::fill(c.overlap.begin(), c.overlap.end(), 0.f);
         std::fill(c.prevPhase.begin(), c.prevPhase.end(), 0.f);
+        std::fill(c.envSmooth.begin(), c.envSmooth.end(), 0.f);   // [FIX FORMANT]
         c.tracks.clear();
         c.havePrev = false;
     }
@@ -139,10 +141,24 @@ void StftVoice::shift(Channel& c, double alpha) {
         regionLo[size_t(i + 1)] = valley + 1;
     }
 
-    // ---- formant envelope of the analysis frame
+    // ---- formant envelope of the analysis frame, smoothed across frames
     for (int k = 0; k < K; ++k) env[size_t(k)] = std::max(mag[size_t(k)], 1e-9f);
     cepster.lifter(env);
-    for (int k = 0; k < K; ++k) env[size_t(k)] = std::max(env[size_t(k)], 1e-9f);
+    // [FIX FORMANT] Smooth the log-envelope across frames: the per-frame
+    // cepstral estimate jitters a few dB even when the true formants are
+    // stable. Without this, a more detailed envelope (higher kQuefrency)
+    // sounds noisy. With this, we can afford kQuefrency = 0.002 and
+    // kMaxGain = 5.0 and still stay clean.
+    for (int k = 0; k < K; ++k) {
+        env[size_t(k)] = std::max(env[size_t(k)], 1e-9f);
+        const float logNow = std::log(env[size_t(k)]);
+        if (c.havePrev)
+            c.envSmooth[size_t(k)] = kEnvSmoothCoef * logNow +
+                                     (1.f - kEnvSmoothCoef) * c.envSmooth[size_t(k)];
+        else
+            c.envSmooth[size_t(k)] = logNow;
+        env[size_t(k)] = std::exp(c.envSmooth[size_t(k)]);
+    }
 
     // ---- move every region, keep one continuous phase track per peak
     std::fill(synMag.begin(), synMag.end(), 0.f);
