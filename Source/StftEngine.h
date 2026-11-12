@@ -47,6 +47,7 @@ private:
         double prevAlpha = 1.0;
         float prevFluxEnergy = 0.f;
         float fluxBaseline = 0.f;
+        float voicedConfidence = 0.f; // Low-band voicing shared with high-band
         int transientHold = 0;
         bool havePrev = false;
     };
