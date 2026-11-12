@@ -9,45 +9,41 @@
 #include <StftPitchShift/RFFT.h>
 #include <StftPitchShift/Cepster.h>
 
-// Multi-resolution STFT for a preloaded WAV. Both public entry points and
-// the formant-control method retain their original signatures.
+// Two independent, frequency-complementary STFTs.  Public API is unchanged.
+// This class renders a preloaded WAV: future samples can be inspected when a
+// MIDI note starts, so the synthesis is aligned to the supplied sample position.
 class StftVoice {
 public:
     StftVoice(std::shared_ptr<const WaveData>, int begin, int end, double hostRate);
     int render(float* left, float* right, int count, double scale);
-    void setFormantScale(double scale);
+    void setFormantScale(double scale); // 1.0 = preserve; 2.0 = +12 semitones
 
 private:
     static constexpr double kQuefrency          = 0.002;
     static constexpr double kSmoothMs           = 6.0;
     static constexpr double kFadeMs             = 8.0;
+    static constexpr float  kMaxGain            = 6.0f;
     static constexpr float  kPeakFloor          = 1e-4f;
-    static constexpr float  kEnvSmoothCoef      = 0.30f;
+    static constexpr float  kEnvSmoothCoef      = 0.3f;
     static constexpr float  kEnvSmoothCoefSlide = 0.05f;
     static constexpr double kCrossLowHz         = 2200.0;
     static constexpr double kCrossHighHz        = 2800.0;
 
     struct Track {
-        float freq = 0.f;           // Unshifted, fractional-bin frequency
-        float phase = 0.f;          // Synthesis phase at the window centre
-        float analysisPhase = 0.f;  // Current analysis phase at that centre
-        float magnitude = 0.f;
-        int age = 0;                // Number of consecutive matched frames
+        float freq = 0.f;  // Analysis frequency in (possibly fractional) FFT bins
+        float phase = 0.f; // Synthesis phase referenced to the frame centre
     };
 
     struct Channel {
-        std::vector<float> overlap;
-        std::vector<float> prevPhase;
-        std::vector<float> prevMagnitude;
-        std::vector<float> envSmooth;
-        std::vector<float> tonalHistory;
-        std::vector<unsigned char> trackMatched;
-        std::vector<Track> tracks;
+        std::vector<float> overlap;       // Preallocated overlap-add accumulator
+        std::vector<float> prevPhase;     // Analysis phase from previous frame
+        std::vector<float> prevMagnitude; // Magnitude from previous frame (flux)
+        std::vector<float> envSmooth;     // Log-spectral envelope smoother
+        std::vector<Track> tracks;        // Fixed-size peak track array
         int trackCount = 0;
         double prevAlpha = 1.0;
         float prevFluxEnergy = 0.f;
         float fluxBaseline = 0.f;
-        float voicedConfidence = 0.f; // Low-band voicing shared with high-band
         int transientHold = 0;
         bool havePrev = false;
     };
@@ -60,40 +56,52 @@ private:
         const int K;
         const double rate;
         const bool high;
+
+        // Every band has its own FFT / cepstral processing state, so sizes and
+        // any library-local FFT plans never interfere with the other band.
         std::shared_ptr<stftpitchshift::FFT> fftp;
         stftpitchshift::Cepster<float> cepster;
         std::array<Channel, 2> channels;
 
-        // Fixed-size scratch: no resizing, reserving or heap use in the DSP.
-        std::vector<float> window, crossover, time;
-        std::vector<std::complex<float>> bins, spec;
-        std::vector<float> mag, ph, env, freqBin;
-        std::vector<float> tonalMask, overlapWeights;
-        std::vector<int> peakBin, regionLo, regionHi, peakTrackIndex;
+        std::vector<float> window;
+        std::vector<float> crossover;
+        std::vector<float> time;
+        std::vector<std::complex<float>> bins;
+        std::vector<std::complex<float>> spec;
+        std::vector<float> mag;
+        std::vector<float> ph;
+        std::vector<float> env;
+        std::vector<float> freqBin;
+        std::vector<int> peakBin;
+        std::vector<int> regionLo;
+        std::vector<int> regionHi;
         std::vector<Track> newTracks;
         float outNorm = 2.f / 3.f;
-        double hopPitchSum = 0.0;
+        double hopPitchSum = 0.0; // Average MIDI pitch ratio over last H samples
         int cursor = 0;
     };
 
     float read(double sourcePosition, int channel) const;
     void frame(Band& band, long long start, double alpha, double phaseAlpha);
-    void shift(Band& band, Channel& channel, int channelIndex,
-               double alpha, double phaseAlpha);
+    void shift(Band& band, Channel& channel, double alpha, double phaseAlpha);
     void advanceBand(Band& band, double alpha);
     void resetState();
 
     std::shared_ptr<const WaveData> wav;
-    int begin, end;
+    int begin;
+    int end;
     double step;
     double smoothCoef = 0.0;
     float fadeStep = 0.f;
-    long long position = 0, length = 0;
+    long long position = 0;
+    long long length = 0;
     bool active = false;
     bool mono = false;
+
     double smoothLog = 0.0;
     bool smoothInit = false;
     float wet = 0.f;
+
     double formantScaleTarget_ = 1.0;
     double formantScaleSmoothed_ = 1.0;
     double formantSmoothCoef_ = 0.0;
