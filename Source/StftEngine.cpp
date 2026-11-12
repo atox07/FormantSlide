@@ -137,6 +137,8 @@ void StftVoice::syncDevParams() {
                  p.quefrencyMs.load() * 0.001);
 }
 
+void StftVoice::jumpPitch() { snapPending_ = true; }
+
 void StftVoice::setFormantScale(double scale) {
     formantScaleTarget_ = std::isfinite(scale)
         ? std::clamp(scale, 1.0 / 64.0, 64.0) : 1.0;
@@ -460,6 +462,7 @@ int StftVoice::render(float* left, float* right, int count, double scale) {
         ? std::clamp(scale, 1.0 / 64.0, 64.0) : 1.0;
     const double target = std::log2(safeScale);
     if (!smoothInit) { smoothLog = target; smoothInit = true; }
+    if (snapPending_) { smoothLog = target; snapPending_ = false; }
 
     for (int i = 0; i < frames; ++i, ++position) {
         smoothLog += (target - smoothLog) * smoothCoef;
