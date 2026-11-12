@@ -146,8 +146,51 @@ float StftVoice::read(double where, int ch) const {
     return ((c3 * f + c2) * f + c1) * f + y1;
 }
 
+double StftVoice::estimateF0(long long centre, int ch, double rate) const {
+    // Average adjacent input samples before decimation. Both FFT sizes
+    // analyse the same duration around their own frame centre.
+    const int stride = std::max(1, int(std::lround(rate / 6000.0)));
+    const double analysisRate = rate / stride;
+    constexpr int window = 144;
+    constexpr int maxLag = 96;
+    std::array<double, window + maxLag> samples{};
+    double mean = 0.0;
+    for (int i = 0; i < int(samples.size()); ++i) {
+        const auto start = centre + (i - int(samples.size()) / 2) * stride;
+        for (int j = 0; j < stride; ++j)
+            samples[i] += read(begin + (start + j) * step, ch);
+        samples[i] /= stride;
+        mean += samples[i];
+    }
+    mean /= samples.size();
+    for (double& sample : samples) sample -= mean;
+    std::array<double, maxLag + 1> corr{};
+    const int first = std::max(2, int(std::floor(analysisRate / 1200.0)));
+    const int last = std::min(maxLag - 1, int(std::ceil(analysisRate / 65.0)));
+    double best = 0.0;
+    for (int lag = first - 1; lag <= last + 1; ++lag) {
+        double cross = 0.0, energy = 0.0;
+        const int offset = (maxLag - lag) / 2;
+        for (int i = offset; i < offset + window; ++i) {
+            const double a = samples[i], b = samples[i + lag];
+            cross += a * b;
+            energy += a * a + b * b;
+        }
+        corr[lag] = energy > 1e-10 ? 2.0 * cross / energy : 0.0;
+        if (lag >= first && lag <= last) best = std::max(best, corr[lag]);
+    }
+    for (int lag = first; lag <= last; ++lag) {
+        const double l = corr[lag - 1], m = corr[lag], r = corr[lag + 1];
+        if (m >= std::max(0.82, best * 0.97) && m > l && m >= r) {
+            const double delta = 0.5 * (l - r) / (l - 2.0 * m + r);
+            return analysisRate / (lag + delta);
+        }
+    }
+    return 0.0;
+}
+
 void StftVoice::shift(Band& b, Channel& c, double alpha,
-                      double phaseAlpha) {
+                      double phaseAlpha, double f0) {
     const double omega = kTwoPi * b.H / b.N;
     const bool hadPrev = c.havePrev;
 
@@ -281,6 +324,10 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
         const int kp = b.peakBin[size_t(i)];
         const double fp = std::clamp(
             double(b.freqBin[size_t(kp)]), kp - 1.5, kp + 1.5);
+        const double hz = fp * b.rate / b.N;
+        const double harmonic = f0 > 0.0 ? std::round(hz / f0) : 0.0;
+        const double tolerance = std::min(0.16 * f0, 0.40 * b.rate / b.N + 0.003 * hz);
+        const bool useEnvelope = harmonic >= 1.0 && std::abs(hz - harmonic * f0) <= tolerance;
         const double shiftedFrequency = alpha * fp;
         if (shiftedFrequency <= 0.0) continue;
         if (shiftedFrequency >= b.K - 1.0) break;
@@ -347,14 +394,14 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
             const int d1 = k + neighbour;
             if (primaryWeight > 0.f && d0 >= 1 && d0 < b.K - 1) {
                 const float targetEnvelope = sampleEnv(float(d0) / beta);
-                const float gain = std::clamp(
-                    targetEnvelope / originalEnvelope, 0.f, kMaxGain);
+                const float gain = useEnvelope ? std::clamp(
+                    targetEnvelope / originalEnvelope, 0.f, kMaxGain) : 1.f;
                 b.spec[size_t(d0)] += base * rot0 * (gain * primaryWeight);
             }
             if (neighbourWeight > 0.f && d1 >= 1 && d1 < b.K - 1) {
                 const float targetEnvelope = sampleEnv(float(d1) / beta);
-                const float gain = std::clamp(
-                    targetEnvelope / originalEnvelope, 0.f, kMaxGain);
+                const float gain = useEnvelope ? std::clamp(
+                    targetEnvelope / originalEnvelope, 0.f, kMaxGain) : 1.f;
                 b.spec[size_t(d1)] += base * rot1 * (gain * neighbourWeight);
             }
         }
@@ -387,7 +434,8 @@ void StftVoice::frame(Band& b, long long start, double alpha,
                 begin + double(sampleIndex) * step, ch) * b.window[size_t(i)];
         }
         b.fftp->fft(b.time, b.bins);
-        shift(b, b.channels[size_t(ch)], alpha, phaseAlpha);
+        const double f0 = estimateF0(start + b.N / 2, ch, b.rate);
+        shift(b, b.channels[size_t(ch)], alpha, phaseAlpha, f0);
         b.fftp->ifft(b.spec, b.time);
 
         auto& overlap = b.channels[size_t(ch)].overlap;
