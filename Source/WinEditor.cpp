@@ -7,8 +7,29 @@
 #include <vector>
 
 namespace {
-constexpr int editorWidth = 760;
-constexpr int editorHeight = 520;
+constexpr int editorWidth = 680;
+constexpr int editorHeight = 400;
+
+// ---------------------------------------------------------------------------
+// Palette (FL-like: charcoal greys + orange accent). Tweak here to retune
+// the whole interface; nothing else in the file hard-codes colours.
+// ---------------------------------------------------------------------------
+namespace ui {
+const juce::Colour bg        {0xff2a2f33};
+const juce::Colour panel     {0xff343a3f};
+const juce::Colour panelEdge {0xff1d2124};
+const juce::Colour well      {0xff1a1e21};
+const juce::Colour control   {0xff454d53};
+const juce::Colour controlHi {0xff566066};
+const juce::Colour text      {0xffd8dde1};
+const juce::Colour dim       {0xff8c969d};
+const juce::Colour accent    {0xffff9a2e};
+const juce::Colour playing   {0xff5fd068};
+
+juce::Font font(float height, bool bold = false) {
+    return juce::Font(juce::FontOptions(height, bold ? juce::Font::bold : juce::Font::plain));
+}
+}
 
 juce::String fileName(const std::wstring& path) {
     return path.empty() ? juce::String() : juce::String(path.c_str());
@@ -16,8 +37,140 @@ juce::String fileName(const std::wstring& path) {
 
 void setLabel(juce::Label& label, const juce::String& value) {
     label.setText(value, juce::dontSendNotification);
-    label.setColour(juce::Label::textColourId, juce::Colour(0xffbed0e2));
+    label.setColour(juce::Label::textColourId, ui::text);
 }
+
+// ---------------------------------------------------------------------------
+// FL-style look and feel: flat dark controls, orange value arcs, no chrome.
+// ---------------------------------------------------------------------------
+class FlLook final : public juce::LookAndFeel_V4 {
+public:
+    FlLook() {
+        setColour(juce::ResizableWindow::backgroundColourId, ui::bg);
+        setColour(juce::Label::textColourId, ui::text);
+
+        setColour(juce::TextButton::buttonColourId, ui::control);
+        setColour(juce::TextButton::textColourOffId, ui::text);
+        setColour(juce::TextButton::textColourOnId, ui::text);
+
+        setColour(juce::ComboBox::backgroundColourId, ui::control);
+        setColour(juce::ComboBox::textColourId, ui::text);
+        setColour(juce::ComboBox::outlineColourId, ui::panelEdge);
+        setColour(juce::ComboBox::arrowColourId, ui::accent);
+
+        setColour(juce::PopupMenu::backgroundColourId, ui::panel);
+        setColour(juce::PopupMenu::textColourId, ui::text);
+        setColour(juce::PopupMenu::highlightedBackgroundColourId, ui::accent);
+        setColour(juce::PopupMenu::highlightedTextColourId, ui::well);
+
+        setColour(juce::Slider::thumbColourId, ui::text);
+        setColour(juce::Slider::trackColourId, ui::accent);
+        setColour(juce::Slider::rotarySliderFillColourId, ui::accent);
+        setColour(juce::Slider::textBoxTextColourId, ui::text);
+        setColour(juce::Slider::textBoxBackgroundColourId, ui::well);
+        setColour(juce::Slider::textBoxOutlineColourId, ui::panelEdge);
+        setColour(juce::Slider::textBoxHighlightColourId, ui::accent.withAlpha(0.4f));
+
+        setColour(juce::TextEditor::backgroundColourId, ui::well);
+        setColour(juce::TextEditor::textColourId, ui::text);
+        setColour(juce::TextEditor::highlightColourId, ui::accent.withAlpha(0.4f));
+        setColour(juce::TextEditor::outlineColourId, ui::panelEdge);
+        setColour(juce::TextEditor::focusedOutlineColourId, ui::accent);
+        setColour(juce::CaretComponent::caretColourId, ui::accent);
+    }
+
+    juce::Font getTextButtonFont(juce::TextButton&, int) override { return ui::font(12.5f); }
+    juce::Font getComboBoxFont(juce::ComboBox&) override { return ui::font(12.5f); }
+    juce::Font getPopupMenuFont() override { return ui::font(12.5f); }
+
+    juce::Label* createSliderTextBox(juce::Slider& slider) override {
+        auto* label = LookAndFeel_V4::createSliderTextBox(slider);
+        label->setFont(ui::font(12.f));
+        label->setJustificationType(juce::Justification::centred);
+        return label;
+    }
+
+    void drawButtonBackground(juce::Graphics& g, juce::Button& button, const juce::Colour&,
+                              bool highlighted, bool down) override {
+        const auto r = button.getLocalBounds().toFloat().reduced(0.5f);
+        const auto base = down ? ui::accent.darker(0.15f)
+                               : (highlighted ? ui::controlHi : ui::control);
+        g.setGradientFill(juce::ColourGradient(base.brighter(0.08f), 0.f, r.getY(),
+                                               base.darker(0.12f), 0.f, r.getBottom(), false));
+        g.fillRoundedRectangle(r, 3.f);
+        g.setColour(ui::panelEdge);
+        g.drawRoundedRectangle(r, 3.f, 1.f);
+    }
+
+    void drawComboBox(juce::Graphics& g, int width, int height, bool, int, int, int, int,
+                      juce::ComboBox& box) override {
+        const auto r = juce::Rectangle<float>(0.f, 0.f, float(width), float(height)).reduced(0.5f);
+        g.setColour(box.isMouseOver() ? ui::controlHi : ui::control);
+        g.fillRoundedRectangle(r, 3.f);
+        g.setColour(ui::panelEdge);
+        g.drawRoundedRectangle(r, 3.f, 1.f);
+        const float cx = float(width) - 14.f, cy = float(height) * 0.5f;
+        juce::Path arrow;
+        arrow.addTriangle(cx - 4.f, cy - 2.f, cx + 4.f, cy - 2.f, cx, cy + 3.f);
+        g.setColour(ui::accent);
+        g.fillPath(arrow);
+    }
+
+    void drawLinearSlider(juce::Graphics& g, int x, int y, int width, int height, float sliderPos,
+                          float minSliderPos, float maxSliderPos, juce::Slider::SliderStyle style,
+                          juce::Slider& slider) override {
+        if (style != juce::Slider::LinearHorizontal) {
+            LookAndFeel_V4::drawLinearSlider(g, x, y, width, height, sliderPos,
+                                             minSliderPos, maxSliderPos, style, slider);
+            return;
+        }
+        const float cy = float(y) + float(height) * 0.5f;
+        const juce::Rectangle<float> track(float(x), cy - 3.f, float(width), 6.f);
+        g.setColour(ui::well);
+        g.fillRoundedRectangle(track, 3.f);
+        g.setColour(ui::panelEdge);
+        g.drawRoundedRectangle(track, 3.f, 1.f);
+        g.setColour(ui::accent);
+        g.fillRoundedRectangle(track.withRight(std::max(track.getX() + 3.f, sliderPos)).reduced(1.f, 1.f), 2.f);
+        const bool hot = slider.isMouseOverOrDragging();
+        g.setColour(hot ? juce::Colours::white : ui::text);
+        g.fillRoundedRectangle(juce::Rectangle<float>(8.f, 16.f).withCentre({sliderPos, cy}), 2.5f);
+        g.setColour(ui::panelEdge);
+        g.drawRoundedRectangle(juce::Rectangle<float>(8.f, 16.f).withCentre({sliderPos, cy}), 2.5f, 1.f);
+    }
+
+    void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height, float pos,
+                          float startAngle, float endAngle, juce::Slider& slider) override {
+        const auto area = juce::Rectangle<float>(float(x), float(y), float(width), float(height)).reduced(4.f);
+        const float d = std::min(area.getWidth(), area.getHeight());
+        const auto c = area.getCentre();
+        const float angle = startAngle + pos * (endAngle - startAngle);
+        const float mid = 0.5f * (startAngle + endAngle);      // top = zero for the bipolar pitch knob
+        const float arcR = d * 0.5f - 2.f;
+        const bool hot = slider.isMouseOverOrDragging();
+
+        juce::Path track, value;
+        track.addCentredArc(c.x, c.y, arcR, arcR, 0.f, startAngle, endAngle, true);
+        value.addCentredArc(c.x, c.y, arcR, arcR, 0.f, mid, angle, true);
+        const juce::PathStrokeType stroke(3.f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
+        g.setColour(ui::well);
+        g.strokePath(track, stroke);
+        g.setColour(hot ? ui::accent.brighter(0.2f) : ui::accent);
+        g.strokePath(value, stroke);
+
+        const auto body = juce::Rectangle<float>(d, d).withCentre(c).reduced(d * 0.17f);
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff555e64), body.getX(), body.getY(),
+                                               juce::Colour(0xff2b3135), body.getX(), body.getBottom(), false));
+        g.fillEllipse(body);
+        g.setColour(ui::panelEdge);
+        g.drawEllipse(body, 1.2f);
+
+        juce::Path tick;
+        tick.addRoundedRectangle(-1.3f, -body.getHeight() * 0.5f + 2.5f, 2.6f, body.getHeight() * 0.32f, 1.f);
+        g.setColour(juce::Colours::white);
+        g.fillPath(tick, juce::AffineTransform::rotation(angle).translated(c.x, c.y));
+    }
+};
 }
 
 // Matches the graphical editor of the v0.2 VST3, without requiring a VST wrapper.
@@ -33,13 +186,6 @@ public:
         thumbnailFormats_.registerBasicFormats();
         thumbnail_.addChangeListener(this);
 
-        theme_.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff2d4560));
-        theme_.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff273449));
-        theme_.setColour(juce::ComboBox::textColourId, juce::Colours::white);
-        theme_.setColour(juce::Slider::thumbColourId, juce::Colour(0xff74c9ff));
-        theme_.setColour(juce::Slider::trackColourId, juce::Colour(0xff3979b8));
-        theme_.setColour(juce::Slider::textBoxTextColourId, juce::Colours::white);
-        theme_.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour(0xff273449));
         setLookAndFeel(&theme_);
 
         addAndMakeVisible(loadButton_);
@@ -60,9 +206,17 @@ public:
         addAndMakeVisible(root_);
         addAndMakeVisible(pitchLabel_);
         addAndMakeVisible(pitch_);
-        setLabel(pitchLabel_, "Pitch");
+
+        for (auto* label : { &wavLabel_, &midiLabel_, &modeLabel_, &sliceModeLabel_, &countLabel_,
+                             &glideLabel_, &rootLabel_, &statusLabel_, &warningLabel_ })
+            label->setFont(ui::font(12.f));
+        wavLabel_.setFont(ui::font(13.5f, true));
+
+        setLabel(pitchLabel_, "PITCH");
+        pitchLabel_.setFont(ui::font(10.5f, true));
+        pitchLabel_.setColour(juce::Label::textColourId, ui::dim);
         pitch_.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-        pitch_.setTextBoxStyle(juce::Slider::TextBoxRight, false, 72, 24);
+        pitch_.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 78, 18);
         pitch_.setRange(-24.0, 24.0, 0.01);
         pitch_.setTextValueSuffix(" st");
         pitch_.setDoubleClickReturnValue(true, 0.0);
@@ -73,12 +227,14 @@ public:
         setLabel(countLabel_, "Equal divisions");
         setLabel(glideLabel_, "Fallback glide (ms)");
         setLabel(rootLabel_, "First slice MIDI note");
+        for (auto* label : { &modeLabel_, &sliceModeLabel_, &countLabel_, &glideLabel_, &rootLabel_ })
+            label->setColour(juce::Label::textColourId, ui::dim);
         setLabel(warningLabel_, "Ctrl + wheel: zoom   |   Wheel: scroll   |   Double-click: fit   |   Drag a marker to edit");
         warningLabel_.setJustificationType(juce::Justification::centred);
-        warningLabel_.setColour(juce::Label::textColourId, juce::Colour(0xffffb65c));
+        warningLabel_.setColour(juce::Label::textColourId, ui::dim);
         wavLabel_.setJustificationType(juce::Justification::centredLeft);
         midiLabel_.setJustificationType(juce::Justification::centredLeft);
-        midiLabel_.setColour(juce::Label::textColourId, juce::Colour(0xff8aa5be));
+        midiLabel_.setColour(juce::Label::textColourId, ui::dim);
         statusLabel_.setJustificationType(juce::Justification::centredLeft);
 
         mode_.addItem("Channel 5", 1);
@@ -88,7 +244,7 @@ public:
 
         for (auto* slider : { &count_, &glide_, &root_ }) {
             slider->setSliderStyle(juce::Slider::LinearHorizontal);
-            slider->setTextBoxStyle(juce::Slider::TextBoxRight, false, 54, 24);
+            slider->setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 22);
         }
         count_.setRange(1.0, 64.0, 1.0);
         glide_.setRange(10.0, 2000.0, 1.0);
@@ -120,26 +276,36 @@ public:
     }
 
     void paint(juce::Graphics& g) override {
-        g.fillAll(juce::Colour(0xff171c25));
-        g.setColour(juce::Colours::white);
-        g.setFont(juce::FontOptions(28.f, juce::Font::bold));
-        g.drawText("FormantSlide", 20, 14, editorWidth - 40, 35, juce::Justification::centred);
-        g.setFont(juce::FontOptions(13.f));
-        g.setColour(juce::Colour(0xff91a8bd));
-        g.drawText("CHROMATIC SLICER / MIDI SLIDES / FORMANT COMPENSATION", 20, 53,
-                   editorWidth - 40, 20, juce::Justification::centred);
+        g.fillAll(ui::bg);
 
-        g.setColour(juce::Colour(0xff233044));
-        g.fillRoundedRectangle(waveBounds_.toFloat(), 7.f);
+        drawPanel(g, panelSlicer_, "SLICER");
+        drawPanel(g, panelSlide_, "SLIDE");
+        drawPanel(g, panelPitch_, nullptr); // its header is pitchLabel_
+
+        // Waveform well / drop zone.
+        const auto waveF = waveBounds_.toFloat();
+        g.setColour(ui::well);
+        g.fillRoundedRectangle(waveF, 4.f);
+        g.setColour(ui::panelEdge);
+        g.drawRoundedRectangle(waveF.reduced(0.5f), 4.f, 1.f);
+        if (dragOver_) {
+            g.setColour(ui::accent);
+            g.drawRoundedRectangle(waveF.reduced(1.f), 4.f, 2.f);
+        }
+        g.setColour(ui::panelEdge.brighter(0.2f));
+        g.drawHorizontalLine(waveBounds_.getCentreY(), float(waveBounds_.getX()), float(waveBounds_.getRight()));
+
         if (thumbnail_.getTotalLength() > 0) {
-            g.setColour(juce::Colour(0xff74c9ff));
+            g.setColour(ui::accent.withAlpha(0.92f));
             thumbnail_.drawChannels(g, waveBounds_, viewStart_ * thumbnail_.getTotalLength(),
                                     (viewStart_ + viewSpan_) * thumbnail_.getTotalLength(), 0.85f);
         } else {
-            g.setColour(juce::Colour(0xff91a8bd));
-            g.drawFittedText("Load a chromatic-scale WAV to see slices", waveBounds_,
+            g.setColour(ui::dim);
+            g.setFont(ui::font(13.f));
+            g.drawFittedText("Drop a chromatic WAV here, or press Load WAV", waveBounds_,
                              juce::Justification::centred, 1);
         }
+
         const auto slices = plugin_.sliceSnapshot();
         const int total = plugin_.wavFrameCount();
         g.reduceClipRegion(waveBounds_);
@@ -150,44 +316,83 @@ public:
                 if (right < waveBounds_.getX() || left > waveBounds_.getRight()) continue;
                 const bool playing = std::find(active_.begin(), active_.end(), int(i)) != active_.end();
                 if (playing || int(i) == selectedSlice_) {
-                    g.setColour(playing ? juce::Colour(0x9954c996) : juce::Colours::yellow.withAlpha(0.15f));
+                    g.setColour(playing ? ui::playing.withAlpha(0.30f) : ui::accent.withAlpha(0.16f));
                     g.fillRect(juce::Rectangle<float>(left, float(waveBounds_.getY()),
                                                      right - left, float(waveBounds_.getHeight())));
                 }
-                g.setColour(juce::Colours::white.withAlpha(0.55f));
+                g.setColour(ui::accent.withAlpha(0.55f));
                 g.drawVerticalLine(juce::roundToInt(left), float(waveBounds_.getY()),
                                    float(waveBounds_.getBottom()));
                 if (i > 0) {
-                    g.setColour(juce::Colour(0xff74c9ff));
+                    g.setColour(ui::accent);
                     g.fillRoundedRectangle(left - 4.f, float(waveBounds_.getY()) + 3.f,
                                            8.f, 19.f, 3.f);
+                }
+                // Note name of the key that plays this slice (FL convention: C5 = MIDI 60).
+                const float visibleLeft = std::max(left, float(waveBounds_.getX()));
+                const float visibleRight = std::min(right, float(waveBounds_.getRight()));
+                if (visibleRight - visibleLeft >= 24.f) {
+                    g.setColour(playing ? ui::playing : ui::dim);
+                    g.setFont(ui::font(10.5f));
+                    const auto name = juce::MidiMessage::getMidiNoteName(
+                        juce::jlimit(0, 127, rootNote_ + int(i)), true, true, 5);
+                    g.drawText(name, juce::Rectangle<float>(visibleLeft, float(waveBounds_.getBottom()) - 17.f,
+                                                            visibleRight - visibleLeft, 14.f),
+                               juce::Justification::centred, false);
                 }
             }
         }
     }
 
     void resized() override {
-        wavLabel_.setBounds(26, 85, 540, 27);
-        loadButton_.setBounds(605, 83, 125, 30);
-        waveBounds_ = {26, 125, 704, 125};
-        statusLabel_.setBounds(26, 261, 527, 26);
-        loadMidiButton_.setBounds(575, 260, 155, 28);
-        midiLabel_.setBounds(26, 287, 704, 19);
+        const int m = 12;
+        const int w = getWidth();
 
-        sliceModeLabel_.setBounds(26, 319, 140, 20);
-        sliceMode_.setBounds(26, 343, 205, 30);
-        countLabel_.setBounds(256, 319, 160, 20);
-        count_.setBounds(256, 344, 250, 28);
-        pitchLabel_.setBounds(543, 319, 180, 20);
-        pitch_.setBounds(543, 337, 165, 47);
+        // Top strip: file name + Load WAV.
+        wavLabel_.setBounds(m, 10, w - 2 * m - 130, 26);
+        loadButton_.setBounds(w - m - 110, 9, 110, 28);
 
-        modeLabel_.setBounds(26, 388, 185, 20);
-        mode_.setBounds(26, 412, 205, 29);
-        glideLabel_.setBounds(280, 388, 205, 20);
-        glide_.setBounds(280, 413, 250, 28);
-        rootLabel_.setBounds(543, 388, 190, 20);
-        root_.setBounds(543, 413, 182, 28);
-        warningLabel_.setBounds(20, 457, 720, 24);
+        // Waveform / drop zone.
+        waveBounds_ = {m, 46, w - 2 * m, 150};
+
+        // Status + MIDI import.
+        statusLabel_.setBounds(m, 202, w - 2 * m - 130, 24);
+        loadMidiButton_.setBounds(w - m - 110, 201, 110, 26);
+        midiLabel_.setBounds(m, 226, w - 2 * m, 18);
+
+        // Panels.
+        const int py = 252, ph = 120;
+        panelSlicer_ = {m, py, 340, ph};
+        panelSlide_ = {panelSlicer_.getRight() + 10, py, 190, ph};
+        const int pitchX = panelSlide_.getRight() + 10;
+        panelPitch_ = {pitchX, py, w - m - pitchX, ph};
+
+        // SLICER: label on the left, control on the right.
+        {
+            const int lx = panelSlicer_.getX() + 12, cx = panelSlicer_.getX() + 136;
+            const int cw = panelSlicer_.getRight() - 12 - cx;
+            sliceModeLabel_.setBounds(lx, py + 28, 120, 26);
+            sliceMode_.setBounds(cx, py + 28, cw, 26);
+            countLabel_.setBounds(lx, py + 58, 120, 26);
+            count_.setBounds(cx, py + 58, cw, 26);
+            rootLabel_.setBounds(lx, py + 88, 124, 26);
+            root_.setBounds(cx, py + 88, cw, 26);
+        }
+
+        // SLIDE: label above control.
+        {
+            const int x = panelSlide_.getX() + 12, cw = panelSlide_.getWidth() - 24;
+            modeLabel_.setBounds(x, py + 26, cw, 18);
+            mode_.setBounds(x, py + 44, cw, 26);
+            glideLabel_.setBounds(x, py + 74, cw, 18);
+            glide_.setBounds(x, py + 92, cw, 24);
+        }
+
+        // PITCH: header + big knob with its value underneath.
+        pitchLabel_.setBounds(panelPitch_.getX() + 12, py + 5, panelPitch_.getWidth() - 24, 16);
+        pitch_.setBounds(panelPitch_.getX() + (panelPitch_.getWidth() - 80) / 2, py + 24, 80, 90);
+
+        warningLabel_.setBounds(m, 376, w - 2 * m, 20);
     }
 
     void mouseDown(const juce::MouseEvent& event) override {
@@ -260,7 +465,19 @@ public:
         return false;
     }
 
+    void fileDragEnter(const juce::StringArray&, int, int) override {
+        dragOver_ = true;
+        repaint(waveBounds_);
+    }
+
+    void fileDragExit(const juce::StringArray&) override {
+        dragOver_ = false;
+        repaint(waveBounds_);
+    }
+
     void filesDropped(const juce::StringArray& files, int, int) override {
+        dragOver_ = false;
+        repaint(waveBounds_);
         for (const auto& path : files) {
             const juce::File file(path);
             if (file.hasFileExtension("wav;mid;midi")) { loadFile(file); break; }
@@ -269,7 +486,7 @@ public:
 
 private:
     FormantSlideNative& plugin_;
-    juce::LookAndFeel_V4 theme_;
+    FlLook theme_;
     juce::TextButton loadButton_{"Load WAV"};
     juce::TextButton loadMidiButton_{"Import MIDI"};
     juce::Label wavLabel_, midiLabel_, modeLabel_, sliceModeLabel_, countLabel_;
@@ -282,8 +499,11 @@ private:
     juce::AudioThumbnailCache cache_{5};
     juce::AudioThumbnail thumbnail_;
     juce::Rectangle<int> waveBounds_;
+    juce::Rectangle<int> panelSlicer_, panelSlide_, panelPitch_;
     double viewStart_ = 0, viewSpan_ = 1;
     std::vector<int> active_;
+    int rootNote_ = 60;        // cached copy of the first-slice note, so paint() never takes the plugin lock
+    bool dragOver_ = false;
     double fraction(int x) const { return double(x - waveBounds_.getX()) / waveBounds_.getWidth(); }
     float screenX(double position) const {
         return float(waveBounds_.getX() + waveBounds_.getWidth() * (position - viewStart_) / viewSpan_);
@@ -291,6 +511,19 @@ private:
     int selectedSlice_ = -1;
     int draggedBoundary_ = -1;
     bool updatingControls_ = false;
+
+    static void drawPanel(juce::Graphics& g, juce::Rectangle<int> r, const char* title) {
+        g.setColour(ui::panel);
+        g.fillRoundedRectangle(r.toFloat(), 4.f);
+        g.setColour(ui::panelEdge);
+        g.drawRoundedRectangle(r.toFloat().reduced(0.5f), 4.f, 1.f);
+        if (title) {
+            g.setColour(ui::dim);
+            g.setFont(ui::font(10.5f, true));
+            g.drawText(title, r.getX() + 12, r.getY() + 5, r.getWidth() - 24, 16,
+                       juce::Justification::centredLeft);
+        }
+    }
 
     void updateDraggedBoundary(int x) {
         const int total = plugin_.wavFrameCount();
@@ -313,6 +546,7 @@ private:
         glide_.setValue(s.fallbackGlideMs, juce::dontSendNotification);
         pitch_.setValue(s.pitchCents / 100.0, juce::dontSendNotification);
         root_.setValue(s.firstNote, juce::dontSendNotification);
+        rootNote_ = s.firstNote;
         updatingControls_ = false;
     }
 
@@ -344,6 +578,10 @@ private:
 
     void refreshStatus() {
         const auto data = plugin_.display();
+        if (rootNote_ != data.rootMidi) {
+            rootNote_ = data.rootMidi;
+            repaint(waveBounds_);
+        }
         juce::String status = juce::String(data.slices) + " slices | root " +
             juce::String(data.rootMidi);
         if (data.lastMidiNote >= 0)
@@ -352,7 +590,7 @@ private:
                       " -> #" + juce::String(data.lastSlice + 1);
         if (selectedSlice_ >= 0)
             status = "Selected slice " + juce::String(selectedSlice_ + 1) +
-                     " | drag a white marker to adjust its boundary";
+                     " | drag a marker to adjust its boundary";
         else if (data.slices == 1 && !data.wavName.empty())
             status += "  |  Only 1 slice: try Equal divisions";
         statusLabel_.setText(status, juce::dontSendNotification);
