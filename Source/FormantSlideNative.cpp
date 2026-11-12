@@ -266,6 +266,11 @@ void _stdcall FormantSlideNative::Voice_Kill(TVoiceHandle handle) {
 void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
     if (!buffer || length <= 0 || !voice.params || !voice.engine_) return;
     // I parametri dev arrivano dagli slider (StftDevParams): li legge StftVoice::render().
+    // Il knob sposta pitch E formante di tutto il canale; slide e note diverse
+    // cambiano solo il pitch, quindi il formante resta fisso al valore del knob.
+    // (1.0 = il formante segue il knob per intero; 0.5 = meta', 0 = knob solo pitch)
+    constexpr double kKnobFormantAmount = 1.0;
+    voice.engine_->setFormantScale(std::exp2(kKnobFormantAmount * settings_.pitchCents / 1200.0));
     const double nextHostSlide = std::isfinite(voice.params->FinalLevels.Pitch)
         ? (double(voice.params->FinalLevels.Pitch) - voice.startPitchCents) / 100.0 : 0.0;
     const double hostStart = voice.previousHostSlide_;
