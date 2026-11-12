@@ -9,7 +9,7 @@ if(NOT EXISTS "${FL_SDK_DIR}/fp_plugclass.h")
     message(FATAL_ERROR "FL Studio SDK missing. Set FL_SDK_DIR to your private local SDK directory.")
 endif()
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(FetchContent)
 
@@ -34,6 +34,9 @@ target_include_directories(formantslide_stft INTERFACE "${stft_headers}")
 target_compile_features(formantslide_stft INTERFACE cxx_std_20)
 
 add_subdirectory("${FL_SDK_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/fl_sdk")
+# Legacy SDK hint tables assign literals to char*. Scope compatibility to its .cpp files.
+target_compile_options(fl_sdk PRIVATE /Zc:strictStrings-)
+
 add_library(FormantSlideNative SHARED
     Source/FormantSlideNative.h Source/FormantSlideNative.cpp
     Source/StftEngine.h Source/StftEngine.cpp
