@@ -12,17 +12,6 @@
 //
 // Public interface is unchanged (constructor + render), so the slide / MIDI /
 // voice logic in FormantSlideNative does not need to be touched.
-//
-// Differences from the previous engine (stftpitchshift core):
-//  * identity phase locking: every spectral peak is moved together with its
-//    whole region of influence and keeps ONE continuous phase track.
-//    The old core moved every bin independently, which is what produced the
-//    hiss and the "ghost harmonic" while the pitch was gliding.
-//  * larger window, hop = N/4 (was N=1024, H=64).
-//  * pitch factor is smoothed per sample (log domain) between blocks.
-//  * dry <-> wet crossfade instead of a hard switch at scale == 1.
-//  * cubic interpolation when the WAV rate differs from the host rate.
-//  * mono WAVs are processed once instead of twice.
 class StftVoice {
 public:
     StftVoice(std::shared_ptr<const WaveData>, int begin, int end, double hostRate);
@@ -30,11 +19,12 @@ public:
 
 private:
     // ---- tuning (safe to experiment with) --------------------------------
-    static constexpr double kQuefrency   = 0.001;  // s, formant envelope smoothness (as before)
-    static constexpr double kSmoothMs    = 6.0;    // pitch factor smoothing time
-    static constexpr double kFadeMs      = 8.0;    // dry/wet crossfade time
-    static constexpr float  kMaxGain     = 3.0f;   // max formant correction per bin (~ +9.5 dB)
-    static constexpr float  kPeakFloor   = 1e-4f;  // peaks below this * frame max are ignored
+    static constexpr double kQuefrency     = 0.002;   // [FIX FORMANT] was 0.001
+    static constexpr double kSmoothMs      = 6.0;     // pitch factor smoothing time
+    static constexpr double kFadeMs        = 8.0;     // dry/wet crossfade time
+    static constexpr float  kMaxGain       = 5.0f;    // [FIX FORMANT] was 3.0f
+    static constexpr float  kPeakFloor     = 1e-4f;   // peaks below this * frame max are ignored
+    static constexpr float  kEnvSmoothCoef = 0.3f;    // [FIX FORMANT] new: 0.1 very smooth, 0.6 reactive
 
     struct Track {            // one spectral peak of the previous frame
         float freq;           // analysis frequency, in bins
@@ -44,6 +34,7 @@ private:
     struct Channel {
         std::vector<float> overlap;                 // output accumulator (N)
         std::vector<float> prevPhase;               // analysis phase of previous frame
+        std::vector<float> envSmooth;               // [FIX FORMANT] log-envelope smoothed across frames (K)
         std::vector<Track> tracks;                  // peaks of previous frame
         bool havePrev = false;
     };
