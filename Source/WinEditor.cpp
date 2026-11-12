@@ -8,7 +8,7 @@
 
 namespace {
 constexpr int editorWidth = 680;
-constexpr int editorHeight = 400;
+constexpr int editorHeight = 384;
 
 // ---------------------------------------------------------------------------
 // Palette (FL-like: charcoal greys + orange accent). Tweak here to retune
@@ -189,26 +189,20 @@ public:
         setLookAndFeel(&theme_);
 
         addAndMakeVisible(loadButton_);
-        addAndMakeVisible(loadMidiButton_);
         addAndMakeVisible(wavLabel_);
-        addAndMakeVisible(midiLabel_);
-        addAndMakeVisible(modeLabel_);
         addAndMakeVisible(sliceModeLabel_);
         addAndMakeVisible(countLabel_);
-        addAndMakeVisible(glideLabel_);
         addAndMakeVisible(rootLabel_);
         addAndMakeVisible(statusLabel_);
         addAndMakeVisible(warningLabel_);
-        addAndMakeVisible(mode_);
         addAndMakeVisible(sliceMode_);
         addAndMakeVisible(count_);
-        addAndMakeVisible(glide_);
         addAndMakeVisible(root_);
         addAndMakeVisible(pitchLabel_);
         addAndMakeVisible(pitch_);
 
-        for (auto* label : { &wavLabel_, &midiLabel_, &modeLabel_, &sliceModeLabel_, &countLabel_,
-                             &glideLabel_, &rootLabel_, &statusLabel_, &warningLabel_ })
+        for (auto* label : { &wavLabel_, &sliceModeLabel_, &countLabel_, &rootLabel_,
+                             &statusLabel_, &warningLabel_ })
             label->setFont(ui::font(12.f));
         wavLabel_.setFont(ui::font(13.5f, true));
 
@@ -222,40 +216,30 @@ public:
         pitch_.setDoubleClickReturnValue(true, 0.0);
         pitch_.onValueChange = [this] { pushSettings(); };
 
-        setLabel(modeLabel_, "Slide MIDI channels");
         setLabel(sliceModeLabel_, "Slicer");
         setLabel(countLabel_, "Equal divisions");
-        setLabel(glideLabel_, "Fallback glide (ms)");
         setLabel(rootLabel_, "First slice MIDI note");
-        for (auto* label : { &modeLabel_, &sliceModeLabel_, &countLabel_, &glideLabel_, &rootLabel_ })
+        for (auto* label : { &sliceModeLabel_, &countLabel_, &rootLabel_ })
             label->setColour(juce::Label::textColourId, ui::dim);
         setLabel(warningLabel_, "Ctrl + wheel: zoom   |   Wheel: scroll   |   Double-click: fit   |   Drag a marker to edit");
         warningLabel_.setJustificationType(juce::Justification::centred);
         warningLabel_.setColour(juce::Label::textColourId, ui::dim);
         wavLabel_.setJustificationType(juce::Justification::centredLeft);
-        midiLabel_.setJustificationType(juce::Justification::centredLeft);
-        midiLabel_.setColour(juce::Label::textColourId, ui::dim);
         statusLabel_.setJustificationType(juce::Justification::centredLeft);
 
-        mode_.addItem("Channel 5", 1);
-        mode_.addItem("Channels 3-16", 2);
         sliceMode_.addItem("WAV markers / detect silence", 1);
         sliceMode_.addItem("Equal divisions", 2);
 
-        for (auto* slider : { &count_, &glide_, &root_ }) {
+        for (auto* slider : { &count_, &root_ }) {
             slider->setSliderStyle(juce::Slider::LinearHorizontal);
             slider->setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 22);
         }
         count_.setRange(1.0, 64.0, 1.0);
-        glide_.setRange(10.0, 2000.0, 1.0);
         root_.setRange(0.0, 127.0, 1.0);
 
-        loadButton_.onClick = [this] { choose(false); };
-        loadMidiButton_.onClick = [this] { choose(true); };
-        mode_.onChange = [this] { pushSettings(); };
+        loadButton_.onClick = [this] { chooseWav(); };
         sliceMode_.onChange = [this] { pushSettings(); };
         count_.onValueChange = [this] { pushSettings(); };
-        glide_.onValueChange = [this] { pushSettings(); };
         root_.onValueChange = [this] { pushSettings(); };
 
         pullSettings();
@@ -279,7 +263,6 @@ public:
         g.fillAll(ui::bg);
 
         drawPanel(g, panelSlicer_, "SLICER");
-        drawPanel(g, panelSlide_, "SLIDE");
         drawPanel(g, panelPitch_, nullptr); // its header is pitchLabel_
 
         // Waveform well / drop zone.
@@ -355,16 +338,13 @@ public:
         // Waveform / drop zone.
         waveBounds_ = {m, 46, w - 2 * m, 150};
 
-        // Status + MIDI import.
-        statusLabel_.setBounds(m, 202, w - 2 * m - 130, 24);
-        loadMidiButton_.setBounds(w - m - 110, 201, 110, 26);
-        midiLabel_.setBounds(m, 226, w - 2 * m, 18);
+        // Status line.
+        statusLabel_.setBounds(m, 202, w - 2 * m, 24);
 
         // Panels.
-        const int py = 252, ph = 120;
-        panelSlicer_ = {m, py, 340, ph};
-        panelSlide_ = {panelSlicer_.getRight() + 10, py, 190, ph};
-        const int pitchX = panelSlide_.getRight() + 10;
+        const int py = 236, ph = 120;
+        panelSlicer_ = {m, py, 506, ph};
+        const int pitchX = panelSlicer_.getRight() + 10;
         panelPitch_ = {pitchX, py, w - m - pitchX, ph};
 
         // SLICER: label on the left, control on the right.
@@ -379,20 +359,11 @@ public:
             root_.setBounds(cx, py + 88, cw, 26);
         }
 
-        // SLIDE: label above control.
-        {
-            const int x = panelSlide_.getX() + 12, cw = panelSlide_.getWidth() - 24;
-            modeLabel_.setBounds(x, py + 26, cw, 18);
-            mode_.setBounds(x, py + 44, cw, 26);
-            glideLabel_.setBounds(x, py + 74, cw, 18);
-            glide_.setBounds(x, py + 92, cw, 24);
-        }
-
         // PITCH: header + big knob with its value underneath.
         pitchLabel_.setBounds(panelPitch_.getX() + 12, py + 5, panelPitch_.getWidth() - 24, 16);
-        pitch_.setBounds(panelPitch_.getX() + (panelPitch_.getWidth() - 80) / 2, py + 24, 80, 90);
+        pitch_.setBounds(panelPitch_.getX() + (panelPitch_.getWidth() - 80) / 2, py + 22, 80, 94);
 
-        warningLabel_.setBounds(m, 376, w - 2 * m, 20);
+        warningLabel_.setBounds(m, py + ph + 6, w - 2 * m, 20);
     }
 
     void mouseDown(const juce::MouseEvent& event) override {
@@ -461,7 +432,7 @@ public:
 
     bool isInterestedInFileDrag(const juce::StringArray& files) override {
         for (const auto& path : files)
-            if (juce::File(path).hasFileExtension("wav;mid;midi")) return true;
+            if (juce::File(path).hasFileExtension("wav")) return true;
         return false;
     }
 
@@ -480,7 +451,7 @@ public:
         repaint(waveBounds_);
         for (const auto& path : files) {
             const juce::File file(path);
-            if (file.hasFileExtension("wav;mid;midi")) { loadFile(file); break; }
+            if (file.hasFileExtension("wav")) { loadFile(file); break; }
         }
     }
 
@@ -488,18 +459,16 @@ private:
     FormantSlideNative& plugin_;
     FlLook theme_;
     juce::TextButton loadButton_{"Load WAV"};
-    juce::TextButton loadMidiButton_{"Import MIDI"};
-    juce::Label wavLabel_, midiLabel_, modeLabel_, sliceModeLabel_, countLabel_;
-    juce::Label glideLabel_, rootLabel_, statusLabel_, warningLabel_;
-    juce::ComboBox mode_, sliceMode_;
+    juce::Label wavLabel_, sliceModeLabel_, countLabel_, rootLabel_, statusLabel_, warningLabel_;
+    juce::ComboBox sliceMode_;
     juce::Label pitchLabel_;
     juce::Slider pitch_;
-    juce::Slider count_, glide_, root_;
+    juce::Slider count_, root_;
     juce::AudioFormatManager thumbnailFormats_;
     juce::AudioThumbnailCache cache_{5};
     juce::AudioThumbnail thumbnail_;
     juce::Rectangle<int> waveBounds_;
-    juce::Rectangle<int> panelSlicer_, panelSlide_, panelPitch_;
+    juce::Rectangle<int> panelSlicer_, panelPitch_;
     double viewStart_ = 0, viewSpan_ = 1;
     std::vector<int> active_;
     int rootNote_ = 60;        // cached copy of the first-slice note, so paint() never takes the plugin lock
@@ -540,23 +509,21 @@ private:
     void pullSettings() {
         updatingControls_ = true;
         const auto s = plugin_.display().settings;
-        mode_.setSelectedId(s.allSlideColors ? 2 : 1, juce::dontSendNotification);
         sliceMode_.setSelectedId(s.equalSlices ? 2 : 1, juce::dontSendNotification);
         count_.setValue(s.sliceCount, juce::dontSendNotification);
-        glide_.setValue(s.fallbackGlideMs, juce::dontSendNotification);
         pitch_.setValue(s.pitchCents / 100.0, juce::dontSendNotification);
         root_.setValue(s.firstNote, juce::dontSendNotification);
         rootNote_ = s.firstNote;
         updatingControls_ = false;
     }
 
+    // Only the controls that exist in the UI are written back; every other setting
+    // (fallback glide, legacy slide-colour flag, MIDI offset) keeps its stored value.
     void pushSettings() {
         if (updatingControls_) return;
         auto settings = plugin_.display().settings;
-        settings.allSlideColors = mode_.getSelectedId() == 2;
         settings.equalSlices = sliceMode_.getSelectedId() == 2;
         settings.sliceCount = int(std::lround(count_.getValue()));
-        settings.fallbackGlideMs = int(std::lround(glide_.getValue()));
         settings.pitchCents = int(std::lround(pitch_.getValue() * 100.0));
         settings.firstNote = int(std::lround(root_.getValue()));
         plugin_.updateSettings(settings);
@@ -569,8 +536,6 @@ private:
         const auto data = plugin_.display();
         wavLabel_.setText(data.wavName.empty() ? "No WAV loaded" : fileName(data.wavName),
                           juce::dontSendNotification);
-        midiLabel_.setText(data.midiName.empty() ? "MIDI duration fallback: none" :
-                           "MIDI: " + fileName(data.midiName), juce::dontSendNotification);
         // A JUCE thumbnail reproduces the same waveform display as our VST3.
         // We only know the basename in Display, so the full path is passed to this
         // method by loadFile() after each import.
@@ -597,27 +562,25 @@ private:
     }
 
     void loadFile(const juce::File& file) {
-        if (!file.existsAsFile()) return;
+        if (!file.existsAsFile() || !file.hasFileExtension("wav")) return;
         const std::wstring path(file.getFullPathName().toWideCharPointer());
         std::string error;
-        const bool wav = file.hasFileExtension("wav");
-        const bool ok = wav ? plugin_.loadWav(path, error) : plugin_.loadMidi(path, error);
-        if (!ok) {
+        if (!plugin_.loadWav(path, error)) {
             juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
                                                    "FormantSlide", juce::String::fromUTF8(error.c_str()));
             return;
         }
         selectedSlice_ = -1;
-        if (wav) { viewStart_ = 0; viewSpan_ = 1; thumbnail_.setSource(new juce::FileInputSource(file)); }
+        viewStart_ = 0;
+        viewSpan_ = 1;
+        thumbnail_.setSource(new juce::FileInputSource(file));
         refreshFilePreview();
         refreshStatus();
         repaint();
     }
 
-    void choose(bool midi) {
-        const auto title = midi ? "Choose a MIDI file" : "Choose a chromatic WAV";
-        auto chooser = std::make_shared<juce::FileChooser>(title, juce::File(),
-                                                            midi ? "*.mid;*.midi" : "*.wav");
+    void chooseWav() {
+        auto chooser = std::make_shared<juce::FileChooser>("Choose a chromatic WAV", juce::File(), "*.wav");
         juce::Component::SafePointer<FormantSlideView> safeThis(this);
         chooser->launchAsync(juce::FileBrowserComponent::openMode |
                              juce::FileBrowserComponent::canSelectFiles,
