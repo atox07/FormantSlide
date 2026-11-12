@@ -95,7 +95,7 @@ StftVoice::StftVoice(std::shared_ptr<const WaveData> data,
 void StftVoice::setDevParams(float envSmooth, float envSmoothSlide, float maxGain, double quefrency) {
     if (envSmooth >= 0 && envSmooth <= 1) kEnvSmoothCoef = envSmooth;
     if (envSmoothSlide >= 0 && envSmoothSlide <= 1) kEnvSmoothCoefSlide = envSmoothSlide;
-    if (std::isfinite(maxGain) && maxGain >= 0) kMaxGain = maxGain;
+    if (std::isfinite(maxGain) && maxGain >= 0) kMaxGain = std::min(maxGain, 40.0f);
     if (quefrency != kQuefrency && quefrency * highBand.rate >= 1.0 &&
         quefrency * highBand.rate < highBand.N / 2) {
         lowBand.cepster.quefrency(quefrency);
@@ -114,6 +114,7 @@ void StftVoice::resetState() {
         band.cursor = 0;
         band.hopPitchSum = 0.0;
         for (auto& c : band.channels) {
+            c.lastF0 = 0.0;
             std::fill(c.overlap.begin(), c.overlap.end(), 0.f);
             std::fill(c.prevPhase.begin(), c.prevPhase.end(), 0.f);
             std::fill(c.prevMagnitude.begin(), c.prevMagnitude.end(), 0.f);
@@ -327,7 +328,11 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
         const double hz = fp * b.rate / b.N;
         const double harmonic = f0 > 0.0 ? std::round(hz / f0) : 0.0;
         const double tolerance = std::min(0.16 * f0, 0.40 * b.rate / b.N + 0.003 * hz);
-        const bool useEnvelope = harmonic >= 1.0 && std::abs(hz - harmonic * f0) <= tolerance;
+        // Require a resolved spectral peak even when using a remembered F0.
+        const int flank = std::clamp(int(std::lround(0.45 * f0 * b.N / b.rate)), 2, 8);
+        const float shoulder = std::max(b.mag[size_t(std::max(0, kp - flank))],
+                                        b.mag[size_t(std::min(b.K - 1, kp + flank))]);
+        const bool useEnvelope = b.mag[size_t(kp)] > 3.f * shoulder && harmonic >= 1.0 && std::abs(hz - harmonic * f0) <= tolerance;
         const double shiftedFrequency = alpha * fp;
         if (shiftedFrequency <= 0.0) continue;
         if (shiftedFrequency >= b.K - 1.0) break;
@@ -388,19 +393,22 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
 
         for (int k = b.regionLo[size_t(i)];
              k <= b.regionHi[size_t(i)]; ++k) {
+            // A peak owns a whole valley-to-valley region for phase locking.
+            // Only its central Hann lobe gets the formant correction.
+            const bool harmonicBin = useEnvelope && std::abs(k - fp) <= 2.0;
             const float originalEnvelope = std::max(b.env[size_t(k)], 1e-9f);
             const std::complex<float> base = b.bins[size_t(k)];
             const int d0 = k + delta;
             const int d1 = k + neighbour;
             if (primaryWeight > 0.f && d0 >= 1 && d0 < b.K - 1) {
                 const float targetEnvelope = sampleEnv(float(d0) / beta);
-                const float gain = useEnvelope ? std::clamp(
+                const float gain = harmonicBin ? std::clamp(
                     targetEnvelope / originalEnvelope, 0.f, kMaxGain) : 1.f;
                 b.spec[size_t(d0)] += base * rot0 * (gain * primaryWeight);
             }
             if (neighbourWeight > 0.f && d1 >= 1 && d1 < b.K - 1) {
                 const float targetEnvelope = sampleEnv(float(d1) / beta);
-                const float gain = useEnvelope ? std::clamp(
+                const float gain = harmonicBin ? std::clamp(
                     targetEnvelope / originalEnvelope, 0.f, kMaxGain) : 1.f;
                 b.spec[size_t(d1)] += base * rot1 * (gain * neighbourWeight);
             }
@@ -434,7 +442,18 @@ void StftVoice::frame(Band& b, long long start, double alpha,
                 begin + double(sampleIndex) * step, ch) * b.window[size_t(i)];
         }
         b.fftp->fft(b.time, b.bins);
-        const double f0 = estimateF0(start + b.N / 2, ch, b.rate);
+        auto& channel = b.channels[size_t(ch)];
+        const double measured = estimateF0(start + b.N / 2, ch, b.rate);
+        if (measured > 0.0) {
+            // Smooth small estimation jitter, follow genuine note changes immediately.
+            if (channel.lastF0 > 0.0 && std::abs(measured - channel.lastF0) < 0.04 * measured) {
+                const double mix = -std::expm1(-double(b.H) / (0.012 * b.rate));
+                channel.lastF0 += mix * (measured - channel.lastF0);
+            } else {
+                channel.lastF0 = measured;
+            }
+        }
+        const double f0 = channel.lastF0;
         shift(b, b.channels[size_t(ch)], alpha, phaseAlpha, f0);
         b.fftp->ifft(b.spec, b.time);
 
