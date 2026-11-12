@@ -19,100 +19,6 @@
 #include <thread>
 
 namespace {
-struct DevParams {
-    float envSmooth = 0.30f;
-    float envSmoothSlide = 0.05f;
-    float maxGain = 6.0f;
-    double quefrency = 0.002;
-};
-
-DevParams published;
-std::atomic_flag publishing = ATOMIC_FLAG_INIT;
-
-std::filesystem::path devConfigPath() {
-    HMODULE dll{};
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCWSTR>(&published), &dll)) return {};
-    std::wstring name(512, L'\0');
-    for (;;) {
-        const DWORD n = GetModuleFileNameW(dll, name.data(), static_cast<DWORD>(name.size()));
-        if (!n) return {};
-        if (n < name.size()) {
-            name.resize(n);
-            return std::filesystem::path(name).parent_path() / L"dev_config.txt";
-        }
-        name.resize(name.size() * 2);
-    }
-}
-
-void loadDevConfig() {
-    static const auto configPath = devConfigPath();
-    std::ifstream input(configPath);
-    if (!input) return;
-    DevParams next;
-    bool found = false;
-    std::string line;
-    while (std::getline(input, line)) {
-        auto first = line.find_first_not_of(" \t\r");
-        if (first == std::string::npos || line[first] == '#') continue;
-        auto eq = line.find('=', first);
-        if (eq == std::string::npos) return;
-        auto key = line.substr(first, line.find_last_not_of(" \t", eq - 1) - first + 1);
-        std::istringstream field(line.substr(eq + 1));
-        field.imbue(std::locale::classic());
-        double v;
-        char extra;
-        if (!(field >> v) || (field >> extra) || !std::isfinite(v)) return;
-        if (key == "envSmooth" && v >= 0 && v <= 1) next.envSmooth = static_cast<float>(v);
-        else if (key == "envSmoothSlide" && v >= 0 && v <= 1) next.envSmoothSlide = static_cast<float>(v);
-        else if (key == "maxGain" && v >= 0 && v <= (std::numeric_limits<float>::max)())
-            next.maxGain = static_cast<float>(v);
-        else if (key == "quefrency" && v > 0) next.quefrency = v;
-        else return;
-        found = true;
-    }
-    if (!found || input.bad()) return;
-    while (publishing.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
-    published = next;
-    publishing.clear(std::memory_order_release);
-}
-
-// One reader for all instances. Join it before the last instance returns to the host.
-std::mutex lifecycle, timerMutex;
-std::condition_variable timerWake;
-std::thread reader;
-unsigned instances = 0;
-bool stopping = false;
-
-void startReader() {
-    std::lock_guard<std::mutex> guard(lifecycle);
-    if (instances++ != 0) return;
-    stopping = false;
-    try {
-        reader = std::thread([] {
-            std::unique_lock<std::mutex> lock(timerMutex);
-            while (!stopping) {
-                lock.unlock();
-                try { loadDevConfig(); } catch (const std::exception&) {}
-                lock.lock();
-                timerWake.wait_for(lock, std::chrono::milliseconds(500), [] { return stopping; });
-            }
-        });
-    } catch (const std::system_error&) {} // The DSP can run with its defaults.
-}
-
-void stopReader() {
-    std::lock_guard<std::mutex> guard(lifecycle);
-    if (--instances || !reader.joinable()) return;
-    {
-        std::lock_guard<std::mutex> lock(timerMutex);
-        stopping = true;
-    }
-    timerWake.notify_one();
-    reader.join();
-    published = DevParams{};
-}
 
 // Extra (non-native) slides: only notes in this color group / MIDI channel act as slides.
 // FL color index 15 == MIDI channel 16 (the channel number reported to MidiFile is color + 1).
@@ -154,9 +60,8 @@ FormantSlideNative::FormantSlideNative(intptr_t tag, TFruityPlugHost* host)
     : TCPPFruityPlug(tag, host, nullptr) {
     Info = &kInfo;
     PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, 0);
-    startReader();
 }
-FormantSlideNative::~FormantSlideNative() { stopReader(); }
+FormantSlideNative::~FormantSlideNative() {}
 
 void _stdcall FormantSlideNative::DestroyObject() {
     if (editor_) { editor_->close(); delete editor_; editor_ = nullptr; }
@@ -360,11 +265,7 @@ void _stdcall FormantSlideNative::Voice_Kill(TVoiceHandle handle) {
 
 void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
     if (!buffer || length <= 0 || !voice.params || !voice.engine_) return;
-    if (!publishing.test_and_set(std::memory_order_acquire)) {
-        const DevParams params = published;
-        publishing.clear(std::memory_order_release);
-        voice.engine_->setDevParams(params.envSmooth, params.envSmoothSlide, params.maxGain, params.quefrency);
-    }
+    // I parametri dev arrivano dagli slider (StftDevParams): li legge StftVoice::render().
     const double nextHostSlide = std::isfinite(voice.params->FinalLevels.Pitch)
         ? (double(voice.params->FinalLevels.Pitch) - voice.startPitchCents) / 100.0 : 0.0;
     const double hostStart = voice.previousHostSlide_;
