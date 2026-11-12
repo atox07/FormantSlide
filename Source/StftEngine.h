@@ -16,14 +16,15 @@ public:
 
 private:
     // ---- tuning (safe to experiment with) --------------------------------
-    static constexpr double kQuefrency     = 0.002;   // [FIX FORMANT] was 0.001
-    static constexpr double kSmoothMs      = 6.0;     // pitch factor smoothing time
-    static constexpr double kFadeMs        = 8.0;     // dry/wet crossfade time
-    static constexpr float  kMaxGain       = 6.0f;    // [FIX SCRATCH] was 5.0f
-    static constexpr float  kPeakFloor     = 1e-4f;
-    static constexpr float  kEnvSmoothCoef = 0.3f;    // [FIX FORMANT]
+    static constexpr double kQuefrency          = 0.002;   // formant envelope detail
+    static constexpr double kSmoothMs           = 6.0;     // pitch factor smoothing time
+    static constexpr double kFadeMs             = 8.0;     // dry/wet crossfade time
+    static constexpr float  kMaxGain            = 6.0f;    // max formant correction per bin
+    static constexpr float  kPeakFloor          = 1e-4f;   // peaks below this * frame max are ignored
+    static constexpr float  kEnvSmoothCoef      = 0.3f;    // envelope smoothing when pitch is stable
+    static constexpr float  kEnvSmoothCoefSlide = 0.05f;   // [FIX EH→I] very slow during slides
 
-    struct Track {
+    struct Track {            // one spectral peak of the previous frame
         float freq;
         float phase;
     };
@@ -31,8 +32,9 @@ private:
     struct Channel {
         std::vector<float> overlap;
         std::vector<float> prevPhase;
-        std::vector<float> envSmooth;               // [FIX FORMANT]
+        std::vector<float> envSmooth;
         std::vector<Track> tracks;
+        double prevAlpha = 1.0;   // [FIX EH→I] last pitch factor seen, to detect slides
         bool havePrev = false;
     };
 
