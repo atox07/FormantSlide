@@ -140,6 +140,7 @@ void StftVoice::syncDevParams() {
 void StftVoice::setFormantScale(double scale) {
     formantScaleTarget_ = std::isfinite(scale)
         ? std::clamp(scale, 1.0 / 64.0, 64.0) : 1.0;
+    if (!formantInit_) { formantScaleSmoothed_ = formantScaleTarget_; formantInit_ = true; }
 }
 
 void StftVoice::resetState() {
@@ -464,10 +465,15 @@ int StftVoice::render(float* left, float* right, int count, double scale) {
         smoothLog += (target - smoothLog) * smoothCoef;
         if (target == 0.0 && std::abs(smoothLog) < 1e-4)
             smoothLog = 0.0;
-        const bool shifted = std::abs(smoothLog) > 1e-5;
-        const double factor = std::exp2(smoothLog);
         formantScaleSmoothed_ +=
             (formantScaleTarget_ - formantScaleSmoothed_) * formantSmoothCoef_;
+        if (formantScaleTarget_ == 1.0 && std::abs(formantScaleSmoothed_ - 1.0) < 1e-5)
+            formantScaleSmoothed_ = 1.0;
+        // Il motore deve girare anche quando il pitch netto e' 0 ma il formante
+        // del knob e' diverso da 1, altrimenti il formante sparirebbe in quel punto.
+        const bool shifted = std::abs(smoothLog) > 1e-5 ||
+                             std::abs(std::log2(formantScaleSmoothed_)) > 1e-5;
+        const double factor = std::exp2(smoothLog);
 
         if (shifted && !active) {
             resetState();
