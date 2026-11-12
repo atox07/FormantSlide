@@ -1,82 +1,131 @@
 #include "StftEngine.h"
 #include <cmath>
+#include <utility>
 
 namespace {
-constexpr double kPi = 3.14159265358979323846;
+constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kTwoPi = 2.0 * kPi;
 
-int pickSize(double rate) {
-    if (rate <= 50000.0) return 2048;
-    if (rate <= 100000.0) return 4096;
-    return 8192;
-}
-double wrapPhase(double p) { return p - kTwoPi * std::floor(p / kTwoPi + 0.5); }
+int pickSize(double rate, int base) {
+    if (rate <= 50000.0) return base;
+    if (rate <= 100000.0) return base * 2;
+    return base * 4;
 }
 
-StftVoice::StftVoice(std::shared_ptr<const WaveData> data, int first, int last, double rate)
-    : wav(std::move(data)), begin(first), end(last),
-      N(pickSize(rate)), H(N / 4), K(N / 2 + 1),
-      step(wav->sampleRate / rate),
-      length(static_cast<long long>(std::ceil((last - first) / step))),
+double wrapPhase(double p) {
+    return p - kTwoPi * std::floor(p / kTwoPi + 0.5);
+}
+} // namespace
+
+StftVoice::Band::Band(int fftSize, double sampleRate, bool upperBand)
+    : N(fftSize),
+      H(fftSize / 4),
+      K(fftSize / 2 + 1),
+      rate(sampleRate),
+      high(upperBand),
       fftp(std::make_shared<stftpitchshift::RFFT>()),
-      cepster(fftp, size_t(N), rate) {
+      cepster(fftp, size_t(fftSize), sampleRate),
+      window(size_t(N), 0.f),
+      crossover(size_t(K), 0.f),
+      time(size_t(N), 0.f),
+      bins(size_t(K)),
+      spec(size_t(K)),
+      mag(size_t(K), 0.f),
+      ph(size_t(K), 0.f),
+      env(size_t(K), 0.f),
+      freqBin(size_t(K), 0.f),
+      peakBin(size_t(K), 0),
+      regionLo(size_t(K), 0),
+      regionHi(size_t(K), 0),
+      newTracks(size_t(K)) {
     cepster.quefrency(kQuefrency);
-    smoothCoef        = 1.0 - std::exp(-1.0 / (kSmoothMs * 0.001 * rate));
-    formantSmoothCoef_ = smoothCoef;   // same time constant
-    fadeStep = float(1.0 / (kFadeMs * 0.001 * rate));
-    outNorm = float(H / (0.375 * N));
-
-    window.resize(size_t(N));
     for (int i = 0; i < N; ++i)
         window[size_t(i)] = float(0.5 - 0.5 * std::cos(kTwoPi * i / N));
-    time.assign(size_t(N), 0.f);
-    bins.assign(size_t(K), {});
-    spec.assign(size_t(K), {});
-    mag.assign(size_t(K), 0.f);
-    ph.assign(size_t(K), 0.f);
-    env.assign(size_t(K), 0.f);
-    freqBin.assign(size_t(K), 0.f);
-    synMag.assign(size_t(K), 0.f);
-    peakBin.reserve(size_t(K));
-    regionLo.reserve(size_t(K));
-    regionHi.reserve(size_t(K));
-    newTracks.reserve(size_t(K));
-    for (auto& c : chan) {
-        c.overlap.assign(size_t(N), 0.f);
-        c.prevPhase.assign(size_t(K), 0.f);
-        c.envSmooth.assign(size_t(K), 0.f);
-        c.tracks.reserve(size_t(K));
+
+    // Complementary frequency-domain crossover.  We filter each *synthesized*
+    // spectrum, so an upward/downward shift is split by its OUTPUT frequency.
+    for (int k = 0; k < K; ++k) {
+        const double hz = double(k) * rate / N;
+        const float highWeight = float(std::clamp(
+            (hz - kCrossLowHz) / (kCrossHighHz - kCrossLowHz), 0.0, 1.0));
+        crossover[size_t(k)] = high ? highWeight : 1.f - highWeight;
     }
 
+    // The periodic Hann window squared has sum 1.5 at 4x overlap.
+    outNorm = 2.f / 3.f;
+    for (auto& c : channels) {
+        c.overlap.assign(size_t(N), 0.f);
+        c.prevPhase.assign(size_t(K), 0.f);
+        c.prevMagnitude.assign(size_t(K), 0.f);
+        c.envSmooth.assign(size_t(K), 0.f);
+        c.tracks.resize(size_t(K));
+    }
+
+    // RFFT lazily builds a per-transform-size cache on its first call.
+    // Prime both directions HERE, not in render()/frame()/shift().  Cepster
+    // uses this same FFT instance and the same N in its lifter() call.
+    fftp->fft(time, bins);
+    fftp->ifft(bins, time);
+}
+
+StftVoice::StftVoice(std::shared_ptr<const WaveData> data,
+                     int first, int last, double hostRate)
+    : wav(std::move(data)),
+      begin(std::clamp(first, 0, wav->frames())),
+      end(std::clamp(last, begin, wav->frames())),
+      step(wav->sampleRate / hostRate),
+      length(static_cast<long long>(std::ceil((end - begin) / step))),
+      lowBand(pickSize(hostRate, 2048), hostRate, false),
+      highBand(pickSize(hostRate, 512), hostRate, true) {
+    smoothCoef = 1.0 - std::exp(-1.0 / (kSmoothMs * 0.001 * hostRate));
+    formantSmoothCoef_ = smoothCoef;
+    fadeStep = float(1.0 / (kFadeMs * 0.001 * hostRate));
+
+    // No scanning or allocations are performed on the audio callback.
     mono = true;
     const auto& s = wav->stereo;
-    for (int i = std::max(0, first); i < std::min(last, wav->frames()); ++i)
-        if (s[size_t(i) * 2] != s[size_t(i) * 2 + 1]) { mono = false; break; }
+    for (int i = begin; i < end; ++i) {
+        if (s[size_t(i) * 2] != s[size_t(i) * 2 + 1]) {
+            mono = false;
+            break;
+        }
+    }
 }
 
 void StftVoice::setFormantScale(double scale) {
-    // [KNOB-FORMANT] only updates the target; render() smooths it per sample.
-    formantScaleTarget_ = std::clamp(scale, 1.0 / 64.0, 64.0);
+    formantScaleTarget_ = std::isfinite(scale)
+        ? std::clamp(scale, 1.0 / 64.0, 64.0) : 1.0;
 }
 
 void StftVoice::resetState() {
-    for (auto& c : chan) {
-        std::fill(c.overlap.begin(), c.overlap.end(), 0.f);
-        std::fill(c.prevPhase.begin(), c.prevPhase.end(), 0.f);
-        std::fill(c.envSmooth.begin(), c.envSmooth.end(), 0.f);
-        c.tracks.clear();
-        c.prevAlpha = 1.0;
-        c.havePrev = false;
-    }
-    cursor = 0;
+    auto resetBand = [](Band& band) {
+        band.cursor = 0;
+        band.hopPitchSum = 0.0;
+        for (auto& c : band.channels) {
+            std::fill(c.overlap.begin(), c.overlap.end(), 0.f);
+            std::fill(c.prevPhase.begin(), c.prevPhase.end(), 0.f);
+            std::fill(c.prevMagnitude.begin(), c.prevMagnitude.end(), 0.f);
+            std::fill(c.envSmooth.begin(), c.envSmooth.end(), 0.f);
+            c.trackCount = 0;
+            c.prevAlpha = 1.0;
+            c.prevFluxEnergy = 0.f;
+            c.fluxBaseline = 0.f;
+            c.transientHold = 0;
+            c.havePrev = false;
+        }
+    };
+    resetBand(lowBand);
+    resetBand(highBand);
 }
 
 float StftVoice::read(double where, int ch) const {
-    if (where < begin || where >= end) return 0;
+    if (where < begin || where >= end) return 0.f;
     const float* s = wav->stereo.data();
     const int a = int(where);
     const float f = float(where - a);
-    auto at = [&](int i) { return s[size_t(std::clamp(i, begin, end - 1)) * 2 + size_t(ch)]; };
+    auto at = [&](int i) {
+        return s[size_t(std::clamp(i, begin, end - 1)) * 2 + size_t(ch)];
+    };
     if (f == 0.f) return at(a);
     const float y0 = at(a - 1), y1 = at(a), y2 = at(a + 1), y3 = at(a + 2);
     const float c1 = 0.5f * (y2 - y0);
@@ -85,199 +134,308 @@ float StftVoice::read(double where, int ch) const {
     return ((c3 * f + c2) * f + c1) * f + y1;
 }
 
-void StftVoice::shift(Channel& c, double alpha) {
-    const double omega = kTwoPi * H / N;
+void StftVoice::shift(Band& b, Channel& c, double alpha,
+                      double phaseAlpha) {
+    const double omega = kTwoPi * b.H / b.N;
+    const bool hadPrev = c.havePrev;
 
     float maxMag = 0.f;
-    for (int k = 0; k < K; ++k) {
-        mag[size_t(k)] = std::abs(bins[size_t(k)]);
-        ph[size_t(k)] = std::arg(bins[size_t(k)]);
-        maxMag = std::max(maxMag, mag[size_t(k)]);
-    }
+    float fluxPositive = 0.f;
+    float fluxTotal = 0.f;
+    float fluxEnergy = 0.f;
 
-    for (int k = 0; k < K; ++k) {
-        double f = k;
-        if (c.havePrev) {
-            const double d = wrapPhase(double(ph[size_t(k)]) - double(c.prevPhase[size_t(k)]) - k * omega);
-            f = k + d / omega;
+    // Analyze the whole frame, but detect transients primarily in the band
+    // that this STFT contributes to the finished signal.
+    const int fluxFirst = std::max(1, int(std::floor(
+        (b.high ? 1800.0 : 80.0) * b.N / b.rate)));
+    const int fluxLast = std::min(b.K - 2, int(std::ceil(
+        (b.high ? b.rate * 0.48 : 3200.0) * b.N / b.rate)));
+
+    for (int k = 0; k < b.K; ++k) {
+        const size_t ix = size_t(k);
+        const float magnitude = std::abs(b.bins[ix]);
+        const float phase = std::arg(b.bins[ix]);
+        b.mag[ix] = magnitude;
+        b.ph[ix] = phase;
+        maxMag = std::max(maxMag, magnitude);
+
+        if (k >= fluxFirst && k <= fluxLast) {
+            fluxEnergy += magnitude;
+            if (hadPrev)
+                fluxPositive += std::max(0.f, magnitude - c.prevMagnitude[ix]);
+            fluxTotal += magnitude;
         }
-        freqBin[size_t(k)] = float(f);
-        c.prevPhase[size_t(k)] = ph[size_t(k)];
+        c.prevMagnitude[ix] = magnitude;
+
+        double f = k;
+        if (hadPrev) {
+            const double err = wrapPhase(double(phase) -
+                double(c.prevPhase[ix]) - k * omega);
+            f += err / omega;
+        }
+        b.freqBin[ix] = float(f);
+        c.prevPhase[ix] = phase;
     }
-    c.havePrev = true;
 
-    std::fill(spec.begin(), spec.end(), std::complex<float>{});
-    if (maxMag < 1e-9f) { c.tracks.clear(); return; }
+    const float flux = fluxPositive / std::max(fluxTotal, 1e-9f);
+    const float threshold = b.high ? 0.17f : 0.22f;
+    const bool onset = hadPrev && c.transientHold == 0 &&
+        flux > std::max(threshold, c.fluxBaseline * 1.75f) &&
+        (fluxEnergy > 1.08f * c.prevFluxEnergy || flux > 0.42f);
 
-    const float thr = maxMag * kPeakFloor;
-    peakBin.clear();
-    for (int k = 2; k < K - 2; ++k) {
-        const float m = mag[size_t(k)];
-        if (m > thr && m > mag[size_t(k - 1)] && m >= mag[size_t(k + 1)] &&
-            m > mag[size_t(k - 2)] && m >= mag[size_t(k + 2)]) {
-            if (!peakBin.empty() && k - peakBin.back() < 4) {
-                if (m > mag[size_t(peakBin.back())]) peakBin.back() = k;
+    c.fluxBaseline = hadPrev
+        ? (0.94f * c.fluxBaseline + 0.06f * flux)
+        : (0.25f * flux);
+    c.prevFluxEnergy = fluxEnergy;
+    if (c.transientHold > 0) --c.transientHold;
+    if (onset) c.transientHold = b.high ? 3 : 2;
+
+    std::fill(b.spec.begin(), b.spec.end(), std::complex<float>{0.f, 0.f});
+    if (maxMag < 1e-9f) {
+        c.trackCount = 0;
+        c.havePrev = false;
+        c.fluxBaseline = 0.f;
+        c.prevAlpha = alpha;
+        return;
+    }
+
+    // Find spectral peaks.  All arrays are full-size and allocated at creation.
+    const float peakThreshold = maxMag * kPeakFloor;
+    int peakCount = 0;
+    for (int k = 2; k < b.K - 2; ++k) {
+        const float m = b.mag[size_t(k)];
+        if (m > peakThreshold &&
+            m > b.mag[size_t(k - 1)] && m >= b.mag[size_t(k + 1)] &&
+            m > b.mag[size_t(k - 2)] && m >= b.mag[size_t(k + 2)]) {
+            if (peakCount > 0 && k - b.peakBin[size_t(peakCount - 1)] < 4) {
+                if (m > b.mag[size_t(b.peakBin[size_t(peakCount - 1)])])
+                    b.peakBin[size_t(peakCount - 1)] = k;
             } else {
-                peakBin.push_back(k);
+                b.peakBin[size_t(peakCount++)] = k;
             }
         }
     }
-    if (peakBin.empty()) {
+    if (peakCount == 0) {
         int best = 1;
-        for (int k = 1; k < K - 1; ++k) if (mag[size_t(k)] > mag[size_t(best)]) best = k;
-        peakBin.push_back(best);
+        for (int k = 2; k < b.K - 1; ++k)
+            if (b.mag[size_t(k)] > b.mag[size_t(best)]) best = k;
+        b.peakBin[0] = best;
+        peakCount = 1;
     }
 
-    const int n = int(peakBin.size());
-    regionLo.assign(size_t(n), 1);
-    regionHi.assign(size_t(n), K - 2);
-    for (int i = 0; i + 1 < n; ++i) {
-        int valley = peakBin[size_t(i)] + 1;
-        for (int k = valley; k < peakBin[size_t(i + 1)]; ++k)
-            if (mag[size_t(k)] < mag[size_t(valley)]) valley = k;
-        regionHi[size_t(i)] = valley;
-        regionLo[size_t(i + 1)] = valley + 1;
+    for (int i = 0; i < peakCount; ++i) {
+        b.regionLo[size_t(i)] = 1;
+        b.regionHi[size_t(i)] = b.K - 2;
+    }
+    for (int i = 0; i + 1 < peakCount; ++i) {
+        int valley = b.peakBin[size_t(i)] + 1;
+        for (int k = valley; k < b.peakBin[size_t(i + 1)]; ++k)
+            if (b.mag[size_t(k)] < b.mag[size_t(valley)]) valley = k;
+        b.regionHi[size_t(i)] = valley;
+        b.regionLo[size_t(i + 1)] = valley + 1;
     }
 
-    // ---- formant envelope with adaptive smoothing
-    const double alphaSpeed = std::abs(alpha - c.prevAlpha);
+    // Smoothed cepstral envelope for formant restoration / formant knob.
+    const double slideSpeed = std::abs(alpha - c.prevAlpha);
     c.prevAlpha = alpha;
-    const float envCoef = (alphaSpeed > 1e-4) ? kEnvSmoothCoefSlide : kEnvSmoothCoef;
-
-    for (int k = 0; k < K; ++k) env[size_t(k)] = std::max(mag[size_t(k)], 1e-9f);
-    cepster.lifter(env);
-    for (int k = 0; k < K; ++k) {
-        env[size_t(k)] = std::max(env[size_t(k)], 1e-9f);
-        const float logNow = std::log(env[size_t(k)]);
-        if (c.havePrev)
-            c.envSmooth[size_t(k)] = envCoef * logNow +
-                                     (1.f - envCoef) * c.envSmooth[size_t(k)];
-        else
-            c.envSmooth[size_t(k)] = logNow;
-        env[size_t(k)] = std::exp(c.envSmooth[size_t(k)]);
+    const float envCoef = slideSpeed > 1e-4
+        ? kEnvSmoothCoefSlide : kEnvSmoothCoef;
+    for (int k = 0; k < b.K; ++k)
+        b.env[size_t(k)] = std::max(b.mag[size_t(k)], 1e-9f);
+    b.cepster.lifter(b.env);
+    for (int k = 0; k < b.K; ++k) {
+        const size_t ix = size_t(k);
+        const float logNow = std::log(std::max(b.env[ix], 1e-9f));
+        // IMPORTANT: don't smooth a first frame against zero log-magnitude.
+        c.envSmooth[ix] = hadPrev
+            ? envCoef * logNow + (1.f - envCoef) * c.envSmooth[ix]
+            : logNow;
+        b.env[ix] = std::exp(c.envSmooth[ix]);
     }
 
-    // [KNOB-FORMANT] beta = formant scale. Sampling env at kk/beta instead of
-    // kk means:
-    //   beta = 1  -> standard preservation (formants stay on original pitch)
-    //   beta = a  -> formants follow only the knob by 'a', regardless of slide
-    //   beta = alpha (total) -> chipmunk, formants follow everything
-    const float beta = float(std::clamp(formantScaleSmoothed_, 1.0 / 64.0, 64.0));
-    auto sampleEnv = [&](float pos) -> float {
-        pos = std::clamp(pos, 1.f, float(K - 2));
-        const int lo = int(std::floor(pos));
-        const int hi = std::min(lo + 1, K - 2);
-        const float frac = pos - lo;
-        return env[size_t(lo)] * (1.f - frac) + env[size_t(hi)] * frac;
+    const float beta = float(std::clamp(
+        formantScaleSmoothed_, 1.0 / 64.0, 64.0));
+    auto sampleEnv = [&](float binPos) -> float {
+        binPos = std::clamp(binPos, 1.f, float(b.K - 2));
+        const int lo = int(std::floor(binPos));
+        const int hi = std::min(lo + 1, b.K - 2);
+        const float frac = binPos - lo;
+        return b.env[size_t(lo)] * (1.f - frac) + b.env[size_t(hi)] * frac;
     };
 
-    std::fill(synMag.begin(), synMag.end(), 0.f);
-    newTracks.clear();
-    size_t t = 0;
-    for (int i = 0; i < n; ++i) {
-        const int kp = peakBin[size_t(i)];
-        const double fp = std::clamp(double(freqBin[size_t(kp)]), kp - 1.5, kp + 1.5);
-        const double fn = alpha * fp;
-        if (fn >= K - 2) break;
+    int nextTrackCount = 0;
+    int trackCursor = 0;
+    for (int i = 0; i < peakCount; ++i) {
+        const int kp = b.peakBin[size_t(i)];
+        const double fp = std::clamp(
+            double(b.freqBin[size_t(kp)]), kp - 1.5, kp + 1.5);
+        const double shiftedFrequency = alpha * fp;
+        if (shiftedFrequency <= 0.0) continue;
+        if (shiftedFrequency >= b.K - 1.0) break;
 
-        const double deltaExact = (alpha - 1.0) * fp;
-        const int    deltaLo    = int(std::floor(deltaExact));
-        const int    deltaHi    = deltaLo + 1;
-        const float  fracHi     = float(deltaExact - deltaLo);
-        const float  fracLo     = 1.f - fracHi;
+        // Integer bin relocation + *explicit* fractional remainder.
+        // This fixes the phase progression at a continuous, sub-bin target,
+        // instead of advancing it at a rounded destination frequency.
+        const double exactShift = (alpha - 1.0) * fp;
+        const int delta = int(std::lround(exactShift));
+        const double fractional = exactShift - delta; // [-0.5, +0.5]
+        const int neighbour = delta + (fractional >= 0.0 ? 1 : -1);
+        const float primaryWeight = float(1.0 - std::abs(fractional));
+        const float neighbourWeight = float(std::abs(fractional));
 
-        const double centreAna = double(ph[size_t(kp)]) + kPi * kp;
+        const double centreAna = double(b.ph[size_t(kp)]) + kPi * kp;
         double centreSyn = centreAna;
-        if (c.havePrev && !c.tracks.empty()) {
-            while (t + 1 < c.tracks.size() && c.tracks[t + 1].freq <= fp) ++t;
-            size_t best = t;
-            if (t + 1 < c.tracks.size() &&
-                std::abs(c.tracks[t + 1].freq - fp) < std::abs(c.tracks[t].freq - fp)) best = t + 1;
-            if (std::abs(c.tracks[best].freq - fp) < 1.75)
-                centreSyn = double(c.tracks[best].phase) + fn * omega;
-        }
-        centreSyn = wrapPhase(centreSyn);
-        newTracks.push_back({float(fp), float(centreSyn)});
-
-        const double thetaBase = centreSyn - double(ph[size_t(kp)]);
-        const double thetaLo   = thetaBase - kPi * (kp + deltaLo);
-        const double thetaHi   = thetaBase - kPi * (kp + deltaHi);
-        const std::complex<float> rotLo(float(std::cos(thetaLo)), float(std::sin(thetaLo)));
-        const std::complex<float> rotHi(float(std::cos(thetaHi)), float(std::sin(thetaHi)));
-
-        for (int k = regionLo[size_t(i)]; k <= regionHi[size_t(i)]; ++k) {
-            const int kkLo = k + deltaLo;
-            const int kkHi = k + deltaHi;
-            const std::complex<float> base = bins[size_t(k)];
-            const float envK = env[size_t(k)];
-            if (fracLo > 0.f && kkLo >= 1 && kkLo <= K - 2) {
-                // [KNOB-FORMANT] sample env at kkLo/beta
-                const float envT = sampleEnv(float(kkLo) / beta);
-                const float g = std::clamp(envT / envK, 0.f, kMaxGain);
-                const std::complex<float> v = base * rotLo * g * fracLo;
-                const float m2 = std::norm(v);
-                if (m2 > synMag[size_t(kkLo)]) { spec[size_t(kkLo)] = v; synMag[size_t(kkLo)] = m2; }
+        if (hadPrev && !onset && c.trackCount > 0) {
+            while (trackCursor + 1 < c.trackCount &&
+                   c.tracks[size_t(trackCursor + 1)].freq <= fp)
+                ++trackCursor;
+            int best = trackCursor;
+            if (trackCursor + 1 < c.trackCount &&
+                std::abs(c.tracks[size_t(trackCursor + 1)].freq - fp) <
+                std::abs(c.tracks[size_t(best)].freq - fp))
+                best = trackCursor + 1;
+            if (std::abs(double(c.tracks[size_t(best)].freq) - fp) < 1.75) {
+                // Advance at the *hop-averaged* MIDI pitch, not merely its
+                // last sample.  This is essential on fast continuous slides.
+                // The first terms explicitly retain the fractional offset;
+                // the final term integrates the pitch ramp within this hop.
+                const double advanceBins =
+                    double(kp + delta) + (fp - kp) + fractional +
+                    (phaseAlpha - alpha) * fp;
+                centreSyn = double(c.tracks[size_t(best)].phase) +
+                    advanceBins * omega;
             }
-            if (fracHi > 0.f && kkHi >= 1 && kkHi <= K - 2) {
-                const float envT = sampleEnv(float(kkHi) / beta);
-                const float g = std::clamp(envT / envK, 0.f, kMaxGain);
-                const std::complex<float> v = base * rotHi * g * fracHi;
-                const float m2 = std::norm(v);
-                if (m2 > synMag[size_t(kkHi)]) { spec[size_t(kkHi)] = v; synMag[size_t(kkHi)] = m2; }
+        }
+        // On a transient, centreSyn deliberately resets to the current
+        // analysis phase.  This prevents prolonged phase smearing on attacks.
+        centreSyn = wrapPhase(centreSyn);
+        b.newTracks[size_t(nextTrackCount++)] = {
+            float(fp), float(centreSyn)
+        };
+
+        // Continuous, fractional-bin phase rotation.  Each of the two target
+        // integer bins is corrected relative to the *same* non-integer peak
+        // position; their phases therefore coincide at the frame centre.
+        const double continuousRotation = centreSyn -
+            double(b.ph[size_t(kp)]) - kPi * (kp + exactShift);
+        const double rotationPrimary = wrapPhase(
+            continuousRotation + kPi * (exactShift - delta));
+        const double rotationNeighbour = wrapPhase(
+            continuousRotation + kPi * (exactShift - neighbour));
+        const std::complex<float> rot0(float(std::cos(rotationPrimary)),
+                                        float(std::sin(rotationPrimary)));
+        const std::complex<float> rot1(float(std::cos(rotationNeighbour)),
+                                        float(std::sin(rotationNeighbour)));
+
+        for (int k = b.regionLo[size_t(i)];
+             k <= b.regionHi[size_t(i)]; ++k) {
+            const float originalEnvelope = std::max(b.env[size_t(k)], 1e-9f);
+            const std::complex<float> base = b.bins[size_t(k)];
+            const int d0 = k + delta;
+            const int d1 = k + neighbour;
+            if (primaryWeight > 0.f && d0 >= 1 && d0 < b.K - 1) {
+                const float targetEnvelope = sampleEnv(float(d0) / beta);
+                const float gain = std::clamp(
+                    targetEnvelope / originalEnvelope, 0.f, kMaxGain);
+                b.spec[size_t(d0)] += base * rot0 * (gain * primaryWeight);
+            }
+            if (neighbourWeight > 0.f && d1 >= 1 && d1 < b.K - 1) {
+                const float targetEnvelope = sampleEnv(float(d1) / beta);
+                const float gain = std::clamp(
+                    targetEnvelope / originalEnvelope, 0.f, kMaxGain);
+                b.spec[size_t(d1)] += base * rot1 * (gain * neighbourWeight);
             }
         }
     }
-    c.tracks.swap(newTracks);
+
+    // Destination frequency, not source frequency, controls the crossover.
+    for (int k = 1; k < b.K - 1; ++k)
+        b.spec[size_t(k)] *= b.crossover[size_t(k)];
+    b.spec.front() = b.spec.back() = {};
+
+    // No resizing/swapping/push_back on the audio thread: fixed track arrays.
+    for (int i = 0; i < nextTrackCount; ++i)
+        c.tracks[size_t(i)] = b.newTracks[size_t(i)];
+    c.trackCount = nextTrackCount;
+    c.havePrev = true;
 }
 
-void StftVoice::frame(long long start, double scale) {
-    const int channels = mono ? 1 : 2;
-    for (int ch = 0; ch < channels; ++ch) {
-        for (int i = 0; i < N; ++i)
-            time[size_t(i)] = read(begin + (start + i) * step, ch) * window[size_t(i)];
-        fftp->fft(time, bins);
-        shift(chan[size_t(ch)], scale);
-        spec.front() = spec.back() = 0;
-        fftp->ifft(spec, time);
-        auto& overlap = chan[size_t(ch)].overlap;
-        for (int i = 0; i < N; ++i) {
+void StftVoice::frame(Band& b, long long start, double alpha,
+                      double phaseAlpha) {
+    const int channelCount = mono ? 1 : 2;
+    for (int ch = 0; ch < channelCount; ++ch) {
+        // start is an ABSOLUTE time index in the output/source timebase.
+        // Both windows read and overlap-add at that same index.  The FFT
+        // centre is start + N/2, but there is NO extra N/2 sample offset on
+        // either read or write.  Consequently the 512/2048 window difference
+        // introduces no relative latency, including on the pre-roll frames.
+        for (int i = 0; i < b.N; ++i) {
+            const long long sampleIndex = start + i;
+            b.time[size_t(i)] = read(
+                begin + double(sampleIndex) * step, ch) * b.window[size_t(i)];
+        }
+        b.fftp->fft(b.time, b.bins);
+        shift(b, b.channels[size_t(ch)], alpha, phaseAlpha);
+        b.fftp->ifft(b.spec, b.time);
+
+        auto& overlap = b.channels[size_t(ch)].overlap;
+        for (int i = 0; i < b.N; ++i) {
             const long long offset = start + i - position;
-            if (offset >= 0 && offset < N)
-                overlap[size_t(offset)] += time[size_t(i)] * window[size_t(i)] * outNorm;
+            if (offset >= 0 && offset < b.N) {
+                overlap[size_t(offset)] += b.time[size_t(i)] *
+                    b.window[size_t(i)] * b.outNorm;
+            }
         }
     }
+}
+
+void StftVoice::advanceBand(Band& b, double alpha) {
+    if (b.cursor != b.H) return;
+    for (int ch = 0; ch < (mono ? 1 : 2); ++ch) {
+        auto& o = b.channels[size_t(ch)].overlap;
+        std::move(o.begin() + b.H, o.end(), o.begin());
+        std::fill(o.end() - b.H, o.end(), 0.f);
+    }
+    frame(b, position, alpha, b.hopPitchSum / b.H);
+    b.cursor = 0;
+    b.hopPitchSum = 0.0;
 }
 
 int StftVoice::render(float* left, float* right, int count, double scale) {
-    const int frames = int(std::max<long long>(0, std::min<long long>(count, length - position)));
-    const double target = std::log2(std::clamp(scale, 1.0 / 64.0, 64.0));
+    if (count <= 0 || length <= position) return 0;
+    const int frames = int(std::max<long long>(0,
+        std::min<long long>(count, length - position)));
+    const double safeScale = std::isfinite(scale)
+        ? std::clamp(scale, 1.0 / 64.0, 64.0) : 1.0;
+    const double target = std::log2(safeScale);
     if (!smoothInit) { smoothLog = target; smoothInit = true; }
-    const int channels = mono ? 1 : 2;
 
     for (int i = 0; i < frames; ++i, ++position) {
         smoothLog += (target - smoothLog) * smoothCoef;
-        if (target == 0.0 && std::abs(smoothLog) < 1e-4) smoothLog = 0.0;
+        if (target == 0.0 && std::abs(smoothLog) < 1e-4)
+            smoothLog = 0.0;
         const bool shifted = std::abs(smoothLog) > 1e-5;
         const double factor = std::exp2(smoothLog);
-
-        // [KNOB-FORMANT] smooth the formant scale too, so a knob move doesn't click.
-        formantScaleSmoothed_ += (formantScaleTarget_ - formantScaleSmoothed_) * formantSmoothCoef_;
+        formantScaleSmoothed_ +=
+            (formantScaleTarget_ - formantScaleSmoothed_) * formantSmoothCoef_;
 
         if (shifted && !active) {
             resetState();
-            for (int offset = -N + H; offset <= 0; offset += H) frame(position + offset, factor);
+            // Each band gets its OWN correctly centered warm-up frames; no
+            // heap allocation, no waiting for a future audio callback.
+            for (int offset = -lowBand.N + lowBand.H;
+                 offset <= 0; offset += lowBand.H)
+                frame(lowBand, position + offset, factor, factor);
+            for (int offset = -highBand.N + highBand.H;
+                 offset <= 0; offset += highBand.H)
+                frame(highBand, position + offset, factor, factor);
             active = true;
-            cursor = 0;
             wet = position == 0 ? 1.f : 0.f;
         }
-        if (active && cursor == H) {
-            for (int ch = 0; ch < channels; ++ch) {
-                auto& o = chan[size_t(ch)].overlap;
-                std::move(o.begin() + H, o.end(), o.begin());
-                std::fill(o.end() - H, o.end(), 0.f);
-            }
-            frame(position, factor);
-            cursor = 0;
+
+        if (active) {
+            advanceBand(lowBand, factor);
+            advanceBand(highBand, factor);
         }
 
         const float wetTarget = shifted ? 1.f : 0.f;
@@ -285,18 +443,23 @@ int StftVoice::render(float* left, float* right, int count, double scale) {
 
         float dl = 0.f, dr = 0.f, wl = 0.f, wr = 0.f;
         if (wet < 1.f) {
-            dl = read(begin + position * step, 0);
-            dr = mono ? dl : read(begin + position * step, 1);
+            dl = read(begin + double(position) * step, 0);
+            dr = mono ? dl : read(begin + double(position) * step, 1);
         }
         if (active) {
-            wl = chan[0].overlap[size_t(cursor)];
-            wr = mono ? wl : chan[1].overlap[size_t(cursor)];
-            ++cursor;
+            wl = lowBand.channels[0].overlap[size_t(lowBand.cursor)] +
+                 highBand.channels[0].overlap[size_t(highBand.cursor)];
+            wr = mono ? wl :
+                 lowBand.channels[1].overlap[size_t(lowBand.cursor)] +
+                 highBand.channels[1].overlap[size_t(highBand.cursor)];
+            ++lowBand.cursor;
+            ++highBand.cursor;
+            lowBand.hopPitchSum += factor;
+            highBand.hopPitchSum += factor;
         }
         left[i] = dl * (1.f - wet) + wl * wet;
         right[i] = dr * (1.f - wet) + wr * wet;
-
-        if (active && !shifted && wet == 0.f) { active = false; }
+        if (active && !shifted && wet == 0.f) active = false;
     }
     return frames;
 }
