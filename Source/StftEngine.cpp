@@ -7,9 +7,15 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kTwoPi = 2.0 * kPi;
 
 int pickSize(double rate, int base) {
-    if (rate <= 50000.0) return base;
-    if (rate <= 100000.0) return base * 2;
-    return base * 4;
+    // L'utente puo' scrivere qualsiasi numero: lo portiamo alla potenza di 2
+    // piu' vicina (la FFT la richiede), tra 128 e 16384.
+    int n = 128;
+    const int want = std::clamp(base, 128, 16384);
+    while (n < 16384 && std::abs(std::log2(double(n * 2) / want)) < std::abs(std::log2(double(n) / want)))
+        n *= 2;
+    if (rate > 100000.0) n *= 4;
+    else if (rate > 50000.0) n *= 2;
+    return n;
 }
 
 double wrapPhase(double p) {
@@ -17,7 +23,8 @@ double wrapPhase(double p) {
 }
 } // namespace
 
-StftVoice::Band::Band(int fftSize, double sampleRate, bool upperBand, double quefrency)
+StftVoice::Band::Band(int fftSize, double sampleRate, bool upperBand, double quefrency,
+                      double crossLowHz, double crossHighHz)
     : N(fftSize),
       H(fftSize / 4),
       K(fftSize / 2 + 1),
@@ -38,7 +45,9 @@ StftVoice::Band::Band(int fftSize, double sampleRate, bool upperBand, double que
       regionLo(size_t(K), 0),
       regionHi(size_t(K), 0),
       newTracks(size_t(K)) {
-    cepster.quefrency(quefrency);
+    // Con FFT piccole il valore iniziale potrebbe superare N/2 campioni.
+    cepster.quefrency(std::clamp(quefrency, 1.0 / sampleRate,
+                                 double(fftSize / 2 - 1) / sampleRate));
     for (int i = 0; i < N; ++i)
         window[size_t(i)] = float(0.5 - 0.5 * std::cos(kTwoPi * i / N));
 
@@ -47,7 +56,7 @@ StftVoice::Band::Band(int fftSize, double sampleRate, bool upperBand, double que
     for (int k = 0; k < K; ++k) {
         const double hz = double(k) * rate / N;
         const float highWeight = float(std::clamp(
-            (hz - kCrossLowHz) / (kCrossHighHz - kCrossLowHz), 0.0, 1.0));
+            (hz - crossLowHz) / std::max(crossHighHz - crossLowHz, 1e-3), 0.0, 1.0));
         crossover[size_t(k)] = high ? highWeight : 1.f - highWeight;
     }
 
@@ -75,8 +84,12 @@ StftVoice::StftVoice(std::shared_ptr<const WaveData> data,
       end(std::clamp(last, begin, wav->frames())),
       step(wav->sampleRate / hostRate),
       length(static_cast<long long>(std::ceil((end - begin) / step))),
-      lowBand(pickSize(hostRate, 2048), hostRate, false, kQuefrency),
-      highBand(pickSize(hostRate, 512), hostRate, true, kQuefrency) {
+      lowBand(pickSize(hostRate, StftDevParams::instance().fftLow.load()), hostRate, false,
+              kQuefrency, StftDevParams::instance().crossLowHz.load(),
+              StftDevParams::instance().crossHighHz.load()),
+      highBand(pickSize(hostRate, StftDevParams::instance().fftHigh.load()), hostRate, true,
+               kQuefrency, StftDevParams::instance().crossLowHz.load(),
+               StftDevParams::instance().crossHighHz.load()) {
     smoothCoef = 1.0 - std::exp(-1.0 / (kSmoothMs * 0.001 * hostRate));
     formantSmoothCoef_ = smoothCoef;
     fadeStep = float(1.0 / (kFadeMs * 0.001 * hostRate));
@@ -92,16 +105,36 @@ StftVoice::StftVoice(std::shared_ptr<const WaveData> data,
     }
 }
 
+void StftVoice::applyQuefrency(double q) {
+    if (!std::isfinite(q)) return;
+    kQuefrency = q;
+    // Un cepstro ha solo N/2 campioni: oltre quel punto il risultato e'
+    // identico ("nessun liftering"), quindi il valore passato alla libreria
+    // viene tenuto nel range valido per evitare accessi fuori buffer.
+    auto set = [q](Band& b) {
+        const double lo = 1.0 / b.rate;
+        const double hi = double(b.N / 2 - 1) / b.rate;
+        b.cepster.quefrency(std::clamp(q, lo, hi));
+    };
+    set(lowBand);
+    set(highBand);
+}
+
+// Nessun range imposto: qualsiasi valore finito viene applicato.
 void StftVoice::setDevParams(float envSmooth, float envSmoothSlide, float maxGain, double quefrency) {
-    if (envSmooth >= 0 && envSmooth <= 1) kEnvSmoothCoef = envSmooth;
-    if (envSmoothSlide >= 0 && envSmoothSlide <= 1) kEnvSmoothCoefSlide = envSmoothSlide;
-    if (std::isfinite(maxGain) && maxGain >= 0) kMaxGain = std::min(maxGain, 40.0f);
-    if (quefrency != kQuefrency && quefrency * highBand.rate >= 1.0 &&
-        quefrency * highBand.rate < highBand.N / 2) {
-        lowBand.cepster.quefrency(quefrency);
-        highBand.cepster.quefrency(quefrency);
-        kQuefrency = quefrency;
-    }
+    if (std::isfinite(envSmooth)) kEnvSmoothCoef = envSmooth;
+    if (std::isfinite(envSmoothSlide)) kEnvSmoothCoefSlide = envSmoothSlide;
+    if (!std::isnan(maxGain)) kMaxGain = std::max(0.f, maxGain);
+    if (quefrency != kQuefrency) applyQuefrency(quefrency);
+}
+
+void StftVoice::syncDevParams() {
+    auto& p = StftDevParams::instance();
+    const unsigned v = p.version.load(std::memory_order_acquire);
+    if (v == devVersion_) return;
+    devVersion_ = v;
+    setDevParams(p.envSmooth.load(), p.envSmoothSlide.load(), p.maxGain.load(),
+                 p.quefrencyMs.load() * 0.001);
 }
 
 void StftVoice::setFormantScale(double scale) {
@@ -114,7 +147,6 @@ void StftVoice::resetState() {
         band.cursor = 0;
         band.hopPitchSum = 0.0;
         for (auto& c : band.channels) {
-            c.lastF0 = 0.0;
             std::fill(c.overlap.begin(), c.overlap.end(), 0.f);
             std::fill(c.prevPhase.begin(), c.prevPhase.end(), 0.f);
             std::fill(c.prevMagnitude.begin(), c.prevMagnitude.end(), 0.f);
@@ -147,51 +179,8 @@ float StftVoice::read(double where, int ch) const {
     return ((c3 * f + c2) * f + c1) * f + y1;
 }
 
-double StftVoice::estimateF0(long long centre, int ch, double rate) const {
-    // Average adjacent input samples before decimation. Both FFT sizes
-    // analyse the same duration around their own frame centre.
-    const int stride = std::max(1, int(std::lround(rate / 6000.0)));
-    const double analysisRate = rate / stride;
-    constexpr int window = 144;
-    constexpr int maxLag = 96;
-    std::array<double, window + maxLag> samples{};
-    double mean = 0.0;
-    for (int i = 0; i < int(samples.size()); ++i) {
-        const auto start = centre + (i - int(samples.size()) / 2) * stride;
-        for (int j = 0; j < stride; ++j)
-            samples[i] += read(begin + (start + j) * step, ch);
-        samples[i] /= stride;
-        mean += samples[i];
-    }
-    mean /= samples.size();
-    for (double& sample : samples) sample -= mean;
-    std::array<double, maxLag + 1> corr{};
-    const int first = std::max(2, int(std::floor(analysisRate / 1200.0)));
-    const int last = std::min(maxLag - 1, int(std::ceil(analysisRate / 65.0)));
-    double best = 0.0;
-    for (int lag = first - 1; lag <= last + 1; ++lag) {
-        double cross = 0.0, energy = 0.0;
-        const int offset = (maxLag - lag) / 2;
-        for (int i = offset; i < offset + window; ++i) {
-            const double a = samples[i], b = samples[i + lag];
-            cross += a * b;
-            energy += a * a + b * b;
-        }
-        corr[lag] = energy > 1e-10 ? 2.0 * cross / energy : 0.0;
-        if (lag >= first && lag <= last) best = std::max(best, corr[lag]);
-    }
-    for (int lag = first; lag <= last; ++lag) {
-        const double l = corr[lag - 1], m = corr[lag], r = corr[lag + 1];
-        if (m >= std::max(0.82, best * 0.97) && m > l && m >= r) {
-            const double delta = 0.5 * (l - r) / (l - 2.0 * m + r);
-            return analysisRate / (lag + delta);
-        }
-    }
-    return 0.0;
-}
-
 void StftVoice::shift(Band& b, Channel& c, double alpha,
-                      double phaseAlpha, double f0) {
+                      double phaseAlpha) {
     const double omega = kTwoPi * b.H / b.N;
     const bool hadPrev = c.havePrev;
 
@@ -303,9 +292,13 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
         const size_t ix = size_t(k);
         const float logNow = std::log(std::max(b.env[ix], 1e-9f));
         // IMPORTANT: don't smooth a first frame against zero log-magnitude.
-        c.envSmooth[ix] = hadPrev
+        float sm = hadPrev
             ? envCoef * logNow + (1.f - envCoef) * c.envSmooth[ix]
             : logNow;
+        // Anti-NaN: con coefficienti >1 il filtro puo' divergere; senza questo
+        // exp() andrebbe a inf e il suono morirebbe fino alla nota dopo.
+        if (!std::isfinite(sm)) sm = logNow;
+        c.envSmooth[ix] = std::clamp(sm, -80.f, 80.f);
         b.env[ix] = std::exp(c.envSmooth[ix]);
     }
 
@@ -325,14 +318,6 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
         const int kp = b.peakBin[size_t(i)];
         const double fp = std::clamp(
             double(b.freqBin[size_t(kp)]), kp - 1.5, kp + 1.5);
-        const double hz = fp * b.rate / b.N;
-        const double harmonic = f0 > 0.0 ? std::round(hz / f0) : 0.0;
-        const double tolerance = std::min(0.16 * f0, 0.40 * b.rate / b.N + 0.003 * hz);
-        // Require a resolved spectral peak even when using a remembered F0.
-        const int flank = std::clamp(int(std::lround(0.45 * f0 * b.N / b.rate)), 2, 8);
-        const float shoulder = std::max(b.mag[size_t(std::max(0, kp - flank))],
-                                        b.mag[size_t(std::min(b.K - 1, kp + flank))]);
-        const bool useEnvelope = b.mag[size_t(kp)] > 3.f * shoulder && harmonic >= 1.0 && std::abs(hz - harmonic * f0) <= tolerance;
         const double shiftedFrequency = alpha * fp;
         if (shiftedFrequency <= 0.0) continue;
         if (shiftedFrequency >= b.K - 1.0) break;
@@ -393,23 +378,20 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
 
         for (int k = b.regionLo[size_t(i)];
              k <= b.regionHi[size_t(i)]; ++k) {
-            // A peak owns a whole valley-to-valley region for phase locking.
-            // Only its central Hann lobe gets the formant correction.
-            const bool harmonicBin = useEnvelope && std::abs(k - fp) <= 2.0;
             const float originalEnvelope = std::max(b.env[size_t(k)], 1e-9f);
             const std::complex<float> base = b.bins[size_t(k)];
             const int d0 = k + delta;
             const int d1 = k + neighbour;
             if (primaryWeight > 0.f && d0 >= 1 && d0 < b.K - 1) {
                 const float targetEnvelope = sampleEnv(float(d0) / beta);
-                const float gain = harmonicBin ? std::clamp(
-                    targetEnvelope / originalEnvelope, 0.f, kMaxGain) : 1.f;
+                const float gain = std::clamp(
+                    targetEnvelope / originalEnvelope, 0.f, kMaxGain);
                 b.spec[size_t(d0)] += base * rot0 * (gain * primaryWeight);
             }
             if (neighbourWeight > 0.f && d1 >= 1 && d1 < b.K - 1) {
                 const float targetEnvelope = sampleEnv(float(d1) / beta);
-                const float gain = harmonicBin ? std::clamp(
-                    targetEnvelope / originalEnvelope, 0.f, kMaxGain) : 1.f;
+                const float gain = std::clamp(
+                    targetEnvelope / originalEnvelope, 0.f, kMaxGain);
                 b.spec[size_t(d1)] += base * rot1 * (gain * neighbourWeight);
             }
         }
@@ -442,19 +424,7 @@ void StftVoice::frame(Band& b, long long start, double alpha,
                 begin + double(sampleIndex) * step, ch) * b.window[size_t(i)];
         }
         b.fftp->fft(b.time, b.bins);
-        auto& channel = b.channels[size_t(ch)];
-        const double measured = estimateF0(start + b.N / 2, ch, b.rate);
-        if (measured > 0.0) {
-            // Smooth small estimation jitter, follow genuine note changes immediately.
-            if (channel.lastF0 > 0.0 && std::abs(measured - channel.lastF0) < 0.04 * measured) {
-                const double mix = -std::expm1(-double(b.H) / (0.012 * b.rate));
-                channel.lastF0 += mix * (measured - channel.lastF0);
-            } else {
-                channel.lastF0 = measured;
-            }
-        }
-        const double f0 = channel.lastF0;
-        shift(b, b.channels[size_t(ch)], alpha, phaseAlpha, f0);
+        shift(b, b.channels[size_t(ch)], alpha, phaseAlpha);
         b.fftp->ifft(b.spec, b.time);
 
         auto& overlap = b.channels[size_t(ch)].overlap;
@@ -482,6 +452,7 @@ void StftVoice::advanceBand(Band& b, double alpha) {
 
 int StftVoice::render(float* left, float* right, int count, double scale) {
     if (count <= 0 || length <= position) return 0;
+    syncDevParams();
     const int frames = int(std::max<long long>(0,
         std::min<long long>(count, length - position)));
     const double safeScale = std::isfinite(scale)
