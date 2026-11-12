@@ -1,6 +1,7 @@
 #pragma once
 
 #include "WaveLoader.h"
+#include "StftDevParams.h"
 #include <algorithm>
 #include <array>
 #include <complex>
@@ -20,15 +21,13 @@ public:
     void setFormantScale(double scale); // 1.0 = preserve; 2.0 = +12 semitones
 
 private:
-    double kQuefrency          = 0.0025;
+    double kQuefrency          = 0.002;
     static constexpr double kSmoothMs           = 6.0;
     static constexpr double kFadeMs             = 8.0;
-    float kMaxGain            = 40.0f;
+    float kMaxGain            = 6.0f;
     static constexpr float  kPeakFloor          = 1e-4f;
-    float kEnvSmoothCoef      = 0.20f;
-    float kEnvSmoothCoefSlide = 0.02f;
-    static constexpr double kCrossLowHz         = 2200.0;
-    static constexpr double kCrossHighHz        = 2800.0;
+    float kEnvSmoothCoef      = 0.3f;
+    float kEnvSmoothCoefSlide = 0.05f;
 
     struct Track {
         float freq = 0.f;  // Analysis frequency in (possibly fractional) FFT bins
@@ -41,7 +40,6 @@ private:
         std::vector<float> prevMagnitude; // Magnitude from previous frame (flux)
         std::vector<float> envSmooth;     // Log-spectral envelope smoother
         std::vector<Track> tracks;        // Fixed-size peak track array
-        double lastF0 = 0.0;
         int trackCount = 0;
         double prevAlpha = 1.0;
         float prevFluxEnergy = 0.f;
@@ -51,7 +49,8 @@ private:
     };
 
     struct Band {
-        Band(int fftSize, double sampleRate, bool upperBand, double quefrency);
+        Band(int fftSize, double sampleRate, bool upperBand, double quefrency,
+             double crossLowHz, double crossHighHz);
 
         const int N;
         const int H;
@@ -85,10 +84,12 @@ private:
 
     float read(double sourcePosition, int channel) const;
     void frame(Band& band, long long start, double alpha, double phaseAlpha);
-    double estimateF0(long long centre, int ch, double rate) const;
-    void shift(Band& band, Channel& channel, double alpha, double phaseAlpha, double f0);
+    void shift(Band& band, Channel& channel, double alpha, double phaseAlpha);
     void advanceBand(Band& band, double alpha);
     void resetState();
+    void syncDevParams();                 // legge StftDevParams (slider VST)
+    void applyQuefrency(double seconds);  // senza limiti utente, protegge solo la FFT
+    unsigned devVersion_ = 0xFFFFFFFFu;
 
     std::shared_ptr<const WaveData> wav;
     int begin;
