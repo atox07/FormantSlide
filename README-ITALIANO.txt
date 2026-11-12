@@ -17,6 +17,41 @@ automatico) corretta per la precedente calibrazione. Se la tua chromatic
 iniziava altrove, imposta First slice MIDI note. I tagli manuali si salvano
 con il progetto.
 
-Build Windows: usa il contenuto di questa directory come radice del branch
-flnative. Avvia il workflow Build FormantSlide FL Native (Windows) in Actions.
-Chiudi FL prima di sostituire FormantSlide_x64.dll con la build risultante.
+Build Windows (x64, MSVC e CMake >= 3.24):
+  cmake --fresh -S . -B build -G "Visual Studio 17 2022" -A x64 -DFL_SDK_DIR="C:/percorso/privato/SDK"
+  cmake --build build --config Release --target FormantSlideNative --parallel 2
+
+L'SDK Image-Line deve restare locale. Non caricarlo su GitHub.
+.gitignore esclude SDK/ e build/ anche nelle sottocartelle, ma non rimuove
+file gia tracciati o copie nella cronologia Git: verificarle prima di pubblicare.
+Se l'SDK e gia nella cronologia, aggiungere .gitignore non basta.
+
+GitHub Actions: il workflow manuale richiede un runner Windows personale
+con etichetta formantslide, MSVC e CMake. Imposta la variabile repository
+FL_SDK_DIR sul percorso dell'SDK privato, FUORI dalla directory di checkout.
+I runner GitHub windows-2022 non hanno accesso al tuo SDK locale.
+Non eseguire codice o pull request non fidati su questo runner personale.
+
+Distribuisci build/Release/FormantSlide_x64.dll insieme a
+build/Release/THIRD_PARTY_LICENSES.txt. Chiudi FL prima di sostituire la DLL.
+Non distribuire vecchie DLL o usare vecchie build/cache per questa versione.
+
+WORLD e incluso in third_party/World con revisione fissata e licenza BSD-3-Clause.
+L'analisi Harvest/CheapTrick/D4C (5 ms) avviene una volta al caricamento WAV,
+prima di acquisire il mutex audio. Il caricamento puo richiedere tempo.
+La sintesi usa WorldSynthesizer, con altezza variabile e inviluppo conservato.
+Il WAV stereo viene analizzato come downmix mono; l'uscita e dual mono con pan.
+La conversione alla frequenza host usa interpolazione lineare.
+Questa prima integrazione richiede verifica sonora in FL (attacchi, slide,
+polifonia e frequenze host differenti). Non garantisce assenza di aliasing,
+allocazioni nel thread audio o latenza algoritmica nulla.
+
+JUCE resta fissato a 8.0.10. Si prevede l'uso secondo l'EULA JUCE 8,
+piano Starter, anziche la licenza alternativa AGPLv3. Starter e gratuito
+entro i requisiti dell'EULA (limite applicabile 20.000 USD nei 12 mesi
+precedenti e requisiti sulle licenze degli sviluppatori).
+I due flag splash/usage a 1 sono impostazioni richieste, non una licenza.
+L'ammissibilita Starter e i diritti di distribuzione dell'SDK FL devono essere
+verificati dal titolare: il solo CMake non puo certificarli.
+Riferimenti: https://juce.com/legal/juce-8-licence/
+             https://github.com/mmorise/World/blob/master/LICENSE.txt

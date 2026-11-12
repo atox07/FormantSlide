@@ -2,7 +2,7 @@
 #include "fp_cplug.h"
 #include "MidiFile.h"
 #include "WaveLoader.h"
-#include <rubberband/RubberBandStretcher.h>
+#include "WorldEngine.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -56,8 +56,6 @@ public:
     bool moveSliceBoundary(int boundaryIndex, int frame);
 
 private:
-    using Stretcher = RubberBand::RubberBandStretcher;
-    std::vector<std::unique_ptr<Stretcher>> spareStretchers_;
     struct Voice {
         intptr_t hostTag = 0;
         PVoiceParams params = nullptr; // HOST-owned, live-updated for native slides
@@ -69,19 +67,19 @@ private:
         double playhead_ = 0;
         int sliceIndex = -1;
         int releaseFrames = -1;
-        double engineRate = 0;
         int sliceEnd_ = 0;
         bool samplePlaying_ = false;
         int drainRemaining_ = 0;
         double customPitch_ = 0, customTarget_ = 0, customStep_ = 0;
         double previousHostSlide_ = 0;
         int customRemaining_ = 0;
-        std::unique_ptr<Stretcher> stretch_;
+        std::unique_ptr<WorldVoice> world_;
 
     };
     mutable std::mutex mutex_;
     Settings settings_;
     WaveData wav_;
+    std::shared_ptr<const WorldAnalysis> analysis_;
     std::vector<AudioSlice> slices_;
     bool slicesManuallyEdited_ = false;
     int lastMidiNote_ = -1, lastSlice_ = -1;
@@ -98,10 +96,8 @@ private:
     std::atomic<int> channelPitchCents_{0};
     std::atomic<float> bpm_{120.f};
     std::atomic<int> hostPpq_{192};
-    std::array<std::array<float, 64>, 2> in_{};
     std::array<std::array<float, 64>, 2> out_{};
 
-    void initStretch(Voice& voice);
     void stopVoices();
     void beginVocal(Voice& voice);
     void beginSlide(const Voice& slideVoice, int noteLengthTicks, double hostTick);

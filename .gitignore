@@ -1,0 +1,19 @@
+# Proprietary Image-Line SDK: local use only, at any depth.
+[Ss][Dd][Kk]/
+
+# Generated builds and fetched dependencies.
+[Bb][Uu][Ii][Ll][Dd]/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+_deps/
+
+# Compiled products and IDE state.
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+.vs/

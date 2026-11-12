@@ -5,38 +5,49 @@ on:
 
 jobs:
   build:
-    runs-on: windows-2022
+    # Dedicated trusted machine with MSVC, CMake, and a PRIVATE SDK outside checkout.
+    # Do not run untrusted pull requests on this self-hosted runner.
+    runs-on: [self-hosted, Windows, X64, formantslide]
     permissions:
       contents: read
+    env:
+      FL_SDK_DIR: ${{ vars.FL_SDK_DIR }}
     steps:
-      - name: Checkout source and SDK
+      - name: Checkout plugin source only
         uses: actions/checkout@v4
 
-      - name: Verify SDK is present
+      - name: Verify private local SDK
         shell: pwsh
         run: |
-          if (-not (Test-Path 'SDK/fp_plugclass.h')) {
-            throw 'SDK folder missing. Copy SDK/ from the FL Studio SDK template ZIP into the repository root.'
+          if (-not $env:FL_SDK_DIR -or -not (Test-Path -LiteralPath (Join-Path $env:FL_SDK_DIR 'fp_plugclass.h'))) {
+            throw 'Set the FL_SDK_DIR repository variable to the private SDK directory on the trusted runner, outside the checkout.'
+          }
+          $sdkPath = [IO.Path]::GetFullPath($env:FL_SDK_DIR).TrimEnd('\')
+          $checkoutPath = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          if ($sdkPath -eq $checkoutPath -or $sdkPath.StartsWith($checkoutPath + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Keep the private SDK outside the checkout; checkout clean may remove ignored files.'
           }
 
       - name: Configure Windows native plugin
         shell: pwsh
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+        run: cmake --fresh -S . -B build -G "Visual Studio 17 2022" -A x64 "-DFL_SDK_DIR=$env:FL_SDK_DIR"
 
       - name: Build FormantSlide native DLL
         shell: pwsh
         run: cmake --build build --config Release --target FormantSlideNative --parallel 2
 
-      - name: Verify DLL exists
+      - name: Verify distribution files
         shell: pwsh
         run: |
-          if (-not (Test-Path 'build/Release/FormantSlide_x64.dll')) {
-            throw 'FormantSlide_x64.dll was not produced at the expected location.'
+          foreach ($file in @('build/Release/FormantSlide_x64.dll', 'build/Release/THIRD_PARTY_LICENSES.txt')) {
+            if (-not (Test-Path -LiteralPath $file)) { throw "Missing distribution file: $file" }
           }
 
-      - name: Upload native plugin
+      - name: Upload native plugin and notices
         uses: actions/upload-artifact@v4
         with:
           name: FormantSlide-FL-Native-Windows
-          path: build/Release/FormantSlide_x64.dll
+          path: |
+            build/Release/FormantSlide_x64.dll
+            build/Release/THIRD_PARTY_LICENSES.txt
           if-no-files-found: error
