@@ -164,9 +164,8 @@ void _stdcall FormantSlideNative::GetName(int section, int index, int, char* nam
     if (!name) return;
     name[0] = '\0';
     if (section == FPN_VoiceColor && index >= 0 && index < 16) {
-        if (index == 0 || index == 1) strcpy_s(name, 256, "Vocal note");
-        else if (index == kSlideColor) strcpy_s(name, 256, "Pitch slide");
-        else strcpy_s(name, 256, "Unused");
+        if (index == kSlideColor) strcpy_s(name, 256, "Pitch slide");
+        else strcpy_s(name, 256, "Vocal note");
     }
 }
 
@@ -254,7 +253,7 @@ TVoiceHandle _stdcall FormantSlideNative::TriggerVoice(PVoiceParams params, intp
     voice.note = voiceNote(double(pitch) - channelPitchCents_.load());
     voice.startPitchCents = pitch;
     voice.color = color;
-    voice.vocal = color <= 1;
+    voice.vocal = color != kSlideColor; // every color except 16 plays a vocal note
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!voice.vocal) {
