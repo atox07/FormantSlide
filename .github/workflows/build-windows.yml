@@ -5,28 +5,46 @@ on:
 
 jobs:
   build:
-    # Dedicated trusted machine with MSVC, CMake, and a PRIVATE SDK outside checkout.
-    # Do not run untrusted pull requests on this self-hosted runner.
-    runs-on: [self-hosted, Windows, X64, formantslide]
+    runs-on: windows-2022
     permissions:
       contents: read
-    env:
-      FL_SDK_DIR: ${{ vars.FL_SDK_DIR }}
     steps:
       - name: Checkout plugin source only
         uses: actions/checkout@v4
 
-      - name: Verify private local SDK
+      - name: Prepare FL Studio SDK on GitHub runner
         shell: pwsh
+        env:
+          FL_SDK_ZIP_URL: ${{ secrets.FL_SDK_ZIP_URL }}
         run: |
-          if (-not $env:FL_SDK_DIR -or -not (Test-Path -LiteralPath (Join-Path $env:FL_SDK_DIR 'fp_plugclass.h'))) {
-            throw 'Set the FL_SDK_DIR repository variable to the private SDK directory on the trusted runner, outside the checkout.'
+          $sdkPath = Join-Path $env:GITHUB_WORKSPACE 'SDK'
+          if (-not (Test-Path -LiteralPath (Join-Path $sdkPath 'fp_plugclass.h'))) {
+            if (-not $env:FL_SDK_ZIP_URL) {
+              throw 'SDK not found in checkout. Set repository secret FL_SDK_ZIP_URL to a private HTTPS ZIP containing your SDK folder (including its CMakeLists.txt). No self-hosted runner is needed.'
+            }
+            $sdkUri = $null
+            if (-not [Uri]::TryCreate($env:FL_SDK_ZIP_URL, [UriKind]::Absolute, [ref]$sdkUri) -or $sdkUri.Scheme -ne 'https') {
+              throw 'FL_SDK_ZIP_URL must be an HTTPS URL.'
+            }
+            $sdkArchive = Join-Path $env:RUNNER_TEMP 'formantslide-sdk.zip'
+            $sdkExtract = Join-Path $env:RUNNER_TEMP ('formantslide-sdk-' + [Guid]::NewGuid().ToString('N'))
+            try {
+              Invoke-WebRequest -Uri $sdkUri -OutFile $sdkArchive -ErrorAction Stop
+              Expand-Archive -LiteralPath $sdkArchive -DestinationPath $sdkExtract -ErrorAction Stop
+            } catch {
+              throw 'Unable to download/extract private SDK archive. Check the FL_SDK_ZIP_URL secret and ZIP availability.'
+            }
+            $sdkHeaders = @(Get-ChildItem -LiteralPath $sdkExtract -Filter 'fp_plugclass.h' -Recurse -File)
+            $sdkFolders = @($sdkHeaders | Where-Object { Test-Path -LiteralPath (Join-Path $_.DirectoryName 'CMakeLists.txt') })
+            if ($sdkFolders.Count -ne 1) {
+              throw 'SDK ZIP must contain exactly one SDK directory with fp_plugclass.h and CMakeLists.txt together.'
+            }
+            $sdkPath = $sdkFolders[0].DirectoryName
           }
-          $sdkPath = [IO.Path]::GetFullPath($env:FL_SDK_DIR).TrimEnd('\')
-          $checkoutPath = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
-          if ($sdkPath -eq $checkoutPath -or $sdkPath.StartsWith($checkoutPath + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'Keep the private SDK outside the checkout; checkout clean may remove ignored files.'
+          if (-not (Test-Path -LiteralPath (Join-Path $sdkPath 'CMakeLists.txt'))) {
+            throw 'SDK/CMakeLists.txt is missing.'
           }
+          "FL_SDK_DIR=$sdkPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Configure Windows native plugin
         shell: pwsh

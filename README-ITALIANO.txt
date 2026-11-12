@@ -21,16 +21,24 @@ Build Windows (x64, MSVC e CMake >= 3.24):
   cmake --fresh -S . -B build -G "Visual Studio 17 2022" -A x64 -DFL_SDK_DIR="C:/percorso/privato/SDK"
   cmake --build build --config Release --target FormantSlideNative --parallel 2
 
-L'SDK Image-Line deve restare locale. Non caricarlo su GitHub.
+Non pubblicare i sorgenti proprietari dell'SDK Image-Line su GitHub.
 .gitignore esclude SDK/ e build/ anche nelle sottocartelle, ma non rimuove
 file gia tracciati o copie nella cronologia Git: verificarle prima di pubblicare.
 Se l'SDK e gia nella cronologia, aggiungere .gitignore non basta.
 
-GitHub Actions: il workflow manuale richiede un runner Windows personale
-con etichetta formantslide, MSVC e CMake. Imposta la variabile repository
-FL_SDK_DIR sul percorso dell'SDK privato, FUORI dalla directory di checkout.
-I runner GitHub windows-2022 non hanno accesso al tuo SDK locale.
-Non eseguire codice o pull request non fidati su questo runner personale.
+GitHub Actions: il workflow manuale compila interamente sui server GitHub
+con runs-on: windows-2022. Non serve alcun runner sul proprio PC e non si
+usa la variabile repository FL_SDK_DIR.
+Se SDK/ e gia presente nel checkout, il workflow lo utilizza direttamente.
+Per un repository senza SDK, configura in Settings > Secrets and variables
+> Actions un repository secret FL_SDK_ZIP_URL con un URL HTTPS privato
+a uno ZIP dell'SDK (contenente anche il suo CMakeLists.txt).
+Il runner scarica ed estrae lo ZIP nella propria cartella temporanea.
+Non pubblicare lo ZIP: usa un collegamento con accesso limitato, valido
+per la durata della build. Il workflow non include l'SDK negli artefatti.
+Avvia Actions > Build FormantSlide FL Native (Windows) > Run workflow,
+selezionando il branch con questo workflow aggiornato.
+Le esecuzioni gia in attesa del runner personale vanno annullate e riavviate.
 
 Distribuisci build/Release/FormantSlide_x64.dll insieme a
 build/Release/THIRD_PARTY_LICENSES.txt. Chiudi FL prima di sostituire la DLL.
