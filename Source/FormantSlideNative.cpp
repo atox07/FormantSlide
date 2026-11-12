@@ -201,6 +201,16 @@ void FormantSlideNative::beginSlide(const Voice& slide, int sdkLength, double ho
     const double liveCents = current_->params->FinalLevels.Pitch;
     if (!std::isfinite(liveCents)) return;
     current_->customTarget_ = (slide.startPitchCents - liveCents) / 100.0;
+    // Slide cortissimo (~0 tick) = cambio di pitch "di colpo": niente rampa e niente
+    // smoothing del motore. Sopra questa soglia il glide resta normale.
+    constexpr double kInstantSlideMs = 10.0;
+    if (duration < sampleRate_ * kInstantSlideMs / 1000.0) {
+        current_->customPitch_ = current_->customTarget_;
+        current_->customRemaining_ = 0;
+        current_->customStep_ = 0;
+        if (current_->engine_) current_->engine_->jumpPitch();
+        return;
+    }
     current_->customRemaining_ = frames;
     current_->customStep_ = (current_->customTarget_ - current_->customPitch_) / double(frames);
 }
