@@ -6,6 +6,7 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr double kTwoPi = 2.0 * kPi;
 
 int pickSize(double rate) {
+    // ~46 ms window: good frequency resolution for voices, same at every host rate
     if (rate <= 50000.0) return 2048;
     if (rate <= 100000.0) return 4096;
     return 8192;
@@ -23,7 +24,7 @@ StftVoice::StftVoice(std::shared_ptr<const WaveData> data, int first, int last, 
     cepster.quefrency(kQuefrency);
     smoothCoef = 1.0 - std::exp(-1.0 / (kSmoothMs * 0.001 * rate));
     fadeStep = float(1.0 / (kFadeMs * 0.001 * rate));
-    outNorm = float(H / (0.375 * N));
+    outNorm = float(H / (0.375 * N));       // Hann^2 overlap-add gain
 
     window.resize(size_t(N));
     for (int i = 0; i < N; ++i)
@@ -43,10 +44,12 @@ StftVoice::StftVoice(std::shared_ptr<const WaveData> data, int first, int last, 
     for (auto& c : chan) {
         c.overlap.assign(size_t(N), 0.f);
         c.prevPhase.assign(size_t(K), 0.f);
-        c.envSmooth.assign(size_t(K), 0.f);
+        c.envSmooth.assign(size_t(K), 0.f);   // [FIX FORMANT]
         c.tracks.reserve(size_t(K));
     }
 
+    // Mono files (L == R) are processed once and copied: half the CPU,
+    // and no chance of the two channels drifting apart.
     mono = true;
     const auto& s = wav->stereo;
     for (int i = std::max(0, first); i < std::min(last, wav->frames()); ++i)
@@ -64,6 +67,8 @@ void StftVoice::resetState() {
     cursor = 0;
 }
 
+// Catmull-Rom interpolation: much cleaner than linear when the WAV rate
+// differs from the host rate (linear interpolation adds high-frequency hiss).
 float StftVoice::read(double where, int ch) const {
     if (where < begin || where >= end) return 0;
     const float* s = wav->stereo.data();
@@ -78,8 +83,9 @@ float StftVoice::read(double where, int ch) const {
     return ((c3 * f + c2) * f + c1) * f + y1;
 }
 
+// bins (analysis) -> spec (synthesis), pitch factor `alpha`, formants kept in place.
 void StftVoice::shift(Channel& c, double alpha) {
-    const double omega = kTwoPi * H / N;
+    const double omega = kTwoPi * H / N;   // phase advance per hop of bin 1
 
     float maxMag = 0.f;
     for (int k = 0; k < K; ++k) {
@@ -88,6 +94,7 @@ void StftVoice::shift(Channel& c, double alpha) {
         maxMag = std::max(maxMag, mag[size_t(k)]);
     }
 
+    // Instantaneous frequency of every bin (in bins) from the phase advance.
     for (int k = 0; k < K; ++k) {
         double f = k;
         if (c.havePrev) {
@@ -102,6 +109,7 @@ void StftVoice::shift(Channel& c, double alpha) {
     std::fill(spec.begin(), spec.end(), std::complex<float>{});
     if (maxMag < 1e-9f) { c.tracks.clear(); return; }
 
+    // ---- spectral peaks (at least 4 bins apart: Hann side lobes are not peaks)
     const float thr = maxMag * kPeakFloor;
     peakBin.clear();
     for (int k = 2; k < K - 2; ++k) {
@@ -121,6 +129,7 @@ void StftVoice::shift(Channel& c, double alpha) {
         peakBin.push_back(best);
     }
 
+    // ---- region of influence of every peak: split at the valley between peaks
     const int n = int(peakBin.size());
     regionLo.assign(size_t(n), 1);
     regionHi.assign(size_t(n), K - 2);
@@ -146,28 +155,30 @@ void StftVoice::shift(Channel& c, double alpha) {
         env[size_t(k)] = std::exp(c.envSmooth[size_t(k)]);
     }
 
+    // ---- move every region, keep one continuous phase track per peak
     std::fill(synMag.begin(), synMag.end(), 0.f);
     newTracks.clear();
     size_t t = 0;
     for (int i = 0; i < n; ++i) {
         const int kp = peakBin[size_t(i)];
         const double fp = std::clamp(double(freqBin[size_t(kp)]), kp - 1.5, kp + 1.5);
-        const double fn = alpha * fp;
-        if (fn >= K - 2) break;
+        const double fn = alpha * fp;                       // true new frequency (bins)
+        if (fn >= K - 2) break;                              // above Nyquist: peaks are sorted
 
-        // [FIX SCRATCH] Fractional bin placement. During a slide, alpha changes
-        // smoothly; using an integer delta made the whole peak region jump by
-        // 1 bin at a time and rotated the phase by 180 degrees at each crossing
-        // (audible as a "scratch"). Spreading the peak over two bins with
-        // linear weights and using the fractional bin in the phase reference
-        // removes both discontinuities.
+        // [FIX SCRATCH + GHOST] Fractional destination bin, but the phase
+        // correction (-1)^k term must use INTEGER destination bins. Mixing
+        // a fractional delta into the phase rotation adds a spurious pi/2
+        // and produces a ghost harmonic while gliding. Splitting the energy
+        // over the two adjacent INTEGER bins (fracLo / fracHi) keeps the
+        // glide continuous without introducing spurious harmonics.
         const double deltaExact = (alpha - 1.0) * fp;
         const int    deltaLo    = int(std::floor(deltaExact));
         const int    deltaHi    = deltaLo + 1;
         const float  fracHi     = float(deltaExact - deltaLo);
         const float  fracLo     = 1.f - fracHi;
-        const double knExact    = kp + deltaExact;
 
+        // Phase of the sinusoid at the CENTRE of the window (the bin phase carries
+        // a (-1)^k term that would otherwise break continuity when kn changes).
         const double centreAna = double(ph[size_t(kp)]) + kPi * kp;
         double centreSyn = centreAna;
         if (c.havePrev && !c.tracks.empty()) {
@@ -181,24 +192,27 @@ void StftVoice::shift(Channel& c, double alpha) {
         centreSyn = wrapPhase(centreSyn);
         newTracks.push_back({float(fp), float(centreSyn)});
 
-        // Fractional kn in the (-1)^k correction: continuous across bin
-        // boundaries, so no 180-degree phase flip while gliding.
-        const double theta = centreSyn - double(ph[size_t(kp)]) - kPi * knExact;
-        const std::complex<float> rot(float(std::cos(theta)), float(std::sin(theta)));
+        // Two integer phase references. Since kkHi == kkLo + 1, thetaHi == thetaLo - pi,
+        // which is the natural phase relation between adjacent FFT bins.
+        const double thetaBase = centreSyn - double(ph[size_t(kp)]);
+        const double thetaLo   = thetaBase - kPi * (kp + deltaLo);
+        const double thetaHi   = thetaBase - kPi * (kp + deltaHi);
+        const std::complex<float> rotLo(float(std::cos(thetaLo)), float(std::sin(thetaLo)));
+        const std::complex<float> rotHi(float(std::cos(thetaHi)), float(std::sin(thetaHi)));
 
         for (int k = regionLo[size_t(i)]; k <= regionHi[size_t(i)]; ++k) {
             const int kkLo = k + deltaLo;
             const int kkHi = k + deltaHi;
-            const std::complex<float> base = bins[size_t(k)] * rot;
+            const std::complex<float> base = bins[size_t(k)];
             if (fracLo > 0.f && kkLo >= 1 && kkLo <= K - 2) {
                 const float g = std::clamp(env[size_t(kkLo)] / env[size_t(k)], 0.f, kMaxGain);
-                const std::complex<float> v = base * g * fracLo;
+                const std::complex<float> v = base * rotLo * g * fracLo;
                 const float m2 = std::norm(v);
                 if (m2 > synMag[size_t(kkLo)]) { spec[size_t(kkLo)] = v; synMag[size_t(kkLo)] = m2; }
             }
             if (fracHi > 0.f && kkHi >= 1 && kkHi <= K - 2) {
                 const float g = std::clamp(env[size_t(kkHi)] / env[size_t(k)], 0.f, kMaxGain);
-                const std::complex<float> v = base * g * fracHi;
+                const std::complex<float> v = base * rotHi * g * fracHi;
                 const float m2 = std::norm(v);
                 if (m2 > synMag[size_t(kkHi)]) { spec[size_t(kkHi)] = v; synMag[size_t(kkHi)] = m2; }
             }
@@ -232,6 +246,7 @@ int StftVoice::render(float* left, float* right, int count, double scale) {
     const int channels = mono ? 1 : 2;
 
     for (int i = 0; i < frames; ++i, ++position) {
+        // pitch factor glides smoothly between the (stepwise) values of the host
         smoothLog += (target - smoothLog) * smoothCoef;
         if (target == 0.0 && std::abs(smoothLog) < 1e-4) smoothLog = 0.0;
         const bool shifted = std::abs(smoothLog) > 1e-5;
@@ -242,7 +257,7 @@ int StftVoice::render(float* left, float* right, int count, double scale) {
             for (int offset = -N + H; offset <= 0; offset += H) frame(position + offset, factor);
             active = true;
             cursor = 0;
-            wet = position == 0 ? 1.f : 0.f;
+            wet = position == 0 ? 1.f : 0.f;   // note starts shifted: no dry attack
         }
         if (active && cursor == H) {
             for (int ch = 0; ch < channels; ++ch) {
@@ -270,6 +285,7 @@ int StftVoice::render(float* left, float* right, int count, double scale) {
         left[i] = dl * (1.f - wet) + wl * wet;
         right[i] = dr * (1.f - wet) + wr * wet;
 
+        // back to the original pitch and fully faded: stop spending CPU
         if (active && !shifted && wet == 0.f) { active = false; }
     }
     return frames;
