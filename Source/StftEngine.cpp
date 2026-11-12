@@ -277,8 +277,8 @@ void StftVoice::shift(Band& b, Channel& c, int channelIndex,
     // was equivalent to ~230 ms smoothing on the long band during slides,
     // lagging vowels and making them sound dark/"closed" near +1 octave.
     // Use an actual 26 ms time constant, and re-acquire transients quickly.
-    const float envCoef = onset ? 0.80f : float(1.0 - std::exp(
-        -double(b.H) / (0.026 * b.rate)));
+    const double envTau = b.high ? 0.026 : 0.226;   // 26 ms high, 226 ms low
+    const float envCoef = onset ? 0.80f : float(1.0 - std::exp(-double(b.H) / (envTau * b.rate)));
     for (int k = 0; k < b.K; ++k)
         b.env[size_t(k)] = std::max(b.mag[size_t(k)], 1e-9f);
     b.cepster.lifter(b.env);
@@ -498,7 +498,7 @@ void StftVoice::shift(Band& b, Channel& c, int channelIndex,
                     saturate(float((targetHz - 4700.0) / 2350.0));
                 const float gain = std::exp(std::clamp(logGain,
                     std::log(b.high ? highFloor : 0.62f),
-                    b.high ? std::log(1.65f) : std::log(3.50f)));
+                    b.high ? std::log(2.40f) : std::log(6.00f)));
                 b.spec[size_t(dst)] += base * rotation[tap] * (gain * weight);
                 b.overlapWeights[size_t(dst)] += tonal * weight;
             }
