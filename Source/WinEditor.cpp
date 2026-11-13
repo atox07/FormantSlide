@@ -1,5 +1,6 @@
 #include "WinEditor.h"
 #include "FormantSlideNative.h"
+#include "StftDevParams.h"
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <algorithm>
 #include <cmath>
@@ -266,7 +267,7 @@ public:
                         return t.retainCharacters("0123456789.,-").replaceCharacter(',', '.').getDoubleValue() / 100.0;
                     };
                 }
-                s.onValueChange = [this] { pushSettings(); };
+                s.onValueChange = [this] { pushGuard(); };
             }
         }
 
@@ -551,9 +552,12 @@ private:
         sliceMode_.setSelectedId(s.equalSlices ? 2 : 1, juce::dontSendNotification);
         count_.setValue(s.sliceCount, juce::dontSendNotification);
         pitch_.setValue(s.pitchCents / 100.0, juce::dontSendNotification);
-        guardSlider_[0].setValue(s.formantGuard, juce::dontSendNotification);
-        guardSlider_[1].setValue(s.highNoteLimitHz, juce::dontSendNotification);
-        guardSlider_[2].setValue(s.highNoteRelaxMax, juce::dontSendNotification);
+        {
+            auto& dp = StftDevParams::instance();
+            guardSlider_[0].setValue(dp.formantGuard.load(), juce::dontSendNotification);
+            guardSlider_[1].setValue(dp.highNoteLimitHz.load(), juce::dontSendNotification);
+            guardSlider_[2].setValue(dp.highNoteRelaxMax.load(), juce::dontSendNotification);
+        }
         root_.setValue(s.firstNote, juce::dontSendNotification);
         rootNote_ = s.firstNote;
         updatingControls_ = false;
@@ -567,14 +571,20 @@ private:
         settings.equalSlices = sliceMode_.getSelectedId() == 2;
         settings.sliceCount = int(std::lround(count_.getValue()));
         settings.pitchCents = int(std::lround(pitch_.getValue() * 100.0));
-        settings.formantGuard = float(guardSlider_[0].getValue());
-        settings.highNoteLimitHz = float(guardSlider_[1].getValue());
-        settings.highNoteRelaxMax = float(guardSlider_[2].getValue());
         settings.firstNote = int(std::lround(root_.getValue()));
         plugin_.updateSettings(settings);
         selectedSlice_ = -1;
         refreshStatus();
         repaint();
+    }
+
+    // I 3 slider FORMANT RELEASE vanno direttamente al motore (StftDevParams).
+    void pushGuard() {
+        if (updatingControls_) return;
+        auto& dp = StftDevParams::instance();
+        dp.formantGuard.store(float(guardSlider_[0].getValue()));
+        dp.highNoteLimitHz.store(float(guardSlider_[1].getValue()));
+        dp.highNoteRelaxMax.store(float(guardSlider_[2].getValue()));
     }
 
     void refreshFilePreview() {

@@ -14,6 +14,10 @@ struct StftDevParams {
     std::atomic<int>      fftHigh        {4096};
     std::atomic<double>   crossLowHz     {2200.0};
     std::atomic<double>   crossHighHz    {2800.0};
+    // Slider della GUI "FORMANT RELEASE" (scritti dall'editor, letti dal render).
+    std::atomic<float>    formantGuard     {1.0f};     // 0..2
+    std::atomic<float>    highNoteLimitHz  {2000.0f};  // 500..4000
+    std::atomic<float>    highNoteRelaxMax {0.75f};    // 0..1
     std::atomic<unsigned> version        {1};   // +1 a ogni modifica
 
     static StftDevParams& instance() {

@@ -1,4 +1,5 @@
 #include "FormantSlideNative.h"
+#include "StftDevParams.h"
 #include "WinEditor.h"
 #include <algorithm>
 #include <cmath>
@@ -285,9 +286,12 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
     // (1.0 = il formante segue il knob per intero; 0.5 = meta', 0 = knob solo pitch)
     constexpr double kKnobFormantAmount = 1.0;
     voice.engine_->setFormantScale(std::exp2(kKnobFormantAmount * settings_.pitchCents / 1200.0));
-    voice.engine_->setFormantGuard(settings_.formantGuard);
-    voice.engine_->setHighNoteLimit(settings_.highNoteLimitHz);
-    voice.engine_->setHighNoteRelaxMax(settings_.highNoteRelaxMax);
+    {
+        auto& dp = StftDevParams::instance();
+        voice.engine_->setFormantGuard(dp.formantGuard.load());
+        voice.engine_->setHighNoteLimit(dp.highNoteLimitHz.load());
+        voice.engine_->setHighNoteRelaxMax(dp.highNoteRelaxMax.load());
+    }
     const double nextHostSlide = std::isfinite(voice.params->FinalLevels.Pitch)
         ? (double(voice.params->FinalLevels.Pitch) - voice.startPitchCents) / 100.0 : 0.0;
     const double hostStart = voice.previousHostSlide_;
@@ -390,12 +394,6 @@ void FormantSlideNative::updateSettings(const Settings& input) {
     settings_.sliceCount = std::clamp(settings_.sliceCount, 1, 64);
     settings_.firstNote = std::clamp(settings_.firstNote, 0, 127);
     settings_.fallbackGlideMs = std::clamp(settings_.fallbackGlideMs, 1, 10000);
-    settings_.formantGuard = std::isfinite(settings_.formantGuard)
-        ? std::clamp(settings_.formantGuard, 0.0f, 2.0f) : 1.0f;
-    settings_.highNoteLimitHz = std::isfinite(settings_.highNoteLimitHz)
-        ? std::clamp(settings_.highNoteLimitHz, 500.0f, 4000.0f) : 2000.0f;
-    settings_.highNoteRelaxMax = std::isfinite(settings_.highNoteRelaxMax)
-        ? std::clamp(settings_.highNoteRelaxMax, 0.0f, 1.0f) : 0.75f;
     // Do not rebuild/silence a playing sample just because glide or pitch
     // calibration has been adjusted with a slider.
     if (settings_.equalSlices != previous.equalSlices || settings_.sliceCount != previous.sliceCount) {
@@ -484,9 +482,9 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
             }
         }
         SavedFormantGuard guardBlock;
-        guardBlock.guard = settings_.formantGuard;
-        guardBlock.limitHz = settings_.highNoteLimitHz;
-        guardBlock.relaxMax = settings_.highNoteRelaxMax;
+        guardBlock.guard = StftDevParams::instance().formantGuard.load();
+        guardBlock.limitHz = StftDevParams::instance().highNoteLimitHz.load();
+        guardBlock.relaxMax = StftDevParams::instance().highNoteRelaxMax.load();
         stream->Write(&guardBlock, sizeof(guardBlock), nullptr);
     } else {
         ULONG read = 0;
@@ -538,12 +536,13 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         ULONG guardRead = 0;
         if (SUCCEEDED(stream->Read(&guardBlock, sizeof(guardBlock), &guardRead)) &&
             guardRead == sizeof(guardBlock) && guardBlock.magic == 0x46474431) {
-            Settings current;
-            { std::lock_guard<std::mutex> lock(mutex_); current = settings_; }
-            current.formantGuard = guardBlock.guard;
-            current.highNoteLimitHz = guardBlock.limitHz;
-            current.highNoteRelaxMax = guardBlock.relaxMax;
-            updateSettings(current);
+            auto& dp = StftDevParams::instance();
+            if (std::isfinite(guardBlock.guard))
+                dp.formantGuard.store(std::clamp(guardBlock.guard, 0.0f, 2.0f));
+            if (std::isfinite(guardBlock.limitHz))
+                dp.highNoteLimitHz.store(std::clamp(guardBlock.limitHz, 500.0f, 4000.0f));
+            if (std::isfinite(guardBlock.relaxMax))
+                dp.highNoteRelaxMax.store(std::clamp(guardBlock.relaxMax, 0.0f, 1.0f));
         }
     }
 }
