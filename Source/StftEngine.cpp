@@ -18,6 +18,11 @@ int pickSize(double rate, int base) {
     return n;
 }
 
+double smooth01(double x) {
+    x = std::clamp(x, 0.0, 1.0);
+    return x * x * (3.0 - 2.0 * x);
+}
+
 double wrapPhase(double p) {
     return p - kTwoPi * std::floor(p / kTwoPi + 0.5);
 }
@@ -159,6 +164,8 @@ void StftVoice::resetState() {
             c.prevFluxEnergy = 0.f;
             c.fluxBaseline = 0.f;
             c.transientHold = 0;
+            c.f0Hz = 0.f;
+            c.relax = 0.f;
             c.havePrev = false;
         }
     };
@@ -244,6 +251,8 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
         c.havePrev = false;
         c.fluxBaseline = 0.f;
         c.prevAlpha = alpha;
+        c.f0Hz = 0.f;
+        c.relax = 0.f;
         return;
     }
 
@@ -304,6 +313,37 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
         c.envSmooth[ix] = std::clamp(sm, -80.f, 80.f);
         b.env[ix] = std::exp(c.envSmooth[ix]);
     }
+
+    // --- Rilascio progressivo della preservazione formanti -------------------
+    // La banda bassa stima la f0 sorgente (primo picco forte sopra 90 Hz); la banda
+    // alta usa quella stima, perche' li' i picchi sono armoniche, non la f0.
+    const int chIx = int(&c - b.channels.data());
+    if (!b.high) {
+        const int kMin = std::max(2, int(std::ceil(90.0 * b.N / b.rate)));
+        for (int i = 0; i < peakCount; ++i) {
+            const int kp = b.peakBin[size_t(i)];
+            if (kp < kMin || b.mag[size_t(kp)] < 0.2f * maxMag) continue;
+            const float f0 = float(double(b.freqBin[size_t(kp)]) * b.rate / b.N);
+            c.f0Hz = c.f0Hz > 0.f ? 0.7f * c.f0Hz + 0.3f * f0 : f0;
+            break;
+        }
+    }
+    {
+        auto& dp = StftDevParams::instance();
+        const double sStart = dp.relaxShiftStart.load(), sEnd = dp.relaxShiftEnd.load();
+        const double hStart = dp.relaxHzStart.load(),    hEnd = dp.relaxHzEnd.load();
+        const double rMax   = dp.relaxMax.load();
+        const double st = 12.0 * std::log2(std::max(alpha, 1e-3));
+        const double outHz = double(lowBand.channels[size_t(chIx)].f0Hz) * alpha;
+        const double sShift = smooth01((st - sStart) / std::max(sEnd - sStart, 1e-3));
+        const double sHz = smooth01((outHz - hStart) / std::max(hEnd - hStart, 1e-3));
+        const float target = std::isfinite(rMax)
+            ? float(std::clamp(rMax, 0.0, 0.95) * std::max(sShift, sHz)) : 0.f;
+        c.relax += (target - c.relax) * 0.25f; // niente scatti da un frame all'altro
+        if (c.relax < 1e-4f) c.relax = 0.f;
+    }
+    const bool relaxOn = c.relax > 0.f;
+    const float keep = 1.f - c.relax; // esponente: 1 = preservazione piena
 
     const float beta = float(std::clamp(
         formantScaleSmoothed_, 1.0 / 64.0, 64.0));
@@ -387,14 +427,16 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
             const int d1 = k + neighbour;
             if (primaryWeight > 0.f && d0 >= 1 && d0 < b.K - 1) {
                 const float targetEnvelope = sampleEnv(float(d0) / beta);
-                const float gain = std::clamp(
+                float gain = std::clamp(
                     targetEnvelope / originalEnvelope, 0.f, kMaxGain);
+                if (relaxOn) gain = std::pow(gain, keep);
                 b.spec[size_t(d0)] += base * rot0 * (gain * primaryWeight);
             }
             if (neighbourWeight > 0.f && d1 >= 1 && d1 < b.K - 1) {
                 const float targetEnvelope = sampleEnv(float(d1) / beta);
-                const float gain = std::clamp(
+                float gain = std::clamp(
                     targetEnvelope / originalEnvelope, 0.f, kMaxGain);
+                if (relaxOn) gain = std::pow(gain, keep);
                 b.spec[size_t(d1)] += base * rot1 * (gain * neighbourWeight);
             }
         }
