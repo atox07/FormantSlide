@@ -27,6 +27,8 @@ private:
     static constexpr double kFadeMs             = 8.0;
     float kMaxGain            = 9.118f;
     static constexpr float  kPeakFloor          = 1e-4f;
+
+    // Rilascio progressivo formanti: parametri in StftDevParams (relax*), letti live.
     float kEnvSmoothCoef      = 0.3f;
     float kEnvSmoothCoefSlide = 0.566f;
 
@@ -46,6 +48,8 @@ private:
         float prevFluxEnergy = 0.f;
         float fluxBaseline = 0.f;
         int transientHold = 0;
+        float f0Hz = 0.f;   // stima grezza della f0 sorgente (solo banda bassa)
+        float relax = 0.f;  // rilascio formanti corrente, 0..kRelaxMax
         bool havePrev = false;
     };
 
