@@ -144,6 +144,16 @@ void StftVoice::syncDevParams() {
 
 void StftVoice::jumpPitch() { snapPending_ = true; }
 
+void StftVoice::setFormantGuard(float guard) {
+    if (std::isfinite(guard)) formantGuard_ = std::clamp(guard, 0.f, 2.f);
+}
+void StftVoice::setHighNoteLimit(float hz) {
+    if (std::isfinite(hz)) highNoteLimitHz_ = std::max(hz, 100.f);
+}
+void StftVoice::setHighNoteRelaxMax(float relaxMax) {
+    if (std::isfinite(relaxMax)) highNoteRelaxMax_ = std::clamp(relaxMax, 0.f, 1.f);
+}
+
 void StftVoice::setFormantScale(double scale) {
     formantScaleTarget_ = std::isfinite(scale)
         ? std::clamp(scale, 1.0 / 64.0, 64.0) : 1.0;
@@ -330,17 +340,28 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
     }
     {
         using R = StftRelax;
-        const double st = 12.0 * std::log2(std::max(alpha, 1e-3));
-        const double outHz = double(lowBand.channels[size_t(chIx)].f0Hz) * alpha;
-        // Quanto e' "alta" la nota: shift totale oppure altezza assoluta in uscita.
-        const double onset = std::max(
-            smooth01((st - R::kShiftOn0) / (R::kShiftOn1 - R::kShiftOn0)),
-            smooth01((outHz - R::kHzOn0) / (R::kHzOn1 - R::kHzOn0)));
-        const double extreme = std::max(
-            smooth01((st - R::kShiftX0) / (R::kShiftX1 - R::kShiftX0)),
-            smooth01((outHz - R::kHzX0) / (R::kHzX1 - R::kHzX0)));
-        const double cap = R::kLow + (R::kHigh - R::kLow) * extreme;
-        const float target = float(cap * onset);
+        const double inHz = double(lowBand.channels[size_t(chIx)].f0Hz);
+        const double outHz = inHz * alpha;
+        // Frequenza piu' alta tra ingresso e uscita (per gestire campioni gia' acuti)
+        const double dangerHz = std::max(inHz, outHz);
+
+        // Shift assoluto (vale sia per slide in alto che in basso)
+        const double signedShift = 12.0 * std::log2(std::max(alpha, 1e-3));
+        const double absShift = std::abs(signedShift);
+        const double onsetShift = smooth01((absShift - R::kShiftOn0) / (R::kShiftOn1 - R::kShiftOn0));
+
+        double cap = R::kLow; // rilascio base
+        if (dangerHz >= highNoteLimitHz_) {
+            // Oltre la soglia: rilascio massimo scelto dall'utente
+            cap = highNoteRelaxMax_;
+        } else {
+            // Transizione graduale avvicinandosi alla soglia
+            const double t = smooth01((dangerHz - highNoteLimitHz_ * 0.8) / (highNoteLimitHz_ * 0.2));
+            cap = R::kLow + (highNoteRelaxMax_ - R::kLow) * t;
+        }
+
+        // Il target finale combina cap, shift e moltiplicatore globale
+        const float target = std::clamp(float(cap * onsetShift * formantGuard_), 0.0f, 1.0f);
         c.relax += (target - c.relax) * 0.25f; // niente scatti da un frame all'altro
         if (c.relax < 1e-4f) c.relax = 0.f;
     }

@@ -19,6 +19,9 @@ public:
     int render(float* left, float* right, int count, double scale);
     void setDevParams(float envSmooth, float envSmoothSlide, float maxGain, double quefrency);
     void jumpPitch();                   // salta subito al pitch richiesto, senza lo smoothing da 6 ms
+    void setFormantGuard(float guard);          // moltiplicatore globale del rilascio (0..2)
+    void setHighNoteLimit(float hz);            // soglia di pericolo in Hz
+    void setHighNoteRelaxMax(float relaxMax);   // rilascio massimo oltre la soglia (0..1)
     void setFormantScale(double scale); // 1.0 = preserve; 2.0 = +12 semitones
 
 private:
@@ -111,6 +114,9 @@ private:
     bool smoothInit = false;
     float wet = 0.f;
 
+    float formantGuard_     = 1.0f;
+    float highNoteLimitHz_  = 2000.0f;
+    float highNoteRelaxMax_ = 0.75f;
     bool snapPending_ = false;
     bool formantInit_ = false; // la prima volta niente glide verso il formante del knob
     double formantScaleTarget_ = 1.0;

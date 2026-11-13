@@ -8,7 +8,7 @@
 
 namespace {
 constexpr int editorWidth = 680;
-constexpr int editorHeight = 384;
+constexpr int editorHeight = 490;
 
 // ---------------------------------------------------------------------------
 // Palette (FL-like: charcoal greys + orange accent). Tweak here to retune
@@ -199,6 +199,7 @@ public:
         addAndMakeVisible(count_);
         addAndMakeVisible(root_);
         addAndMakeVisible(pitchLabel_);
+        for (int i = 0; i < 3; ++i) { addAndMakeVisible(guardLabel_[i]); addAndMakeVisible(guardSlider_[i]); }
         addAndMakeVisible(pitch_);
 
         for (auto* label : { &wavLabel_, &sliceModeLabel_, &countLabel_, &rootLabel_,
@@ -242,6 +243,33 @@ public:
         count_.onValueChange = [this] { pushSettings(); };
         root_.onValueChange = [this] { pushSettings(); };
 
+        {
+            struct Def { const char* name; double lo, hi, step, reset; bool hz; };
+            const Def defs[3] = {
+                {"Formant Guard",   0.0,   2.0,    0.01, 1.0,    false},
+                {"High Note Limit", 500.0, 4000.0, 1.0,  2000.0, true},
+                {"High Note Relax", 0.0,   1.0,    0.01, 0.75,   false},
+            };
+            for (int i = 0; i < 3; ++i) {
+                setLabel(guardLabel_[i], defs[i].name);
+                guardLabel_[i].setColour(juce::Label::textColourId, ui::dim);
+                auto& s = guardSlider_[i];
+                s.setSliderStyle(juce::Slider::LinearHorizontal);
+                s.setTextBoxStyle(juce::Slider::TextBoxRight, false, 70, 22);
+                s.setRange(defs[i].lo, defs[i].hi, defs[i].step);
+                s.setDoubleClickReturnValue(true, defs[i].reset);
+                if (defs[i].hz) {
+                    s.setTextValueSuffix(" Hz");
+                } else {
+                    s.textFromValueFunction = [](double v) { return juce::String(juce::roundToInt(v * 100.0)) + " %"; };
+                    s.valueFromTextFunction = [](const juce::String& t) {
+                        return t.retainCharacters("0123456789.,-").replaceCharacter(',', '.').getDoubleValue() / 100.0;
+                    };
+                }
+                s.onValueChange = [this] { pushSettings(); };
+            }
+        }
+
         pullSettings();
         refreshFilePreview();
         const auto saved = plugin_.display();
@@ -264,6 +292,7 @@ public:
 
         drawPanel(g, panelSlicer_, "SLICER");
         drawPanel(g, panelPitch_, nullptr); // its header is pitchLabel_
+        drawPanel(g, panelGuard_, "FORMANT RELEASE");
 
         // Waveform well / drop zone.
         const auto waveF = waveBounds_.toFloat();
@@ -363,7 +392,15 @@ public:
         pitchLabel_.setBounds(panelPitch_.getX() + 12, py + 5, panelPitch_.getWidth() - 24, 16);
         pitch_.setBounds(panelPitch_.getX() + (panelPitch_.getWidth() - 80) / 2, py + 22, 80, 94);
 
-        warningLabel_.setBounds(m, py + ph + 6, w - 2 * m, 20);
+        // FORMANT RELEASE: 3 slider sotto i pannelli.
+        panelGuard_ = {m, py + ph + 8, w - 2 * m, 96};
+        for (int i = 0; i < 3; ++i) {
+            const int ry = panelGuard_.getY() + 24 + i * 23;
+            guardLabel_[i].setBounds(panelGuard_.getX() + 12, ry, 124, 22);
+            guardSlider_[i].setBounds(panelGuard_.getX() + 136, ry, panelGuard_.getWidth() - 136 - 12, 22);
+        }
+
+        warningLabel_.setBounds(m, panelGuard_.getBottom() + 6, w - 2 * m, 20);
     }
 
     void mouseDown(const juce::MouseEvent& event) override {
@@ -468,7 +505,9 @@ private:
     juce::AudioThumbnailCache cache_{5};
     juce::AudioThumbnail thumbnail_;
     juce::Rectangle<int> waveBounds_;
-    juce::Rectangle<int> panelSlicer_, panelPitch_;
+    juce::Rectangle<int> panelSlicer_, panelPitch_, panelGuard_;
+    juce::Label guardLabel_[3];
+    juce::Slider guardSlider_[3];
     double viewStart_ = 0, viewSpan_ = 1;
     std::vector<int> active_;
     int rootNote_ = 60;        // cached copy of the first-slice note, so paint() never takes the plugin lock
@@ -512,6 +551,9 @@ private:
         sliceMode_.setSelectedId(s.equalSlices ? 2 : 1, juce::dontSendNotification);
         count_.setValue(s.sliceCount, juce::dontSendNotification);
         pitch_.setValue(s.pitchCents / 100.0, juce::dontSendNotification);
+        guardSlider_[0].setValue(s.formantGuard, juce::dontSendNotification);
+        guardSlider_[1].setValue(s.highNoteLimitHz, juce::dontSendNotification);
+        guardSlider_[2].setValue(s.highNoteRelaxMax, juce::dontSendNotification);
         root_.setValue(s.firstNote, juce::dontSendNotification);
         rootNote_ = s.firstNote;
         updatingControls_ = false;
@@ -525,6 +567,9 @@ private:
         settings.equalSlices = sliceMode_.getSelectedId() == 2;
         settings.sliceCount = int(std::lround(count_.getValue()));
         settings.pitchCents = int(std::lround(pitch_.getValue() * 100.0));
+        settings.formantGuard = float(guardSlider_[0].getValue());
+        settings.highNoteLimitHz = float(guardSlider_[1].getValue());
+        settings.highNoteRelaxMax = float(guardSlider_[2].getValue());
         settings.firstNote = int(std::lround(root_.getValue()));
         plugin_.updateSettings(settings);
         selectedSlice_ = -1;
