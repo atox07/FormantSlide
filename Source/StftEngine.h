@@ -28,7 +28,7 @@ private:
     float kMaxGain            = 9.118f;
     static constexpr float  kPeakFloor          = 1e-4f;
 
-    // Rilascio progressivo formanti: parametri in StftDevParams (relax*), letti live.
+    // Rilascio progressivo formanti: costanti in StftRelax (StftDevParams.h).
     float kEnvSmoothCoef      = 0.3f;
     float kEnvSmoothCoefSlide = 0.566f;
 

@@ -329,16 +329,18 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
         }
     }
     {
-        auto& dp = StftDevParams::instance();
-        const double sStart = dp.relaxShiftStart.load(), sEnd = dp.relaxShiftEnd.load();
-        const double hStart = dp.relaxHzStart.load(),    hEnd = dp.relaxHzEnd.load();
-        const double rMax   = dp.relaxMax.load();
+        using R = StftRelax;
         const double st = 12.0 * std::log2(std::max(alpha, 1e-3));
         const double outHz = double(lowBand.channels[size_t(chIx)].f0Hz) * alpha;
-        const double sShift = smooth01((st - sStart) / std::max(sEnd - sStart, 1e-3));
-        const double sHz = smooth01((outHz - hStart) / std::max(hEnd - hStart, 1e-3));
-        const float target = std::isfinite(rMax)
-            ? float(std::clamp(rMax, 0.0, 0.95) * std::max(sShift, sHz)) : 0.f;
+        // Quanto e' "alta" la nota: shift totale oppure altezza assoluta in uscita.
+        const double onset = std::max(
+            smooth01((st - R::kShiftOn0) / (R::kShiftOn1 - R::kShiftOn0)),
+            smooth01((outHz - R::kHzOn0) / (R::kHzOn1 - R::kHzOn0)));
+        const double extreme = std::max(
+            smooth01((st - R::kShiftX0) / (R::kShiftX1 - R::kShiftX0)),
+            smooth01((outHz - R::kHzX0) / (R::kHzX1 - R::kHzX0)));
+        const double cap = R::kLow + (R::kHigh - R::kLow) * extreme;
+        const float target = float(cap * onset);
         c.relax += (target - c.relax) * 0.25f; // niente scatti da un frame all'altro
         if (c.relax < 1e-4f) c.relax = 0.f;
     }
