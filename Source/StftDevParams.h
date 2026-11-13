@@ -30,7 +30,5 @@ struct StftDevParams {
 // Soglia in Hz e rilascio massimo oltre soglia arrivano dagli slider della GUI
 // (Settings -> StftVoice::setHighNoteLimit / setHighNoteRelaxMax).
 struct StftRelax {
-    static constexpr double kLow      = 0.10;  // rilascio base sotto la soglia di pericolo
-    static constexpr double kShiftOn0 = 6.0;   // |shift| in semitoni: inizio rilascio
-    static constexpr double kShiftOn1 = 12.0;  // |shift| in semitoni: rilascio pieno
+    static constexpr double kLow      = 0.10;  // rilascio base prima della progressione verso la soglia
 };

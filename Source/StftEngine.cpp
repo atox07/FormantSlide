@@ -18,11 +18,6 @@ int pickSize(double rate, int base) {
     return n;
 }
 
-double smooth01(double x) {
-    x = std::clamp(x, 0.0, 1.0);
-    return x * x * (3.0 - 2.0 * x);
-}
-
 double wrapPhase(double p) {
     return p - kTwoPi * std::floor(p / kTwoPi + 0.5);
 }
@@ -345,31 +340,21 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
         // Frequenza piu' alta tra ingresso e uscita (per gestire campioni gia' acuti)
         const double dangerHz = std::max(inHz, outHz);
 
-        // Shift assoluto (vale sia per slide in alto che in basso)
-        const double signedShift = 12.0 * std::log2(std::max(alpha, 1e-3));
-        const double absShift = std::abs(signedShift);
-        const double onsetShift = smooth01((absShift - R::kShiftOn0) / (R::kShiftOn1 - R::kShiftOn0));
-
-        double cap = R::kLow; // rilascio base
-        if (dangerHz >= highNoteLimitHz_) {
-            // Oltre la soglia: rilascio massimo scelto dall'utente
-            cap = highNoteRelaxMax_;
-        } else {
-            // Transizione graduale avvicinandosi alla soglia
-            const double t = smooth01((dangerHz - highNoteLimitHz_ * 0.8) / (highNoteLimitHz_ * 0.2));
-            cap = R::kLow + (highNoteRelaxMax_ - R::kLow) * t;
-        }
-
-        // Il target finale combina cap, shift e moltiplicatore globale
-        const float target = std::clamp(float(cap * onsetShift * formantGuard_), 0.0f, 1.0f);
+        // La soglia indica dove il rilascio raggiunge il massimo. La curva
+        // risponde anche alle note intermedie e agli slide brevi.
+        const double proximity = std::clamp(dangerHz / highNoteLimitHz_, 0.0, 1.0);
+        const double amount = R::kLow + (highNoteRelaxMax_ - R::kLow) * proximity;
+        const float target = std::clamp(float(amount * formantGuard_), 0.f, 1.f);
         c.relax += (target - c.relax) * 0.25f; // niente scatti da un frame all'altro
         if (c.relax < 1e-4f) c.relax = 0.f;
     }
-    const bool relaxOn = c.relax > 0.f;
-    const float keep = 1.f - c.relax; // esponente: 1 = preservazione piena
-
-    const float beta = float(std::clamp(
-        formantScaleSmoothed_, 1.0 / 64.0, 64.0));
+    // Con rilascio zero il formante segue il knob. A rilascio pieno
+    // segue lo slide della nota, con il contributo del knob rimosso.
+    // Interpolare in ottave rende udibile il controllo anche quando
+    // il knob da solo muove pitch e formante dello stesso intervallo.
+    const double knobScale = std::clamp(formantScaleSmoothed_, 1.0 / 64.0, 64.0);
+    const double noteScale = alpha / knobScale;
+    const float beta = float(knobScale * std::pow(noteScale / knobScale, c.relax));
     auto sampleEnv = [&](float binPos) -> float {
         binPos = std::clamp(binPos, 1.f, float(b.K - 2));
         const int lo = int(std::floor(binPos));
@@ -450,16 +435,14 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
             const int d1 = k + neighbour;
             if (primaryWeight > 0.f && d0 >= 1 && d0 < b.K - 1) {
                 const float targetEnvelope = sampleEnv(float(d0) / beta);
-                float gain = std::clamp(
+                const float gain = std::clamp(
                     targetEnvelope / originalEnvelope, 0.f, kMaxGain);
-                if (relaxOn) gain = std::pow(gain, keep);
                 b.spec[size_t(d0)] += base * rot0 * (gain * primaryWeight);
             }
             if (neighbourWeight > 0.f && d1 >= 1 && d1 < b.K - 1) {
                 const float targetEnvelope = sampleEnv(float(d1) / beta);
-                float gain = std::clamp(
+                const float gain = std::clamp(
                     targetEnvelope / originalEnvelope, 0.f, kMaxGain);
-                if (relaxOn) gain = std::pow(gain, keep);
                 b.spec[size_t(d1)] += base * rot1 * (gain * neighbourWeight);
             }
         }
