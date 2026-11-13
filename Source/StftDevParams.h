@@ -14,6 +14,12 @@ struct StftDevParams {
     std::atomic<int>      fftHigh        {4096};
     std::atomic<double>   crossLowHz     {2200.0};
     std::atomic<double>   crossHighHz    {2800.0};
+    // Rilascio progressivo preservazione formanti (letti live a ogni frame).
+    std::atomic<float>    relaxMax       {0.30f};   // 0.30 = max 30%
+    std::atomic<float>    relaxShiftStart{12.0f};   // semitoni di shift
+    std::atomic<float>    relaxShiftEnd  {24.0f};
+    std::atomic<float>    relaxHzStart   {900.0f};  // f0 in uscita
+    std::atomic<float>    relaxHzEnd     {1700.0f};
     std::atomic<unsigned> version        {1};   // +1 a ogni modifica
 
     static StftDevParams& instance() {
