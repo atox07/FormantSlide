@@ -183,7 +183,11 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     voice.playhead_ = slices_[size_t(index)].begin;
     voice.sliceEnd_ = slices_[size_t(index)].end;
     voice.samplePlaying_ = true;
-    voice.engine_ = std::make_unique<StftVoice>(wav_, int(voice.playhead_), voice.sliceEnd_, sampleRate_);
+    // FL reports cents relative to middle C (900 cents below A4).
+    const double startNoteHz = 440.0 * std::exp2(
+        (voice.startPitchCents + settings_.pitchCents - 900.0) / 1200.0);
+    voice.engine_ = std::make_unique<StftVoice>(
+        wav_, int(voice.playhead_), voice.sliceEnd_, sampleRate_, startNoteHz);
     voice.drainRemaining_ = 0;
 }
 

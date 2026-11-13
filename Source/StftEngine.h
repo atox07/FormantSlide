@@ -15,7 +15,7 @@
 // MIDI note starts, so the synthesis is aligned to the supplied sample position.
 class StftVoice {
 public:
-    StftVoice(std::shared_ptr<const WaveData>, int begin, int end, double hostRate);
+    StftVoice(std::shared_ptr<const WaveData>, int begin, int end, double hostRate, double startNoteHz);
     int render(float* left, float* right, int count, double scale);
     void setDevParams(float envSmooth, float envSmoothSlide, float maxGain, double quefrency);
     void jumpPitch();                   // salta subito al pitch richiesto, senza lo smoothing da 6 ms
@@ -31,7 +31,6 @@ private:
     float kMaxGain            = 9.118f;
     static constexpr float  kPeakFloor          = 1e-4f;
 
-    // Rilascio progressivo formanti: costanti in StftRelax (StftDevParams.h).
     float kEnvSmoothCoef      = 0.3f;
     float kEnvSmoothCoefSlide = 0.566f;
 
@@ -51,7 +50,6 @@ private:
         float prevFluxEnergy = 0.f;
         float fluxBaseline = 0.f;
         int transientHold = 0;
-        float f0Hz = 0.f;   // stima grezza della f0 sorgente (solo banda bassa)
         float relax = 0.f;  // rilascio formanti corrente, 0..kRelaxMax
         bool havePrev = false;
     };
@@ -114,6 +112,7 @@ private:
     bool smoothInit = false;
     float wet = 0.f;
 
+    const double startNoteHz_;
     float formantGuard_     = 1.0f;
     float highNoteLimitHz_  = 2000.0f;
     float highNoteRelaxMax_ = 0.75f;

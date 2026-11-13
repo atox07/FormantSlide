@@ -26,9 +26,3 @@ struct StftDevParams {
     }
 };
 
-// Rilascio progressivo della preservazione formanti: costanti fisse.
-// Soglia in Hz e rilascio massimo oltre soglia arrivano dagli slider della GUI
-// (Settings -> StftVoice::setHighNoteLimit / setHighNoteRelaxMax).
-struct StftRelax {
-    static constexpr double kLow      = 0.10;  // rilascio base prima della progressione verso la soglia
-};

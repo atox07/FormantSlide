@@ -78,12 +78,13 @@ StftVoice::Band::Band(int fftSize, double sampleRate, bool upperBand, double que
 }
 
 StftVoice::StftVoice(std::shared_ptr<const WaveData> data,
-                     int first, int last, double hostRate)
+                     int first, int last, double hostRate, double startNoteHz)
     : wav(std::move(data)),
       begin(std::clamp(first, 0, wav->frames())),
       end(std::clamp(last, begin, wav->frames())),
       step(wav->sampleRate / hostRate),
       length(static_cast<long long>(std::ceil((end - begin) / step))),
+      startNoteHz_(startNoteHz),
       lowBand(pickSize(hostRate, StftDevParams::instance().fftLow.load()), hostRate, false,
               kQuefrency, StftDevParams::instance().crossLowHz.load(),
               StftDevParams::instance().crossHighHz.load()),
@@ -169,7 +170,6 @@ void StftVoice::resetState() {
             c.prevFluxEnergy = 0.f;
             c.fluxBaseline = 0.f;
             c.transientHold = 0;
-            c.f0Hz = 0.f;
             c.relax = 0.f;
             c.havePrev = false;
         }
@@ -256,7 +256,6 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
         c.havePrev = false;
         c.fluxBaseline = 0.f;
         c.prevAlpha = alpha;
-        c.f0Hz = 0.f;
         c.relax = 0.f;
         return;
     }
@@ -319,34 +318,14 @@ void StftVoice::shift(Band& b, Channel& c, double alpha,
         b.env[ix] = std::exp(c.envSmooth[ix]);
     }
 
-    // --- Rilascio progressivo della preservazione formanti -------------------
-    // La banda bassa stima la f0 sorgente (primo picco forte sopra 90 Hz); la banda
-    // alta usa quella stima, perche' li' i picchi sono armoniche, non la f0.
-    const int chIx = int(&c - b.channels.data());
-    if (!b.high) {
-        const int kMin = std::max(2, int(std::ceil(90.0 * b.N / b.rate)));
-        for (int i = 0; i < peakCount; ++i) {
-            const int kp = b.peakBin[size_t(i)];
-            if (kp < kMin || b.mag[size_t(kp)] < 0.2f * maxMag) continue;
-            const float f0 = float(double(b.freqBin[size_t(kp)]) * b.rate / b.N);
-            c.f0Hz = c.f0Hz > 0.f ? 0.7f * c.f0Hz + 0.3f * f0 : f0;
-            break;
-        }
-    }
-    {
-        using R = StftRelax;
-        const double inHz = double(lowBand.channels[size_t(chIx)].f0Hz);
-        const double outHz = inHz * alpha;
-        // Frequenza piu' alta tra ingresso e uscita (per gestire campioni gia' acuti)
-        const double dangerHz = std::max(inHz, outHz);
-
-        // La soglia indica dove il rilascio raggiunge il massimo. La curva
-        // risponde anche alle note intermedie e agli slide brevi.
-        const double proximity = std::clamp(dangerHz / highNoteLimitHz_, 0.0, 1.0);
-        const double amount = R::kLow + (highNoteRelaxMax_ - R::kLow) * proximity;
-        const float target = std::clamp(float(amount * formantGuard_), 0.f, 1.f);
-        c.relax += (target - c.relax) * 0.25f; // niente scatti da un frame all'altro
+    // Gate on the original note, independently of slide direction and destination.
+    // Match the precision of FL's pitch parameter at the exact boundary.
+    if (float(startNoteHz_) >= highNoteLimitHz_) {
+        const float target = std::clamp(highNoteRelaxMax_ * formantGuard_, 0.f, 1.f);
+        c.relax += (target - c.relax) * 0.25f;
         if (c.relax < 1e-4f) c.relax = 0.f;
+    } else {
+        c.relax = 0.f;
     }
     // Con rilascio zero il formante segue il knob. A rilascio pieno
     // segue lo slide della nota, con il contributo del knob rimosso.
