@@ -36,6 +36,9 @@ private:
     std::array<SpectralChannel,2> spectral{};
     int spectralCursor = 0;
     bool spectralActive = false;
+    int spectralRetry = 0, silentSpectrum = 0, silentGrains = 0;
+    double spectralReturn = 1;
+    void recoverSpectrum();
     double effectMix = 0;
     double spectralPower = 0, grainPower = 0, crossPower = 0, blendGain = 1;
     void spectralFrame(int offset, double ratio, double formantScale, bool first);

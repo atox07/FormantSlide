@@ -83,6 +83,16 @@ void StftVoice::spectralFrame(int offset, double ratio, double formantScale, boo
     }
 }
 
+void StftVoice::recoverSpectrum() {
+    spectralActive = false;
+    spectralRetry = size;
+    spectralReturn = 0;
+    silentSpectrum = 0;
+    for (auto& channel : spectral) channel.overlap.fill(0);
+    spectralPower = crossPower = 0;
+    blendGain = 1;
+}
+
 int StftVoice::render(float* left,float* right,int count,double scale) {
     const double target = std::log2(std::isfinite(scale) ? std::clamp(scale,1./64,64.) : 1.);
     if (snap) { pitch = target; snap = false; }
@@ -109,14 +119,22 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         mix += (0.35*smoothing)*(confidence-mix);
         effectMix += smoothing*((shifted ? 1. : 0.)-effectMix);
         const bool process = shifted || effectMix>1e-5;
-        if (process && !spectralActive) {
-            for (auto& channel : spectral) channel.overlap.fill(0);
-            spectralCursor = 0;
-            for (int offset=hop-size; offset<0; offset+=hop)
-                spectralFrame(offset,ratio,color,offset==hop-size);
-            spectralActive = true;
+        if (!process) spectralActive = false;
+        if (spectralRetry > 0) --spectralRetry;
+        else if (process && (!spectralActive || spectralCursor%hop==0)) {
+            try {
+                if (!spectralActive) {
+                    for (auto& channel : spectral) channel.overlap.fill(0);
+                    spectralCursor = 0;
+                    for (int offset=hop-size; offset<0; offset+=hop)
+                        spectralFrame(offset,ratio,color,offset==hop-size);
+                }
+                spectralFrame(0,ratio,color,false);
+                spectralActive = true;
+            } catch (...) {
+                recoverSpectrum();
+            }
         }
-        if (process && spectralCursor%hop==0) spectralFrame(0,ratio,color,false);
         // TD-PSOLA: select a source pulse, place its waveform at the MIDI period.
         if (untilPulse <= 0 && shifted && frame.period > 0 && used < int(grains.size())) {
             const double spacing = std::max(1.,frame.period/(step*ratio));
@@ -147,11 +165,45 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
             if (grain.phase >= 1.) grain = grains[--used];
             else ++g;
         }
-        const double wet = mix*std::min(1.,weight*8.);
+        const double dry[2] = {read(position,0),read(position,1)};
+        const bool audible = std::abs(dry[0])+std::abs(dry[1]) > 1e-5;
+        // Exact-zero runs ignore ordinary low-level output and zero crossings.
+        // Require source activity during the run, and test grains only where
+        // the analysis predicts a periodic signal inside this slice.
+        auto stalled = [&](int& run, bool eligible, bool zero) {
+            if (!eligible || !zero) run = 0;
+            else if (audible) ++run;
+            return run >= size*2;
+        };
+        double sl = spectral[0].overlap[spectralCursor];
+        double sr = spectral[1].overlap[spectralCursor];
+        if (!std::isfinite(sl) || !std::isfinite(sr) ||
+            stalled(silentSpectrum,spectralActive,sl==0 && sr==0)) {
+            recoverSpectrum();
+            sl = sr = 0;
+        }
+        bool expectGrain = shifted && frame.voiced > 0.8 && frame.period > 0 &&
+                           position+2*frame.period < end && !wav->pulses.empty();
+        if (stalled(silentGrains,expectGrain,l==0 && r==0) ||
+            !std::isfinite(l) || !std::isfinite(r) || !std::isfinite(weight)) {
+            used = 0;
+            untilPulse = 0;
+            silentGrains = 0;
+            grainPower = crossPower = 0;
+            blendGain = 1;
+            weight = l = r = 0;
+        }
+        if (spectralActive) spectralReturn += smoothing*(1.-spectralReturn);
+        const double coverage = std::min(1.,weight*8.);
+        const double wet = coverage*(1.-spectralReturn*(1.-mix));
         const double norm = 1./std::max(1e-9,weight);
         const double grain[2] = {l*norm,r*norm};
-        const double sl = spectral[0].overlap[spectralCursor];
-        const double sr = spectral[1].overlap[spectralCursor];
+        if (!spectralActive && process) {
+            sl = dry[0]; sr = dry[1];
+        } else if (spectralReturn<0.99999 && process) {
+            sl = dry[0]+spectralReturn*(sl-dry[0]);
+            sr = dry[1]+spectralReturn*(sr-dry[1]);
+        }
         const double follow = smoothing*0.25;
         spectralPower += follow*(sl*sl+sr*sr-spectralPower);
         grainPower += follow*(grain[0]*grain[0]+grain[1]*grain[1]-grainPower);
@@ -165,11 +217,10 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         blendGain += follow*(compensation-blendGain);
         for (int ch=0; ch<2; ++ch) {
             float& sample = spectral[ch].overlap[spectralCursor];
-            const double hybrid = blendGain*(other*sample+wet*grain[ch]);
-            (ch ? right : left)[i] = float((1-effectMix)*read(position,ch)+effectMix*hybrid);
+            const double hybrid = blendGain*(other*(ch ? sr : sl)+wet*grain[ch]);
+            (ch ? right : left)[i] = float((1-effectMix)*dry[ch]+effectMix*hybrid);
             sample = 0;
         }
-        spectralActive = process;
         spectralCursor = (spectralCursor+1)&(size-1);
     }
     return i;

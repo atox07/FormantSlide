@@ -303,6 +303,15 @@ public:
     void paint(juce::Graphics& g) override {
         g.fillAll(ui::bg);
 
+        const auto ink = titlePath_.getBounds();
+        g.setColour(juce::Colours::black.withAlpha(0.6f));
+        g.fillPath(titlePath_, juce::AffineTransform::translation(2.f, 2.f));
+        g.setColour(ui::well);
+        g.strokePath(titlePath_, juce::PathStrokeType(2.f, juce::PathStrokeType::curved));
+        g.setGradientFill(juce::ColourGradient(ui::accent, ink.getX(), ink.getY(),
+                                               juce::Colour(0xffffd700), ink.getX(), ink.getBottom(), false));
+        g.fillPath(titlePath_);
+
         drawPanel(g, panelSlicer_, "SLICER");
         drawPanel(g, panelPitch_, nullptr); // its header is pitchLabel_
         drawPanel(g, panelGuard_, "FORMANT RELEASE");
@@ -373,8 +382,15 @@ public:
         const int m = 12;
         const int w = getWidth();
 
-        // Top strip: file name + Load WAV.
-        wavLabel_.setBounds(m, 10, w - 2 * m - 214, 26);
+        juce::GlyphArrangement title;
+        title.addLineOfText(ui::font(26.f, true).italicised().withExtraKerningFactor(0.025f),
+                            "FormantSlide", 0.f, 0.f);
+        titlePath_.clear();
+        title.createPath(titlePath_);
+        const auto centre = titlePath_.getBounds().getCentre();
+        titlePath_.applyTransform(juce::AffineTransform::translation(w * 0.5f - centre.x, 23.f - centre.y));
+        const int nameRight = juce::roundToInt(titlePath_.getBounds().getX()) - 10;
+        wavLabel_.setBounds(m, 10, std::max(0, nameRight - m), 26);
         slotBox_.setBounds(w - m - 201,9,84,28);
         loadButton_.setBounds(w - m - 110, 9, 110, 28);
 
@@ -547,6 +563,7 @@ private:
     juce::AudioThumbnailCache cache_{5};
     juce::AudioThumbnail thumbnail_;
     juce::Rectangle<int> waveBounds_;
+    juce::Path titlePath_;
     juce::Rectangle<int> panelSlicer_, panelPitch_, panelGuard_;
     juce::Label guardLabel_[3];
     juce::Slider guardSlider_[3];
