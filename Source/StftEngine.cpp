@@ -5,7 +5,10 @@
 StftVoice::StftVoice(std::shared_ptr<const WaveData> data,int first,int last,double rate,double hz)
     : wav(std::move(data)), begin(std::clamp(first,0,wav->frames())),
       end(std::clamp(last,begin,wav->frames())), step(wav->sampleRate/rate),
-      startNote(hz), smoothing(-std::expm1(-1./(0.006*rate))), position(begin) {}
+      startNote(hz), smoothing(-std::expm1(-1./(0.006*rate))), position(begin) {
+    for (int j=0; j<size; ++j)
+        window[j] = float(0.5-0.5*std::cos(6.283185307179586*j/size));
+}
 float StftVoice::read(double where, int ch) const {
     if (where < begin || where >= end) return 0.f;
     const float* s = wav->stereo.data();
@@ -20,6 +23,64 @@ float StftVoice::read(double where, int ch) const {
     const float c2 = y0 - 2.5f * y1 + 2.f * y2 - 0.5f * y3;
     const float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
     return ((c3 * f + c2) * f + c1) * f + y1;
+}
+
+// Overlap-add frames share the exact source timeline of the PSOLA grains.
+void StftVoice::spectralFrame(int offset, double ratio, double formantScale, bool first) {
+    constexpr double tau = 6.283185307179586;
+    constexpr int nyquist = size/2;
+    for (int ch=0; ch<2; ++ch) {
+        auto& state = spectral[ch];
+        for (int j=0; j<size; ++j)
+            input[j] = window[j]*read(position+(offset+j)*step,ch);
+        fft.perform(input.data(),bins.data(),false);
+        output.fill({});
+        for (int k=0; k<=nyquist; ++k) magnitude[k] = std::abs(bins[k]);
+        // Local RMS envelope provides a bounded formant correction. The
+        // local floor controls how much diffuse energy stays at source Hz.
+        double energy = 0;
+        constexpr int width = 8;
+        for (int j=0; j<width; ++j) energy += double(magnitude[j])*magnitude[j];
+        int count = 0;
+        for (int k=0; k<=nyquist; ++k) {
+            if (k+width<=nyquist) energy += double(magnitude[k+width])*magnitude[k+width];
+            if (k>width) energy -= double(magnitude[k-width-1])*magnitude[k-width-1];
+            envelope[k] = float(std::sqrt(std::max(0.,energy)/
+                (1+std::min(nyquist,k+width)-std::max(0,k-width))));
+            if (k>0 && k<nyquist && magnitude[k]>magnitude[k-1] && magnitude[k]>=magnitude[k+1])
+                peaks[count++] = k;
+        }
+        int nearest = 0;
+        for (int k=0; k<=nyquist; ++k) {
+            const double angle = std::arg(bins[k]);
+            const double expected = tau*hop*k/size;
+            const double advance = expected + (first ? 0. : std::remainder(angle-state.phase[k]-expected,tau));
+            state.phase[k] = angle;
+            state.rotation[k] = first ? 0. : std::remainder(state.rotation[k]+(ratio-1)*advance,tau);
+        }
+        for (int k=0; k<=nyquist; ++k) {
+            if (!count) { output[k] += bins[k]; continue; }
+            while (nearest+1<count && 2*k>peaks[nearest]+peaks[nearest+1]) ++nearest;
+            const int pk = peaks[nearest];
+            const float contrast = magnitude[pk]/std::max(1e-8f,envelope[pk]);
+            const float tonal = std::clamp((contrast-1.35f)/1.35f,0.f,1.f)*
+                                std::clamp((4.f-std::abs(k-pk))/2.f,0.f,1.f);
+            output[k] += (1-tonal)*bins[k];
+            const double dest = k+(ratio-1)*pk;
+            if (dest<1 || dest>=nyquist-1 || tonal<=0) continue;
+            const int bin = int(std::round(dest));
+            const int envBin = int(std::clamp(dest/formantScale,0.,double(nyquist)));
+            const float gain = std::clamp(envelope[envBin]/std::max(envelope[k],1e-8f),0.24f,4.f);
+            // Phase is referenced to the middle of the Hann window.
+            const double rotation = state.rotation[pk]+(pk*(ratio-1)-(bin-k))*tau*0.5;
+            output[bin] += bins[k]*std::polar(tonal*gain,float(rotation));
+        }
+        for (int k=1; k<nyquist; ++k) output[size-k] = std::conj(output[k]);
+        fft.perform(output.data(),input.data(),true);
+        for (int j=std::max(0,-offset); j<size; ++j)
+            state.overlap[(spectralCursor+offset+j)&(size-1)] +=
+                input[j].real()*window[j]*(2.f/3.f);
+    }
 }
 
 int StftVoice::render(float* left,float* right,int count,double scale) {
@@ -41,7 +102,21 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
             }
         }
         const bool shifted = std::abs(pitch)>1e-5 || std::abs(color-1)>1e-5;
-        mix += smoothing*((shifted ? frame.voiced : 0.)-mix);
+        double confidence = frame.voiced;
+        if (index+1 < wav->vocal.size())
+            confidence += (wav->vocal[index+1].voiced-confidence)*
+                          (position/wav->analysisHop-double(index));
+        mix += (0.35*smoothing)*(confidence-mix);
+        effectMix += smoothing*((shifted ? 1. : 0.)-effectMix);
+        const bool process = shifted || effectMix>1e-5;
+        if (process && !spectralActive) {
+            for (auto& channel : spectral) channel.overlap.fill(0);
+            spectralCursor = 0;
+            for (int offset=hop-size; offset<0; offset+=hop)
+                spectralFrame(offset,ratio,color,offset==hop-size);
+            spectralActive = true;
+        }
+        if (process && spectralCursor%hop==0) spectralFrame(0,ratio,color,false);
         // TD-PSOLA: select a source pulse, place its waveform at the MIDI period.
         if (untilPulse <= 0 && shifted && frame.period > 0 && used < int(grains.size())) {
             const double spacing = std::max(1.,frame.period/(step*ratio));
@@ -73,9 +148,29 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
             else ++g;
         }
         const double wet = mix*std::min(1.,weight*8.);
-        const double gain = wet/std::max(1e-9,weight);
-        left[i] = float((1-wet)*read(position,0)+gain*l);
-        right[i] = float((1-wet)*read(position,1)+gain*r);
+        const double norm = 1./std::max(1e-9,weight);
+        const double grain[2] = {l*norm,r*norm};
+        const double sl = spectral[0].overlap[spectralCursor];
+        const double sr = spectral[1].overlap[spectralCursor];
+        const double follow = smoothing*0.25;
+        spectralPower += follow*(sl*sl+sr*sr-spectralPower);
+        grainPower += follow*(grain[0]*grain[0]+grain[1]*grain[1]-grainPower);
+        crossPower += follow*(sl*grain[0]+sr*grain[1]-crossPower);
+        const double other = 1.-wet;
+        const double expectedPower = other*spectralPower+wet*grainPower;
+        const double summedPower = other*other*spectralPower+wet*wet*grainPower+
+                                   2*other*wet*crossPower;
+        const double compensation = std::clamp(std::sqrt((expectedPower+1e-8)/
+                                              (std::max(0.,summedPower)+1e-8)),0.85,1.4);
+        blendGain += follow*(compensation-blendGain);
+        for (int ch=0; ch<2; ++ch) {
+            float& sample = spectral[ch].overlap[spectralCursor];
+            const double hybrid = blendGain*(other*sample+wet*grain[ch]);
+            (ch ? right : left)[i] = float((1-effectMix)*read(position,ch)+effectMix*hybrid);
+            sample = 0;
+        }
+        spectralActive = process;
+        spectralCursor = (spectralCursor+1)&(size-1);
     }
     return i;
 }

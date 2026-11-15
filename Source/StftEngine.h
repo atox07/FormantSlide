@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <juce_dsp/juce_dsp.h>
 
 class StftVoice {
 public:
@@ -21,6 +22,23 @@ private:
     bool snap=true;
     float guard=0,limit=2000,relax=0.75f;
     std::array<Grain,32> grains{};
+    static constexpr int order = 10, size = 1 << order, hop = size / 4;
+    using Complex = std::complex<float>;
+    juce::dsp::FFT fft{order};
+    std::array<float,size> window{};
+    std::array<Complex,size> input{}, bins{}, output{};
+    std::array<float,size/2+1> envelope{}, magnitude{};
+    std::array<int,size/2+1> peaks{};
+    struct SpectralChannel {
+        std::array<float,size> overlap{};
+        std::array<double,size/2+1> phase{}, rotation{};
+    };
+    std::array<SpectralChannel,2> spectral{};
+    int spectralCursor = 0;
+    bool spectralActive = false;
+    double effectMix = 0;
+    double spectralPower = 0, grainPower = 0, crossPower = 0, blendGain = 1;
+    void spectralFrame(int offset, double ratio, double formantScale, bool first);
     int used=0;
     float read(double where,int channel) const;
 };

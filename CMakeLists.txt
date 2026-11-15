@@ -43,6 +43,7 @@ target_compile_definitions(FormantSlideNative PRIVATE
 
 target_link_libraries(FormantSlideNative PRIVATE
     fl_sdk
+    juce::juce_dsp
     juce::juce_audio_utils
     juce::juce_recommended_config_flags
     user32 gdi32 comdlg32 shell32 ole32)
