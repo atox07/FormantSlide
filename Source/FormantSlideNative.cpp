@@ -171,6 +171,10 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     // Match the working v0.2 VST3: a fixed root defines slice position.
     const int index = std::clamp(voice.note - slot.settings_.firstNote, 0, count - 1);
     voice.baseOffset = 60.0 + voice.startPitchCents / 100.0 - (slot.settings_.firstNote + index);
+    // FL includes static tuning in the initial voice pitch. Keep small
+    // offsets in sample playback, leaving subsequent native slides to DSP.
+    voice.fineTune = std::abs(voice.baseOffset) <= 0.5 ? voice.baseOffset : 0.;
+    voice.sourceStep = slot.wav_->sampleRate / sampleRate_ * std::exp2(voice.fineTune / 12.);
     slot.lastMidiNote_ = voice.note;
     voice.sliceIndex = index;
     slot.lastSlice_ = index;
@@ -182,7 +186,7 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     const double startNoteHz = 440.0 * std::exp2(
         (voice.startPitchCents + slot.settings_.pitchCents - 900.0) / 1200.0);
     voice.engine_ = std::make_unique<StftVoice>(
-        slot.wav_, int(voice.playhead_), voice.sliceEnd_, sampleRate_, startNoteHz);
+        slot.wav_, int(voice.playhead_), voice.sliceEnd_, sampleRate_, startNoteHz, voice.sourceStep);
     voice.drainRemaining_ = 0;
 }
 
@@ -254,7 +258,7 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
         const double hostPitch = hostStart + (nextHostSlide - hostStart) * double(pos + run) / length;
         const double shift = std::clamp(hostPitch + voice.baseOffset + slot.settings_.pitchCents / 100.0, -48.0, 48.0);
         voice.shiftCents = int(std::lround(shift * 100.0));
-        const int frames = voice.engine_->render(out_[0].data(), out_[1].data(), run, std::exp2(shift / 12.0));
+        const int frames = voice.engine_->render(out_[0].data(), out_[1].data(), run, std::exp2((shift - voice.fineTune) / 12.0));
         const float vol = std::max(0.f, voice.params->FinalLevels.Vol);
         const float pan = std::clamp(voice.params->FinalLevels.Pan, -1.f, 1.f);
         for (int i = 0; i < frames; ++i) {
@@ -265,7 +269,7 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
             const float sample = out_[0][size_t(i)] * gain * fade * vol;
             buffer[pos + i][0] += sample * (pan > 0 ? 1.f - pan : 1.f);
             buffer[pos + i][1] += out_[1][size_t(i)] * gain * fade * vol * (pan < 0 ? 1.f + pan : 1.f);
-            voice.playhead_ += double(slot.wav_->sampleRate) / sampleRate_;
+            voice.playhead_ += voice.sourceStep;
         }
         if (frames < run || voice.playhead_ >= voice.sliceEnd_) voice.samplePlaying_ = false;
     }

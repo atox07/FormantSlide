@@ -7,7 +7,7 @@
 
 class StftVoice {
 public:
-    StftVoice(std::shared_ptr<const WaveData>, int, int, double, double);
+    StftVoice(std::shared_ptr<const WaveData>, int, int, double, double, double sourceStep);
     int render(float*, float*, int, double);
     int spectralPercent() const { return lastSpectralPercent; }
     bool retryingSpectrum() const { return spectralRetry > 0; }

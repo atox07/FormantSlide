@@ -73,6 +73,8 @@ private:
         int note = 60, color = 0;
         float startPitchCents = 0;
         double baseOffset = 0;
+        double fineTune = 0; // Static sub-semitone offset in semitones
+        double sourceStep = 1;
         int shiftCents = 0;
         bool released = false;
         double playhead_ = 0;

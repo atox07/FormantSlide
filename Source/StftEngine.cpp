@@ -2,9 +2,9 @@
 #include <cmath>
 #include <utility>
 
-StftVoice::StftVoice(std::shared_ptr<const WaveData> data,int first,int last,double rate,double hz)
+StftVoice::StftVoice(std::shared_ptr<const WaveData> data,int first,int last,double rate,double hz,double sourceStep)
     : wav(std::move(data)), begin(std::clamp(first,0,wav->frames())),
-      end(std::clamp(last,begin,wav->frames())), step(wav->sampleRate/rate),
+      end(std::clamp(last,begin,wav->frames())), step(sourceStep),
       startNote(hz), smoothing(-std::expm1(-1./(0.006*rate))), position(begin) {
     for (int j=0; j<size; ++j)
         window[j] = float(0.5-0.5*std::cos(6.283185307179586*j/size));
