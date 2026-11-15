@@ -9,7 +9,7 @@ if(NOT EXISTS "${FL_SDK_DIR}/fp_plugclass.h")
     message(FATAL_ERROR "FL Studio SDK missing. Set FL_SDK_DIR to your private local SDK directory.")
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(FetchContent)
 
@@ -19,19 +19,6 @@ FetchContent_Declare(juce
     GIT_TAG 8.0.10
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(juce)
-
-set(stft_headers "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stftPitchShift/cpp")
-if(NOT EXISTS "${stft_headers}/StftPitchShift/StftPitchShiftCore.h")
-    FetchContent_Declare(stft_source
-        GIT_REPOSITORY https://github.com/jurihock/stftPitchShift.git
-        GIT_TAG 70c96db087458f8631edbc1bb4068d42ea5b52cc
-        SOURCE_SUBDIR formantslide_headers_only)
-    FetchContent_MakeAvailable(stft_source)
-    set(stft_headers "${stft_source_SOURCE_DIR}/cpp")
-endif()
-add_library(formantslide_stft INTERFACE)
-target_include_directories(formantslide_stft INTERFACE "${stft_headers}")
-target_compile_features(formantslide_stft INTERFACE cxx_std_20)
 
 add_subdirectory("${FL_SDK_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/fl_sdk")
 # Legacy SDK hint tables assign literals to char*. Scope compatibility to its .cpp files.
@@ -55,7 +42,7 @@ target_compile_definitions(FormantSlideNative PRIVATE
     JUCE_PLUGINHOST_LV2=0 JUCE_PLUGINHOST_ARA=0 JUCE_USE_LAME_AUDIO_FORMAT=0)
 
 target_link_libraries(FormantSlideNative PRIVATE
-    fl_sdk formantslide_stft
+    fl_sdk
     juce::juce_audio_utils
     juce::juce_recommended_config_flags
     user32 gdi32 comdlg32 shell32 ole32)

@@ -9,6 +9,68 @@
 #include <limits>
 
 namespace {
+// Estimate periodicity on a reduced-rate analysis channel. Pulse locations
+// remain in original WAV coordinates and are shared by both stereo channels.
+void analyzeVoice(WaveData& w) {
+    const int stride = std::max(1, w.sampleRate / 12000);
+    const double rate = double(w.sampleRate) / stride;
+    std::vector<float> x;
+    double power[2]{};
+    for (size_t i = 0; i < w.stereo.size(); ++i)
+        power[i % 2] += double(w.stereo[i]) * w.stereo[i];
+    const int ch = power[1] > power[0];
+    for (int i = 0; i < w.frames(); i += stride) {
+        float sum = 0;
+        const int count = std::min(stride, w.frames() - i);
+        for (int j = 0; j < count; ++j) sum += w.stereo[2 * size_t(i+j) + ch];
+        x.push_back(sum / count);
+    }
+    w.analysisHop = std::max(1, w.sampleRate / 100);
+    const int maxLag = std::max(4, int(rate / 55));
+    std::vector<double> score(maxLag + 1);
+    for (int at = 0; at < w.frames(); at += w.analysisHop) {
+        const int first = std::clamp(at / stride - maxLag, 0,
+                                     std::max(0, int(x.size()) - 2*maxLag));
+        const int count = std::min(maxLag, int(x.size()) - first - maxLag);
+        VocalFrame frame;
+        if (count >= maxLag / 2) {
+            for (int lag = 1; lag <= maxLag; ++lag) {
+                double diff = 0, energy = 1e-12;
+                for (int j = first; j < first + count; j += 2) {
+                    const double a = x[j], b = x[j+lag];
+                    diff += (a-b)*(a-b);
+                    energy += a*a+b*b;
+                }
+                score[lag] = energy > 1e-8 ? 1-diff/energy : 0;
+            }
+            const int lo = std::clamp(int(rate/2200), 2, maxLag-1);
+            const double best = *std::max_element(score.begin()+lo, score.end());
+            for (int lag = lo; lag < maxLag; ++lag) {
+                if (score[lag] < std::max(0.55, best*0.92) ||
+                    score[lag] < score[lag-1] || score[lag] <= score[lag+1]) continue;
+                const double curvature = 2*score[lag]-score[lag-1]-score[lag+1];
+                const double offset = 0.5*(score[lag+1]-score[lag-1])/std::max(curvature,1e-9);
+                frame.period = float((lag+offset)*stride);
+                frame.voiced = float(std::clamp((score[lag]-0.55)/0.30,0.0,1.0));
+                break;
+            }
+        }
+        w.vocal.push_back(frame);
+    }
+    for (double pos = 0; pos < w.frames();) {
+        const auto f = w.vocal[int(pos)/w.analysisHop];
+        if (f.period < 2) { pos += w.analysisHop; continue; }
+        const int radius = std::max(1,int(f.period*0.15));
+        const int lo = std::max(w.pulses.empty()?0:w.pulses.back()+1,int(pos)-radius);
+        const int hi = std::min(w.frames()-1,int(pos)+radius);
+        int peak = lo;
+        for (int i = lo+1; i <= hi; ++i)
+            if (w.stereo[2*size_t(i)+ch] > w.stereo[2*size_t(peak)+ch]) peak=i;
+        if (lo > hi) break;
+        w.pulses.push_back(peak);
+        pos = peak+f.period;
+    }
+}
 uint16_t u16(const uint8_t* p) { return uint16_t(p[0] | (p[1] << 8)); }
 uint32_t u32(const uint8_t* p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
                                         (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); }
@@ -91,6 +153,7 @@ bool readWav(const std::wstring& path, WaveData& result, std::string& error) {
         tmp.stereo[i * 2] = l;
         tmp.stereo[i * 2 + 1] = r;
     }
+    analyzeVoice(tmp);
     result = std::move(tmp);
     error.clear();
     return true;
