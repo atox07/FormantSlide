@@ -3,6 +3,7 @@
 #include "MidiFile.h"
 #include "WaveLoader.h"
 #include "StftEngine.h"
+#include "StftDevParams.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -27,6 +28,10 @@ public:
     struct Display {
         Settings settings;
         int slices = 0;
+        int spectralPercent = -1;
+        bool spectralRecovery = false;
+        bool voiceActive = false;
+        int shiftCents = 0;
         int midiNotes = 0;
         std::wstring wavName, midiName;
         std::wstring wavFullPath, midiFullPath;
@@ -47,6 +52,7 @@ public:
     void _stdcall Voice_Release(TVoiceHandle handle) override;
     void _stdcall Voice_Kill(TVoiceHandle handle) override;
 
+    StftDevParams& guardControls() { return controls_; }
     int selectedSlot() const { return selected_.load(); }
     void selectSlot(int index) { selected_.store(std::clamp(index,0,3)); }
     void checkpoint();
@@ -67,6 +73,7 @@ private:
         int note = 60, color = 0;
         float startPitchCents = 0;
         double baseOffset = 0;
+        int shiftCents = 0;
         bool released = false;
         double playhead_ = 0;
         int sliceIndex = -1;
@@ -78,6 +85,7 @@ private:
         std::unique_ptr<StftVoice> engine_;
 
     };
+    StftDevParams controls_;
     mutable std::mutex mutex_;
     struct Slot {
         Settings settings_;

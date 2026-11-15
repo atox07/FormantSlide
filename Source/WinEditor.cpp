@@ -611,7 +611,7 @@ private:
         count_.setValue(s.sliceCount, juce::dontSendNotification);
         pitch_.setValue(s.pitchCents / 100.0, juce::dontSendNotification);
         {
-            auto& dp = StftDevParams::instance();
+            auto& dp = plugin_.guardControls();
             guardSlider_[0].setValue(dp.formantGuard.load(), juce::dontSendNotification);
             guardSlider_[1].setValue(dp.highNoteLimitHz.load(), juce::dontSendNotification);
             guardSlider_[2].setValue(dp.highNoteRelaxMax.load(), juce::dontSendNotification);
@@ -640,7 +640,7 @@ private:
     // I 3 slider FORMANT RELEASE vanno direttamente al motore (StftDevParams).
     void pushGuard() {
         if (updatingControls_) return;
-        auto& dp = StftDevParams::instance();
+        auto& dp = plugin_.guardControls();
         rememberEdit();
         dp.formantGuard.store(float(guardSlider_[0].getValue()));
         dp.highNoteLimitHz.store(float(guardSlider_[1].getValue()));
@@ -674,6 +674,10 @@ private:
                      " | drag a marker to adjust its boundary";
         else if (data.slices == 1 && !data.wavName.empty())
             status += "  |  Only 1 slice: try Equal divisions";
+        if (data.voiceActive) status += " | Shift " + juce::String(data.shiftCents) + " ct";
+        if (data.spectralRecovery) status += " | STFT recovery";
+        else if (data.spectralPercent >= 0) status += " | STFT mix " + juce::String(data.spectralPercent) + "%";
+        else if (data.voiceActive) status += " | Dry";
         statusLabel_.setText(status, juce::dontSendNotification);
     }
 

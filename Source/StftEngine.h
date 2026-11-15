@@ -9,6 +9,8 @@ class StftVoice {
 public:
     StftVoice(std::shared_ptr<const WaveData>, int, int, double, double);
     int render(float*, float*, int, double);
+    int spectralPercent() const { return lastSpectralPercent; }
+    bool retryingSpectrum() const { return spectralRetry > 0; }
     void jumpPitch() { snap = true; }
     void setFormantScale(double v) { formant = std::clamp(v,1./64,64.); }
     void setFormantGuard(float v) { guard = v; }
@@ -39,6 +41,7 @@ private:
     int spectralRetry = 0, silentSpectrum = 0, silentGrains = 0;
     double spectralReturn = 1;
     void recoverSpectrum();
+    int lastSpectralPercent = -1;
     double effectMix = 0;
     double spectralPower = 0, grainPower = 0, crossPower = 0, blendGain = 1;
     void spectralFrame(int offset, double ratio, double formantScale, bool first);

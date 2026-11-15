@@ -241,7 +241,7 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
     constexpr double kKnobFormantAmount = 1.0;
     voice.engine_->setFormantScale(std::exp2(kKnobFormantAmount * slot.settings_.pitchCents / 1200.0));
     {
-        auto& dp = StftDevParams::instance();
+        auto& dp = controls_;
         voice.engine_->setFormantGuard(dp.formantGuard.load());
         voice.engine_->setHighNoteLimit(dp.highNoteLimitHz.load());
         voice.engine_->setHighNoteRelaxMax(dp.highNoteRelaxMax.load());
@@ -253,6 +253,7 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
         const int run = std::min(64, length - pos);
         const double hostPitch = hostStart + (nextHostSlide - hostStart) * double(pos + run) / length;
         const double shift = std::clamp(hostPitch + voice.baseOffset + slot.settings_.pitchCents / 100.0, -48.0, 48.0);
+        voice.shiftCents = int(std::lround(shift * 100.0));
         const int frames = voice.engine_->render(out_[0].data(), out_[1].data(), run, std::exp2(shift / 12.0));
         const float vol = std::max(0.f, voice.params->FinalLevels.Vol);
         const float pan = std::clamp(voice.params->FinalLevels.Pan, -1.f, 1.f);
@@ -311,7 +312,7 @@ void _stdcall FormantSlideNative::Gen_Render(PWAV32FS buffer, int& length) {
 }
 
 void FormantSlideNative::checkpointLocked(int index) {
-    auto& dp = StftDevParams::instance();
+    auto& dp = controls_;
     if (history_.size() >= 32) history_.erase(history_.begin());
     history_.push_back({slots_[index],index,{dp.formantGuard.load(),dp.highNoteLimitHz.load(),dp.highNoteRelaxMax.load()}});
 }
@@ -329,7 +330,7 @@ bool FormantSlideNative::undo() {
         for (auto& v : voices_) if (slotForColor(v->color)==saved.index) v->samplePlaying_=false;
     slot = std::move(saved.slot);
     selectSlot(saved.index);
-    auto& dp = StftDevParams::instance();
+    auto& dp = controls_;
     dp.formantGuard.store(saved.guard[0]);
     dp.highNoteLimitHz.store(saved.guard[1]);
     dp.highNoteRelaxMax.store(saved.guard[2]);
@@ -394,6 +395,19 @@ FormantSlideNative::Display FormantSlideNative::display() const {
     d.lastMidiNote = slot.lastMidiNote_;
     d.lastSlice = slot.lastSlice_;
     d.lastPitchCents = slot.lastPitchCents_;
+    for (auto it = voices_.rbegin(); it != voices_.rend(); ++it) {
+        const auto& voice = **it;
+        if (slotForColor(voice.color) == selectedSlot() && voice.samplePlaying_ && voice.engine_) {
+            d.voiceActive = true;
+            d.shiftCents = voice.shiftCents;
+            d.lastMidiNote = voice.note;
+            d.lastSlice = voice.sliceIndex;
+            d.lastPitchCents = voice.startPitchCents;
+            d.spectralPercent = voice.engine_->spectralPercent();
+            d.spectralRecovery = voice.engine_->retryingSpectrum();
+            break;
+        }
+    }
     return d;
 }
 
@@ -466,9 +480,9 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
                 }
             }
             SavedFormantGuard guardBlock;
-            guardBlock.guard = StftDevParams::instance().formantGuard.load();
-            guardBlock.limitHz = StftDevParams::instance().highNoteLimitHz.load();
-            guardBlock.relaxMax = StftDevParams::instance().highNoteRelaxMax.load();
+            guardBlock.guard = controls_.formantGuard.load();
+            guardBlock.limitHz = controls_.highNoteLimitHz.load();
+            guardBlock.relaxMax = controls_.highNoteRelaxMax.load();
             stream->Write(&guardBlock, sizeof(guardBlock), nullptr);
         } else {
             ULONG read = 0;
@@ -477,6 +491,10 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
                 s.magic != 0x46534e32 || (s.version < 1 || s.version > 5)) return;
             if (index==0) {
                 std::lock_guard<std::mutex> lock(mutex_);
+                const StftDevParams defaults;
+                controls_.formantGuard.store(defaults.formantGuard.load());
+                controls_.highNoteLimitHz.store(defaults.highNoteLimitHz.load());
+                controls_.highNoteRelaxMax.store(defaults.highNoteRelaxMax.load());
                 stopVoices(); slots_ = {}; history_.clear(); selection=0;
                 midi_ = {}; midiPath_.clear();
             }
@@ -527,7 +545,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
             ULONG guardRead = 0;
             if (SUCCEEDED(stream->Read(&guardBlock, sizeof(guardBlock), &guardRead)) &&
                 guardRead == sizeof(guardBlock) && guardBlock.magic == 0x46474431) {
-                auto& dp = StftDevParams::instance();
+                auto& dp = controls_;
                 if (std::isfinite(guardBlock.guard))
                     dp.formantGuard.store(std::clamp(guardBlock.guard, 0.0f, 2.0f));
                 if (std::isfinite(guardBlock.limitHz))

@@ -20,8 +20,4 @@ struct StftDevParams {
     std::atomic<float>    highNoteRelaxMax {0.75f};    // 0..1
     std::atomic<unsigned> version        {1};   // +1 a ogni modifica
 
-    static StftDevParams& instance() {
-        static StftDevParams p;
-        return p;
-    }
 };

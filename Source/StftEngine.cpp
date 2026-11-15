@@ -209,6 +209,8 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         grainPower += follow*(grain[0]*grain[0]+grain[1]*grain[1]-grainPower);
         crossPower += follow*(sl*grain[0]+sr*grain[1]-crossPower);
         const double other = 1.-wet;
+        if (i+1 == count || position+step >= end)
+            lastSpectralPercent = process ? int(100.*effectMix*other*(spectralActive ? spectralReturn : 0.)+0.5) : -1;
         const double expectedPower = other*spectralPower+wet*grainPower;
         const double summedPower = other*other*spectralPower+wet*wet*grainPower+
                                    2*other*wet*crossPower;
