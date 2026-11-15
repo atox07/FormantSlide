@@ -57,16 +57,53 @@ void analyzeVoice(WaveData& w) {
         }
         w.vocal.push_back(frame);
     }
+    // Repair isolated period outliers only when the surrounding voiced frames
+    // agree. Keep genuine transitions and unvoiced boundaries intact.
+    float previous = 0;
+    for (size_t i = 0; i + 1 < w.vocal.size(); ++i) {
+        auto& frame = w.vocal[i];
+        const float original = frame.period;
+        const float next = w.vocal[i+1].period;
+        if (previous > 0 && original > 0 && next > 0 &&
+            std::abs(previous-next) < 0.08f*previous &&
+            std::abs(original-previous) > 0.18f*previous)
+            frame.period = 0.5f*(previous+next);
+        previous = original;
+    }
+    int lastPulse = -1;
     for (double pos = 0; pos < w.frames();) {
         const auto f = w.vocal[int(pos)/w.analysisHop];
-        if (f.period < 2) { pos += w.analysisHop; continue; }
+        if (f.period < 2) { lastPulse = -1; pos += w.analysisHop; continue; }
         const int radius = std::max(1,int(f.period*0.15));
         const int lo = std::max(w.pulses.empty()?0:w.pulses.back()+1,int(pos)-radius);
         const int hi = std::min(w.frames()-1,int(pos)+radius);
-        int peak = lo;
-        for (int i = lo+1; i <= hi; ++i)
-            if (w.stereo[2*size_t(i)+ch] > w.stereo[2*size_t(peak)+ch]) peak=i;
         if (lo > hi) break;
+        int peak = lo;
+        const int half = std::max(2, int(0.35*f.period));
+        if (lastPulse >= half && hi+half < w.frames() && lo >= half) {
+            // Match a short waveform neighbourhood across cycles. Two nearby
+            // maxima can trade amplitude while the underlying phase is stable.
+            double best = -2;
+            const int sampleStep = std::max(1,half/12);
+            for (int candidate = lo; candidate <= hi; ++candidate) {
+                double cross = 0, energyA = 0, energyB = 0;
+                for (int j = -half; j <= half; j += sampleStep) {
+                    const double a = w.stereo[2*size_t(lastPulse+j)+ch];
+                    const double b = w.stereo[2*size_t(candidate+j)+ch];
+                    cross += a*b;
+                    energyA += a*a;
+                    energyB += b*b;
+                }
+                const double distance = (candidate-pos)/radius;
+                const double similarity = cross/std::sqrt(energyA*energyB+1e-24)
+                                        - 0.035*distance*distance;
+                if (similarity > best) { best = similarity; peak = candidate; }
+            }
+        } else {
+            for (int i = lo+1; i <= hi; ++i)
+                if (w.stereo[2*size_t(i)+ch] > w.stereo[2*size_t(peak)+ch]) peak=i;
+        }
+        lastPulse = peak;
         w.pulses.push_back(peak);
         pos = peak+f.period;
     }

@@ -32,20 +32,29 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         const double release = startNote >= limit ? std::clamp(double(guard*relax),0.,1.) : 0.;
         color += smoothing*(formant*std::pow(ratio/(formant*formant),release)-color);
         const size_t index = size_t(position)/wav->analysisHop;
-        const VocalFrame frame = index < wav->vocal.size() ? wav->vocal[index] : VocalFrame{};
+        VocalFrame frame = index < wav->vocal.size() ? wav->vocal[index] : VocalFrame{};
+        if (frame.period > 0 && index+1 < wav->vocal.size()) {
+            const auto& next = wav->vocal[index+1];
+            if (next.period > 0 && std::abs(next.period-frame.period) < 0.2f*frame.period) {
+                const float t = float(position/wav->analysisHop - double(index));
+                frame.period += t*(next.period-frame.period);
+            }
+        }
         const bool shifted = std::abs(pitch)>1e-5 || std::abs(color-1)>1e-5;
         mix += smoothing*((shifted ? frame.voiced : 0.)-mix);
         // TD-PSOLA: select a source pulse, place its waveform at the MIDI period.
         if (untilPulse <= 0 && shifted && frame.period > 0 && used < int(grains.size())) {
             const double spacing = std::max(1.,frame.period/(step*ratio));
             const double radius = std::clamp(0.8*frame.period/(step*color), std::max(1.,0.65*spacing), spacing*12.);
-            const double center = position+radius*step;
+            // The pulse is usually due between two output samples.
+            const double age = std::max(0.,-untilPulse);
+            const double center = position+(radius-age)*step;
             auto mark = std::lower_bound(wav->pulses.begin(),wav->pulses.end(),center);
             if (mark != wav->pulses.begin() &&
                 (mark == wav->pulses.end() || center-mark[-1] < *mark-center)) --mark;
             if (mark != wav->pulses.end() && *mark >= begin && *mark < end &&
                 std::abs(*mark-center) <= frame.period)
-                grains[used++] = {*mark-radius*step*color, step*color, 0., 0.5/radius};
+                grains[used++] = {*mark+(age-radius)*step*color, step*color, age/(2*radius), 0.5/radius};
             untilPulse += spacing;
         }
         untilPulse = std::max(-1.,untilPulse-1.);
