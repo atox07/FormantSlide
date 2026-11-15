@@ -189,6 +189,14 @@ public:
 
         setLookAndFeel(&theme_);
 
+        setWantsKeyboardFocus(true);
+        addAndMakeVisible(slotBox_);
+        slotBox_.addItemList({"Slot A","Slot B","Slot C","Slot D"},1);
+        slotBox_.setSelectedId(plugin_.selectedSlot()+1,juce::dontSendNotification);
+        slotBox_.onChange = [this] {
+            plugin_.selectSlot(slotBox_.getSelectedId()-1);
+            refreshSlot();
+        };
         addAndMakeVisible(loadButton_);
         addAndMakeVisible(wavLabel_);
         addAndMakeVisible(sliceModeLabel_);
@@ -279,6 +287,10 @@ public:
             if (existing.existsAsFile()) thumbnail_.setSource(new juce::FileInputSource(existing));
         }
         refreshStatus();
+        for (auto* slider : {&count_, &pitch_, &root_, &guardSlider_[0], &guardSlider_[1], &guardSlider_[2]}) {
+            slider->onDragStart = [this] { gesture_ = true; captured_ = false; };
+            slider->onDragEnd = [this] { gesture_ = false; };
+        }
         startTimerHz(40); // refresh host pitch/slice diagnostics when FL plays notes
     }
 
@@ -362,7 +374,8 @@ public:
         const int w = getWidth();
 
         // Top strip: file name + Load WAV.
-        wavLabel_.setBounds(m, 10, w - 2 * m - 130, 26);
+        wavLabel_.setBounds(m, 10, w - 2 * m - 214, 26);
+        slotBox_.setBounds(w - m - 201,9,84,28);
         loadButton_.setBounds(w - m - 110, 9, 110, 28);
 
         // Waveform / drop zone.
@@ -420,6 +433,7 @@ public:
             }
         }
         if (draggedBoundary_ > 0) {
+            plugin_.checkpoint();
             selectedSlice_ = draggedBoundary_;
             setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
             updateDraggedBoundary(event.x);
@@ -493,12 +507,39 @@ public:
         }
     }
 
+    bool keyPressed(const juce::KeyPress& key) override {
+        if (key.getModifiers().isCtrlDown() && !key.getModifiers().isShiftDown() &&
+            (key.getKeyCode()=='Z' || key.getKeyCode()=='z') && plugin_.undo()) {
+            refreshSlot();
+            return true;
+        }
+        return false;
+    }
 private:
     FormantSlideNative& plugin_;
     FlLook theme_;
     juce::TextButton loadButton_{"Load WAV"};
     juce::Label wavLabel_, sliceModeLabel_, countLabel_, rootLabel_, statusLabel_, warningLabel_;
-    juce::ComboBox sliceMode_;
+    juce::ComboBox sliceMode_, slotBox_;
+    std::wstring previewPath_;
+    bool gesture_ = false, captured_ = false;
+    void rememberEdit() {
+        if (!gesture_ || !captured_) plugin_.checkpoint();
+        captured_ = true;
+    }
+    void refreshSlot() {
+        slotBox_.setSelectedId(plugin_.selectedSlot()+1,juce::dontSendNotification);
+        pullSettings();
+        selectedSlice_ = draggedBoundary_ = -1;
+        viewStart_ = 0; viewSpan_ = 1;
+        thumbnail_.clear();
+        auto path = plugin_.display().wavFullPath;
+        if (!path.empty())
+            thumbnail_.setSource(new juce::FileInputSource(juce::File(juce::String(path.c_str()))));
+        refreshFilePreview();
+        refreshStatus();
+        repaint();
+    }
     juce::Label pitchLabel_;
     juce::Slider pitch_;
     juce::Slider count_, root_;
@@ -572,6 +613,7 @@ private:
         settings.sliceCount = int(std::lround(count_.getValue()));
         settings.pitchCents = int(std::lround(pitch_.getValue() * 100.0));
         settings.firstNote = int(std::lround(root_.getValue()));
+        rememberEdit();
         plugin_.updateSettings(settings);
         selectedSlice_ = -1;
         refreshStatus();
@@ -582,6 +624,7 @@ private:
     void pushGuard() {
         if (updatingControls_) return;
         auto& dp = StftDevParams::instance();
+        rememberEdit();
         dp.formantGuard.store(float(guardSlider_[0].getValue()));
         dp.highNoteLimitHz.store(float(guardSlider_[1].getValue()));
         dp.highNoteRelaxMax.store(float(guardSlider_[2].getValue()));
@@ -589,6 +632,7 @@ private:
 
     void refreshFilePreview() {
         const auto data = plugin_.display();
+        previewPath_ = data.wavFullPath;
         wavLabel_.setText(data.wavName.empty() ? "No WAV loaded" : fileName(data.wavName),
                           juce::dontSendNotification);
         // A JUCE thumbnail reproduces the same waveform display as our VST3.
@@ -616,11 +660,11 @@ private:
         statusLabel_.setText(status, juce::dontSendNotification);
     }
 
-    void loadFile(const juce::File& file) {
+    void loadFile(const juce::File& file, int destination = -1) {
         if (!file.existsAsFile() || !file.hasFileExtension("wav")) return;
         const std::wstring path(file.getFullPathName().toWideCharPointer());
         std::string error;
-        if (!plugin_.loadWav(path, error)) {
+        if (!plugin_.loadWav(path, error, destination)) {
             juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
                                                    "FormantSlide", juce::String::fromUTF8(error.c_str()));
             return;
@@ -628,6 +672,9 @@ private:
         selectedSlice_ = -1;
         viewStart_ = 0;
         viewSpan_ = 1;
+        if (destination >= 0) plugin_.selectSlot(destination);
+        slotBox_.setSelectedId(plugin_.selectedSlot()+1,juce::dontSendNotification);
+        pullSettings();
         thumbnail_.setSource(new juce::FileInputSource(file));
         refreshFilePreview();
         refreshStatus();
@@ -639,14 +686,15 @@ private:
         juce::Component::SafePointer<FormantSlideView> safeThis(this);
         chooser->launchAsync(juce::FileBrowserComponent::openMode |
                              juce::FileBrowserComponent::canSelectFiles,
-                             [safeThis, chooser](const juce::FileChooser& fc) {
+                             [safeThis, chooser, destination=plugin_.selectedSlot()](const juce::FileChooser& fc) {
                                  if (safeThis != nullptr && fc.getResult().existsAsFile())
-                                     safeThis->loadFile(fc.getResult());
+                                     safeThis->loadFile(fc.getResult(),destination);
                              });
     }
 
     void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(); }
     void timerCallback() override {
+        if (slotBox_.getSelectedId()!=plugin_.selectedSlot()+1 || previewPath_!=plugin_.display().wavFullPath) refreshSlot();
         auto playing = plugin_.playingSlices();
         if (playing != active_) { active_ = std::move(playing); repaint(waveBounds_); }
         refreshStatus();
