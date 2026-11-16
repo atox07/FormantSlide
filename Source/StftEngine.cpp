@@ -83,13 +83,20 @@ void StftVoice::spectralFrame(int offset, double ratio, double formantScale, boo
             const int anchor = std::abs(k-pk)<=3 ? pk : k;
             const double displacement = (ratio-1)*anchor;
             const double dest = k+displacement;
-            if (dest<0.5 || dest>=nyquist-0.5) continue;
-            const int bin = int(std::round(dest));
-            const int envBin = int(std::clamp(dest/formantScale,0.,double(nyquist)));
-            const float gain = std::clamp(envelope[envBin]/std::max(envelope[k],1e-8f),0.24f,4.f);
-            // Phase is referenced to the middle of the Hann window.
-            const double rotation = state.rotation[anchor]+(displacement-(bin-k))*tau*0.5;
-            output[bin] += bins[k]*std::polar(1.f+tonal*(gain-1.f),float(rotation));
+            if (dest<=0 || dest>=nyquist) continue;
+            const int lower = int(dest);
+            const float fraction = float(dest-lower);
+            const double envPos = std::clamp(dest/formantScale,0.,double(nyquist));
+            const int envLo = int(envPos);
+            const float env = envelope[envLo] + float(envPos-envLo)*
+                (envelope[std::min(envLo+1,nyquist)]-envelope[envLo]);
+            const float gain = std::clamp(env/std::max(envelope[k],1e-8f),0.24f,4.f);
+            // Interpolate the relocation about the window centre. Adjacent
+            // FFT basis functions differ by pi there, hence the minus sign.
+            const double rotation = state.rotation[anchor]+fraction*tau*0.5;
+            const Complex component = bins[k]*std::polar(1.f+tonal*(gain-1.f),float(rotation));
+            if (lower>0) output[lower] += (1.f-fraction)*component;
+            if (lower+1<nyquist) output[lower+1] -= fraction*component;
         }
         for (int k=1; k<nyquist; ++k) output[size-k] = std::conj(output[k]);
         fft.perform(output.data(),input.data(),true);
