@@ -12,6 +12,7 @@ public:
     int spectralPercent() const { return lastSpectralPercent; }
     bool retryingSpectrum() const { return spectralRetry > 0; }
     void jumpPitch() { snap = true; }
+    void setEngineBias(int value) { engineBias = std::clamp(value, -100, 100) * 0.01; }
     void setFormantScale(double v) { formant = std::clamp(v,1./64,64.); }
     void setFormantGuard(float v) { guard = v; }
     void setHighNoteLimit(float v) { limit = v; }
@@ -22,6 +23,8 @@ private:
     std::shared_ptr<const WaveData> wav;
     int begin,end;
     double step,startNote,smoothing,position,pitch=0,formant=1,color=1,untilPulse=0,mix=0;
+    double engineBias = 0;
+    bool preferGrains = false;
     bool snap=true;
     float guard=0,limit=2000,relax=0.75f;
     std::array<Grain,32> grains{};

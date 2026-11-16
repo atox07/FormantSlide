@@ -149,6 +149,19 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
             const double ahead = next+t*(wav->vocal[index+2].voiced-next);
             confidence = std::min(confidence,std::min(next,ahead));
         }
+        // Bias the periodicity decision. Narrow its overlap away from Auto,
+        // with hysteresis to avoid switching on each marginal analysis frame.
+        const double strength = std::abs(engineBias);
+        const double threshold = 0.5*(1.+engineBias);
+        const double hysteresis = 0.05*strength*(1.-strength);
+        if (confidence > threshold+hysteresis) preferGrains = true;
+        else if (confidence < threshold-hysteresis) preferGrains = false;
+        if (strength >= 1.) confidence = engineBias < 0 ? 1. : 0.;
+        else if (strength > 0.) {
+            const double bias = engineBias + (preferGrains ? -hysteresis : hysteresis);
+            const double width = 1.-std::abs(bias);
+            confidence = std::clamp((confidence-std::max(0.,bias))/width,0.,1.);
+        }
         // Around 12 ms towards spectral, 65 ms back towards grains.
         mix += smoothing*(confidence<mix ? 0.5 : 0.092)*(confidence-mix);
         if (confidence == 0 && mix < 1e-6) mix = 0;

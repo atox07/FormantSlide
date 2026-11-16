@@ -22,6 +22,7 @@ public:
         int firstNote = 60; // MIDI key assigned to slice 1
         int fallbackGlideMs = 250;
         int pitchCents = 0;
+        int engineBias = 0; // -100 PSOLA, 0 automatic, +100 STFT
         int midiOffsetTicks = 0;
     };
     struct Display {

@@ -243,6 +243,7 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
     // cambiano solo il pitch, quindi il formante resta fisso al valore del knob.
     // (1.0 = il formante segue il knob per intero; 0.5 = meta', 0 = knob solo pitch)
     constexpr double kKnobFormantAmount = 1.0;
+    voice.engine_->setEngineBias(slot.settings_.engineBias);
     voice.engine_->setFormantScale(std::exp2(kKnobFormantAmount * slot.settings_.pitchCents / 1200.0));
     {
         auto& dp = controls_;
@@ -370,6 +371,7 @@ void FormantSlideNative::updateSettings(const Settings& input) {
     auto& slot = slots_[selectedSlot()];
     const auto previous = slot.settings_;
     slot.settings_ = input;
+    slot.settings_.engineBias = std::clamp(slot.settings_.engineBias, -100, 100);
     slot.settings_.pitchCents = std::clamp(slot.settings_.pitchCents, -2400, 2400);
     slot.settings_.sliceCount = std::clamp(slot.settings_.sliceCount, 1, 64);
     slot.settings_.firstNote = std::clamp(slot.settings_.firstNote, 0, 127);
@@ -463,11 +465,11 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         SavedState s;
         if (save) {
             std::lock_guard<std::mutex> lock(mutex_);
-            s.version = 6;
+            s.version = 7;
             s.equal = slot.settings_.equalSlices;
             s.slices = slot.settings_.sliceCount;
             s.root = slot.settings_.firstNote;
-            s.all = 100; // Reserved v6 field; automatic blending.
+            s.all = uint32_t(slot.settings_.engineBias + 100);
             s.glide = slot.settings_.fallbackGlideMs;
             s.pitchOrLegacyOffset = slot.settings_.pitchCents;
             s.offset = slot.settings_.midiOffsetTicks;
@@ -492,7 +494,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
             ULONG read = 0;
             if (FAILED(stream->Read(&s, sizeof(s), &read)) ||
                 read < offsetof(SavedState, pitchOrLegacyOffset) ||
-                s.magic != 0x46534e32 || (s.version < 1 || s.version > 6)) return;
+                s.magic != 0x46534e32 || (s.version < 1 || s.version > 7)) return;
             if (index==0) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 const StftDevParams defaults;
@@ -504,6 +506,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
             }
             if (s.version>=5) records=4;
             Settings restored;
+            if (s.version >= 7) restored.engineBias = int(std::min(s.all, uint32_t(200))) - 100;
             restored.equalSlices = s.equal != 0;
             restored.sliceCount = int(s.slices);
             restored.fallbackGlideMs = int(s.glide);

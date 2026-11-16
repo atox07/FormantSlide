@@ -9,7 +9,7 @@
 
 namespace {
 constexpr int editorWidth = 680;
-constexpr int editorHeight = 490;
+constexpr int editorHeight = 526;
 
 // ---------------------------------------------------------------------------
 // Palette (FL-like: charcoal greys + orange accent). Tweak here to retune
@@ -190,6 +190,22 @@ public:
         setLookAndFeel(&theme_);
 
         setWantsKeyboardFocus(true);
+        addAndMakeVisible(engineBias_);
+        addAndMakeVisible(psolaLabel_);
+        addAndMakeVisible(stftLabel_);
+        setLabel(psolaLabel_, "PSOLA");
+        setLabel(stftLabel_, "STFT");
+        engineBias_.setSliderStyle(juce::Slider::LinearHorizontal);
+        engineBias_.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+        engineBias_.setRange(-100, 100, 1);
+        engineBias_.setDoubleClickReturnValue(true, 0);
+        engineBias_.setName("PSOLA / Auto / STFT");
+        engineBias_.setPopupDisplayEnabled(true, true, this);
+        engineBias_.textFromValueFunction = [](double value) -> juce::String {
+            if (value == 0) return "Auto";
+            return juce::String(value < 0 ? "PSOLA +" : "STFT +") + juce::String(int(std::abs(value)));
+        };
+        engineBias_.onValueChange = [this] { pushSettings(); };
         addAndMakeVisible(slotBox_);
         slotBox_.addItemList({"Slot A","Slot B","Slot C","Slot D"},1);
         slotBox_.setSelectedId(plugin_.selectedSlot()+1,juce::dontSendNotification);
@@ -287,7 +303,7 @@ public:
             if (existing.existsAsFile()) thumbnail_.setSource(new juce::FileInputSource(existing));
         }
         refreshStatus();
-        for (auto* slider : {&count_, &pitch_, &root_, &guardSlider_[0], &guardSlider_[1], &guardSlider_[2]}) {
+        for (auto* slider : {&engineBias_, &count_, &pitch_, &root_, &guardSlider_[0], &guardSlider_[1], &guardSlider_[2]}) {
             slider->onDragStart = [this] { gesture_ = true; captured_ = false; };
             slider->onDragEnd = [this] { gesture_ = false; };
         }
@@ -430,7 +446,11 @@ public:
             guardSlider_[i].setBounds(panelGuard_.getX() + 136, ry, panelGuard_.getWidth() - 136 - 12, 22);
         }
 
-        warningLabel_.setBounds(m, panelGuard_.getBottom() + 6, w - 2 * m, 20);
+        const int engineY = panelGuard_.getBottom() + 3;
+        psolaLabel_.setBounds(m + 12, engineY, 54, 26);
+        engineBias_.setBounds(m + 66, engineY, w - 2*m - 132, 26);
+        stftLabel_.setBounds(w - m - 60, engineY, 54, 26);
+        warningLabel_.setBounds(m, engineY + 31, w - 2 * m, 20);
     }
 
     void mouseDown(const juce::MouseEvent& event) override {
@@ -558,7 +578,8 @@ private:
     }
     juce::Label pitchLabel_;
     juce::Slider pitch_;
-    juce::Slider count_, root_;
+    juce::Label psolaLabel_, stftLabel_;
+    juce::Slider count_, root_, engineBias_;
     juce::AudioFormatManager thumbnailFormats_;
     juce::AudioThumbnailCache cache_{5};
     juce::AudioThumbnail thumbnail_;
@@ -609,6 +630,7 @@ private:
         const auto s = plugin_.display().settings;
         sliceMode_.setSelectedId(s.equalSlices ? 2 : 1, juce::dontSendNotification);
         count_.setValue(s.sliceCount, juce::dontSendNotification);
+        engineBias_.setValue(s.engineBias, juce::dontSendNotification);
         pitch_.setValue(s.pitchCents / 100.0, juce::dontSendNotification);
         {
             auto& dp = plugin_.guardControls();
@@ -628,6 +650,7 @@ private:
         auto settings = plugin_.display().settings;
         settings.equalSlices = sliceMode_.getSelectedId() == 2;
         settings.sliceCount = int(std::lround(count_.getValue()));
+        settings.engineBias = int(engineBias_.getValue());
         settings.pitchCents = int(std::lround(pitch_.getValue() * 100.0));
         settings.firstNote = int(std::lround(root_.getValue()));
         rememberEdit();
