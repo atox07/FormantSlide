@@ -5,7 +5,9 @@
 StftVoice::StftVoice(std::shared_ptr<const WaveData> data,int first,int last,double rate,double hz,double sourceStep)
     : wav(std::move(data)), begin(std::clamp(first,0,wav->frames())),
       end(std::clamp(last,begin,wav->frames())), step(sourceStep),
-      startNote(hz), smoothing(-std::expm1(-1./(0.006*rate))), position(begin) {
+      startNote(hz), smoothing(-std::expm1(-1./(0.006*rate))), position(begin),
+      bodyFilter(-std::expm1(-6.283185307179586*1800./rate)),
+      fadeStep(1./std::max(1.,0.008*rate)) {
     for (int j=0; j<size; ++j)
         window[j] = float(0.5-0.5*std::cos(6.283185307179586*j/size));
 }
@@ -26,7 +28,7 @@ float StftVoice::read(double where, int ch) const {
 }
 
 // Overlap-add frames share the exact source timeline of the PSOLA grains.
-void StftVoice::spectralFrame(int offset, double ratio, double formantScale, bool first) {
+void StftVoice::spectralFrame(int offset, double ratio, bool first) {
     constexpr double tau = 6.283185307179586;
     constexpr int nyquist = size/2;
     for (int ch=0; ch<2; ++ch) {
@@ -36,17 +38,23 @@ void StftVoice::spectralFrame(int offset, double ratio, double formantScale, boo
         fft.perform(input.data(),bins.data(),false);
         output.fill({});
         for (int k=0; k<=nyquist; ++k) magnitude[k] = std::abs(bins[k]);
-        // Local RMS envelope provides a bounded formant correction. The
-        // tonal confidence controls how strongly that correction is applied.
-        double energy = 0;
+        // Compare broad-band power on the same frequency grid before and
+        // after relocation, including diffuse components and overlapping peaks.
         constexpr int width = 8;
-        for (int j=0; j<width; ++j) energy += double(magnitude[j])*magnitude[j];
+        auto bandPower = [&](int k, double& power) {
+            if (k+width<=nyquist) power += double(magnitude[k+width])*magnitude[k+width];
+            if (k>width) power -= double(magnitude[k-width-1])*magnitude[k-width-1];
+            return float(std::max(0.,power));
+        };
+        auto initialPower = [&] {
+            double power = 0;
+            for (int j=0; j<width; ++j) power += double(magnitude[j])*magnitude[j];
+            return power;
+        };
+        double energy = initialPower();
         int count = 0;
         for (int k=0; k<=nyquist; ++k) {
-            if (k+width<=nyquist) energy += double(magnitude[k+width])*magnitude[k+width];
-            if (k>width) energy -= double(magnitude[k-width-1])*magnitude[k-width-1];
-            envelope[k] = float(std::sqrt(std::max(0.,energy)/
-                (1+std::min(nyquist,k+width)-std::max(0,k-width))));
+            envelope[k] = bandPower(k,energy);
             if (k>0 && k<nyquist && magnitude[k]>magnitude[k-1] && magnitude[k]>=magnitude[k+1])
                 peaks[count++] = k;
         }
@@ -55,17 +63,6 @@ void StftVoice::spectralFrame(int offset, double ratio, double formantScale, boo
             const double angle = std::arg(bins[k]);
             const double expected = tau*hop*k/size;
             const double advance = expected + (first ? 0. : std::remainder(angle-state.phase[k]-expected,tau));
-            const float frequency = float(advance*(size/(tau*hop)));
-            const float drift = std::abs(frequency-state.peakFrequency[k]);
-            const float evidence = std::clamp(1.f-drift/0.20f,0.f,1.f);
-            // Neighbouring harmonics can bury each other's spectral contrast.
-            // Accumulate evidence only for a resolved, persistent peak.
-            const bool peak = k>0 && k<nyquist && magnitude[k]>magnitude[k-1] &&
-                              magnitude[k]>=magnitude[k+1] && magnitude[k]>1e-6f;
-            const float target = peak && std::abs(frequency-k)<0.65f ? evidence : 0.f;
-            state.stableTone[k] = first ? 0.f : state.stableTone[k] +
-                (target-state.stableTone[k])*(target>state.stableTone[k] ? 0.30f : 0.70f);
-            state.peakFrequency[k] = frequency;
             state.phase[k] = angle;
             state.rotation[k] = first ? 0. : std::remainder(state.rotation[k]+(ratio-1)*advance,tau);
         }
@@ -73,30 +70,27 @@ void StftVoice::spectralFrame(int offset, double ratio, double formantScale, boo
             if (k==0) { output[0] += bins[0]; continue; }
             while (nearest+1<count && 2*k>peaks[nearest]+peaks[nearest+1]) ++nearest;
             const int pk = count ? peaks[nearest] : k;
-            const float contrast = magnitude[pk]/std::max(1e-8f,envelope[pk]);
-            const float prominence = std::clamp((contrast-1.35f)/1.35f,0.f,1.f);
-            const float persistence = std::clamp((state.stableTone[pk]-0.5f)*2.5f,0.f,1.f);
-            const float tonal = std::max(prominence,persistence)*
-                                std::clamp((4.f-std::abs(k-pk))/2.f,0.f,1.f);
-            // Move each component once. Diffuse regions carry pitched FX too:
-            // use confidence for envelope correction, never for a dry bypass.
             const int anchor = std::abs(k-pk)<=3 ? pk : k;
             const double displacement = (ratio-1)*anchor;
             const double dest = k+displacement;
             if (dest<=0 || dest>=nyquist) continue;
             const int lower = int(dest);
             const float fraction = float(dest-lower);
-            const double envPos = std::clamp(dest/formantScale,0.,double(nyquist));
-            const int envLo = int(envPos);
-            const float env = envelope[envLo] + float(envPos-envLo)*
-                (envelope[std::min(envLo+1,nyquist)]-envelope[envLo]);
-            const float gain = std::clamp(env/std::max(envelope[k],1e-8f),0.24f,4.f);
             // Interpolate the relocation about the window centre. Adjacent
             // FFT basis functions differ by pi there, hence the minus sign.
             const double rotation = state.rotation[anchor]+fraction*tau*0.5;
-            const Complex component = bins[k]*std::polar(1.f+tonal*(gain-1.f),float(rotation));
+            const Complex component = bins[k]*std::polar(1.f,float(rotation));
             if (lower>0) output[lower] += (1.f-fraction)*component;
             if (lower+1<nyquist) output[lower+1] -= fraction*component;
+        }
+        for (int k=0; k<=nyquist; ++k) magnitude[k] = std::abs(output[k]);
+        energy = initialPower();
+        for (int k=0; k<=nyquist; ++k) {
+            const float shiftedPower = bandPower(k,energy);
+            // Limit boosts in spectral holes; never synthesise a missing harmonic.
+            const float gain = std::clamp(std::sqrt((envelope[k]+1e-12f)/
+                                                    (shiftedPower+1e-12f)),0.24f,4.f);
+            output[k] *= gain;
         }
         for (int k=1; k<nyquist; ++k) output[size-k] = std::conj(output[k]);
         fft.perform(output.data(),input.data(),true);
@@ -149,22 +143,6 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
             const double ahead = next+t*(wav->vocal[index+2].voiced-next);
             confidence = std::min(confidence,std::min(next,ahead));
         }
-        // Bias the periodicity decision. Narrow its overlap away from Auto,
-        // with hysteresis to avoid switching on each marginal analysis frame.
-        const double strength = std::abs(engineBias);
-        const double threshold = 0.5*(1.+engineBias);
-        const double hysteresis = 0.05*strength*(1.-strength);
-        if (confidence > threshold+hysteresis) preferGrains = true;
-        else if (confidence < threshold-hysteresis) preferGrains = false;
-        if (strength >= 1.) confidence = engineBias < 0 ? 1. : 0.;
-        else if (strength > 0.) {
-            const double bias = engineBias + (preferGrains ? -hysteresis : hysteresis);
-            const double width = 1.-std::abs(bias);
-            confidence = std::clamp((confidence-std::max(0.,bias))/width,0.,1.);
-        }
-        // Around 12 ms towards spectral, 65 ms back towards grains.
-        mix += smoothing*(confidence<mix ? 0.5 : 0.092)*(confidence-mix);
-        if (confidence == 0 && mix < 1e-6) mix = 0;
         effectMix += smoothing*((shifted ? 1. : 0.)-effectMix);
         const bool process = shifted || effectMix>1e-5;
         if (!process) spectralActive = false;
@@ -175,9 +153,9 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
                     for (auto& channel : spectral) channel.overlap.fill(0);
                     spectralCursor = 0;
                     for (int offset=hop-size; offset<0; offset+=hop)
-                        spectralFrame(offset,ratio,color,offset==hop-size);
+                        spectralFrame(offset,ratio,offset==hop-size);
                 }
-                spectralFrame(0,ratio,color,false);
+                spectralFrame(0,ratio,false);
                 spectralActive = true;
             } catch (...) {
                 recoverSpectrum();
@@ -264,6 +242,27 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         }
         if (spectralActive) spectralReturn += smoothing*(1.-spectralReturn);
         const double coverage = std::min(1.,weight*8.);
+        // Compare the body of the actual STFT output with the source. Compare
+        // stereo powers separately so an out-of-phase WAV cannot cancel here.
+        const double inputs[] = {dry[0],dry[1],sl,sr};
+        for (int channel=0; channel<4; ++channel)
+            bodyLow[channel] += bodyFilter*(inputs[channel]-bodyLow[channel]);
+        const double followBody = smoothing*0.25; // approximately 24 ms
+        sourceBody += followBody*(bodyLow[0]*bodyLow[0]+bodyLow[1]*bodyLow[1]-sourceBody);
+        spectralBody += followBody*(bodyLow[2]*bodyLow[2]+bodyLow[3]*bodyLow[3]-spectralBody);
+
+        // Auto stays spectral until a reliable pitched source loses body on an
+        // upward slide. A Schmitt trigger keeps borderline vowels on one engine.
+        const double loss = std::clamp(1.-spectralBody/std::max(sourceBody,1e-10),0.,1.);
+        const double upward = std::clamp(pitch*2.,0.,1.); // full sensitivity at +6 st
+        const double evidence = confidence*upward*loss - engineBias;
+        const bool usable = shifted && frame.period>0 && coverage>=1. && sourceBody>1e-9;
+        if (engineBias <= -1.) preferGrains = shifted;
+        else if (!usable || engineBias >= 1.) preferGrains = false;
+        else if (confidence < 0.62 || evidence < 0.24) preferGrains = false;
+        else if (confidence >= 0.80 && evidence >= 0.48 && effectMix > 0.95)
+            preferGrains = true;
+        mix = preferGrains ? std::min(1.,mix+fadeStep) : std::max(0.,mix-fadeStep);
         const double wet = coverage*(1.-spectralReturn*(1.-mix));
         const double norm = 1./std::max(1e-9,weight);
         const double grain[2] = {l*norm,r*norm};

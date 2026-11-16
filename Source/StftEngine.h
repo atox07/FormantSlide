@@ -25,6 +25,9 @@ private:
     double step,startNote,smoothing,position,pitch=0,formant=1,color=1,untilPulse=0,mix=0;
     double engineBias = 0;
     bool preferGrains = false;
+    double bodyFilter, fadeStep;
+    std::array<double,4> bodyLow{};
+    double sourceBody = 0, spectralBody = 0;
     bool snap=true;
     float guard=0,limit=2000,relax=0.75f;
     std::array<Grain,32> grains{};
@@ -38,7 +41,6 @@ private:
     struct SpectralChannel {
         std::array<float,size> overlap{};
         std::array<double,size/2+1> phase{}, rotation{};
-        std::array<float,size/2+1> peakFrequency{}, stableTone{};
     };
     std::array<SpectralChannel,2> spectral{};
     int spectralCursor = 0;
@@ -49,7 +51,7 @@ private:
     int lastSpectralPercent = -1;
     double effectMix = 0;
     double spectralPower = 0, grainPower = 0, crossPower = 0, blendGain = 1;
-    void spectralFrame(int offset, double ratio, double formantScale, bool first);
+    void spectralFrame(int offset, double ratio, bool first);
     int used=0;
     float read(double where,int channel) const;
 };
