@@ -12,6 +12,7 @@ public:
     int spectralPercent() const { return lastSpectralPercent; }
     bool retryingSpectrum() const { return spectralRetry > 0; }
     void jumpPitch() { snap = true; }
+    void setPsolaPercent(int percent) { psolaLimit = std::clamp(percent,0,100)*0.01; }
     void setFormantScale(double v) { formant = std::clamp(v,1./64,64.); }
     void setFormantGuard(float v) { guard = v; }
     void setHighNoteLimit(float v) { limit = v; }
@@ -43,6 +44,7 @@ private:
     double spectralReturn = 1;
     void recoverSpectrum();
     int lastSpectralPercent = -1;
+    double psolaLimit = 1;
     double effectMix = 0;
     double spectralPower = 0, grainPower = 0, crossPower = 0, blendGain = 1;
     void spectralFrame(int offset, double ratio, double formantScale, bool first);

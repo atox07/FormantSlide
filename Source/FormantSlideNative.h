@@ -20,7 +20,7 @@ public:
         bool equalSlices = false;
         int sliceCount = 12;
         int firstNote = 60; // MIDI key assigned to slice 1
-        bool allSlideColors = true; // false = channel/color 5 only
+        int psolaPercent = 50; // Maximum normal PSOLA contribution for this slot
         int fallbackGlideMs = 250;
         int pitchCents = 0;
         int midiOffsetTicks = 0;

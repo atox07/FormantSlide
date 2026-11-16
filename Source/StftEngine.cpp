@@ -150,7 +150,9 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
             confidence = std::min(confidence,std::min(next,ahead));
         }
         // Around 12 ms towards spectral, 65 ms back towards grains.
+        confidence *= psolaLimit;
         mix += smoothing*(confidence<mix ? 0.5 : 0.092)*(confidence-mix);
+        if (confidence == 0 && mix < 1e-6) mix = 0;
         effectMix += smoothing*((shifted ? 1. : 0.)-effectMix);
         const bool process = shifted || effectMix>1e-5;
         if (!process) spectralActive = false;
@@ -229,7 +231,7 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         }
         if (spectralActive) spectralReturn += smoothing*(1.-spectralReturn);
         const double coverage = std::min(1.,weight*8.);
-        const double wet = coverage*(1.-spectralReturn*(1.-mix));
+        const double wet = coverage*(spectralReturn*mix + (1.-spectralReturn)*psolaLimit);
         const double norm = 1./std::max(1e-9,weight);
         const double grain[2] = {l*norm,r*norm};
         if (!spectralActive && process) {

@@ -243,6 +243,7 @@ void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
     // cambiano solo il pitch, quindi il formante resta fisso al valore del knob.
     // (1.0 = il formante segue il knob per intero; 0.5 = meta', 0 = knob solo pitch)
     constexpr double kKnobFormantAmount = 1.0;
+    voice.engine_->setPsolaPercent(slot.settings_.psolaPercent);
     voice.engine_->setFormantScale(std::exp2(kKnobFormantAmount * slot.settings_.pitchCents / 1200.0));
     {
         auto& dp = controls_;
@@ -463,11 +464,11 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
         SavedState s;
         if (save) {
             std::lock_guard<std::mutex> lock(mutex_);
-            s.version = 5;
+            s.version = 6;
             s.equal = slot.settings_.equalSlices;
             s.slices = slot.settings_.sliceCount;
             s.root = slot.settings_.firstNote;
-            s.all = slot.settings_.allSlideColors;
+            s.all = slot.settings_.psolaPercent; // v6 reuses the obsolete slide-colour field
             s.glide = slot.settings_.fallbackGlideMs;
             s.pitchOrLegacyOffset = slot.settings_.pitchCents;
             s.offset = slot.settings_.midiOffsetTicks;
@@ -492,7 +493,7 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
             ULONG read = 0;
             if (FAILED(stream->Read(&s, sizeof(s), &read)) ||
                 read < offsetof(SavedState, pitchOrLegacyOffset) ||
-                s.magic != 0x46534e32 || (s.version < 1 || s.version > 5)) return;
+                s.magic != 0x46534e32 || (s.version < 1 || s.version > 6)) return;
             if (index==0) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 const StftDevParams defaults;
@@ -502,11 +503,11 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
                 stopVoices(); slots_ = {}; history_.clear(); selection=0;
                 midi_ = {}; midiPath_.clear();
             }
-            if (s.version==5) records=4;
+            if (s.version>=5) records=4;
             Settings restored;
             restored.equalSlices = s.equal != 0;
             restored.sliceCount = int(s.slices);
-            restored.allSlideColors = s.all != 0;
+            restored.psolaPercent = s.version < 6 ? 100 : int(std::min(s.all,100u));
             restored.fallbackGlideMs = int(s.glide);
             restored.midiOffsetTicks = s.offset;
             restored.firstNote = std::clamp(int(s.root), 0, 127);
