@@ -55,6 +55,17 @@ void StftVoice::spectralFrame(int offset, double ratio, double formantScale, boo
             const double angle = std::arg(bins[k]);
             const double expected = tau*hop*k/size;
             const double advance = expected + (first ? 0. : std::remainder(angle-state.phase[k]-expected,tau));
+            const float frequency = float(advance*(size/(tau*hop)));
+            const float drift = std::abs(frequency-state.peakFrequency[k]);
+            const float evidence = std::clamp(1.f-drift/0.20f,0.f,1.f);
+            // Neighbouring harmonics can bury each other's spectral contrast.
+            // Accumulate evidence only for a resolved, persistent peak.
+            const bool peak = k>0 && k<nyquist && magnitude[k]>magnitude[k-1] &&
+                              magnitude[k]>=magnitude[k+1] && magnitude[k]>1e-6f;
+            const float target = peak && std::abs(frequency-k)<0.65f ? evidence : 0.f;
+            state.stableTone[k] = first ? 0.f : state.stableTone[k] +
+                (target-state.stableTone[k])*(target>state.stableTone[k] ? 0.30f : 0.70f);
+            state.peakFrequency[k] = frequency;
             state.phase[k] = angle;
             state.rotation[k] = first ? 0. : std::remainder(state.rotation[k]+(ratio-1)*advance,tau);
         }
@@ -63,7 +74,9 @@ void StftVoice::spectralFrame(int offset, double ratio, double formantScale, boo
             while (nearest+1<count && 2*k>peaks[nearest]+peaks[nearest+1]) ++nearest;
             const int pk = peaks[nearest];
             const float contrast = magnitude[pk]/std::max(1e-8f,envelope[pk]);
-            const float tonal = std::clamp((contrast-1.35f)/1.35f,0.f,1.f)*
+            const float prominence = std::clamp((contrast-1.35f)/1.35f,0.f,1.f);
+            const float persistence = std::clamp((state.stableTone[pk]-0.5f)*2.5f,0.f,1.f);
+            const float tonal = std::max(prominence,persistence)*
                                 std::clamp((4.f-std::abs(k-pk))/2.f,0.f,1.f);
             output[k] += (1-tonal)*bins[k];
             const double dest = k+(ratio-1)*pk;

@@ -34,6 +34,7 @@ private:
     struct SpectralChannel {
         std::array<float,size> overlap{};
         std::array<double,size/2+1> phase{}, rotation{};
+        std::array<float,size/2+1> peakFrequency{}, stableTone{};
     };
     std::array<SpectralChannel,2> spectral{};
     int spectralCursor = 0;
