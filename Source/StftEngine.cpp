@@ -136,10 +136,21 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         }
         const bool shifted = std::abs(pitch)>1e-5 || std::abs(color-1)>1e-5;
         double confidence = frame.voiced;
-        if (index+1 < wav->vocal.size())
+        if (index+1 <= size_t(end-1)/wav->analysisHop && index+1 < wav->vocal.size())
             confidence += (wav->vocal[index+1].voiced-confidence)*
                           (position/wav->analysisHop-double(index));
-        mix += (0.35*smoothing)*(confidence-mix);
+        // The slice is preanalysed: start yielding to STFT before pitch marks
+        // disappear, and require sustained periodicity to bring PSOLA back.
+        // Interpolate the lookahead as well so it has no 10 ms steps.
+        const size_t lastFrame = size_t(end-1)/wav->analysisHop;
+        if (index+2 <= lastFrame && index+2 < wav->vocal.size()) {
+            const double t = position/wav->analysisHop-double(index);
+            const double next = wav->vocal[index+1].voiced;
+            const double ahead = next+t*(wav->vocal[index+2].voiced-next);
+            confidence = std::min(confidence,std::min(next,ahead));
+        }
+        // Around 12 ms towards spectral, 65 ms back towards grains.
+        mix += smoothing*(confidence<mix ? 0.5 : 0.092)*(confidence-mix);
         effectMix += smoothing*((shifted ? 1. : 0.)-effectMix);
         const bool process = shifted || effectMix>1e-5;
         if (!process) spectralActive = false;
