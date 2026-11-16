@@ -190,11 +190,6 @@ public:
         setLookAndFeel(&theme_);
 
         setWantsKeyboardFocus(true);
-        addAndMakeVisible(psolaBox_);
-        for (int percent : {100,50,25,0})
-            psolaBox_.addItem(percent == 0 ? juce::String("STFT only") :
-                              "PSOLA max " + juce::String(percent) + "%", percent+1);
-        psolaBox_.onChange = [this] { pushSettings(); };
         addAndMakeVisible(slotBox_);
         slotBox_.addItemList({"Slot A","Slot B","Slot C","Slot D"},1);
         slotBox_.setSelectedId(plugin_.selectedSlot()+1,juce::dontSendNotification);
@@ -403,8 +398,7 @@ public:
         waveBounds_ = {m, 46, w - 2 * m, 150};
 
         // Status line.
-        statusLabel_.setBounds(m, 202, w - 2 * m - 145, 24);
-        psolaBox_.setBounds(w-m-140,202,140,24);
+        statusLabel_.setBounds(m, 202, w - 2 * m, 24);
 
         // Panels.
         const int py = 236, ph = 120;
@@ -542,7 +536,7 @@ private:
     FlLook theme_;
     juce::TextButton loadButton_{"Load WAV"};
     juce::Label wavLabel_, sliceModeLabel_, countLabel_, rootLabel_, statusLabel_, warningLabel_;
-    juce::ComboBox sliceMode_, slotBox_, psolaBox_;
+    juce::ComboBox sliceMode_, slotBox_;
     std::wstring previewPath_;
     bool gesture_ = false, captured_ = false;
     void rememberEdit() {
@@ -613,7 +607,6 @@ private:
     void pullSettings() {
         updatingControls_ = true;
         const auto s = plugin_.display().settings;
-        psolaBox_.setSelectedId(s.psolaPercent+1,juce::dontSendNotification);
         sliceMode_.setSelectedId(s.equalSlices ? 2 : 1, juce::dontSendNotification);
         count_.setValue(s.sliceCount, juce::dontSendNotification);
         pitch_.setValue(s.pitchCents / 100.0, juce::dontSendNotification);
@@ -633,7 +626,6 @@ private:
     void pushSettings() {
         if (updatingControls_) return;
         auto settings = plugin_.display().settings;
-        settings.psolaPercent = std::clamp(psolaBox_.getSelectedId()-1,0,100);
         settings.equalSlices = sliceMode_.getSelectedId() == 2;
         settings.sliceCount = int(std::lround(count_.getValue()));
         settings.pitchCents = int(std::lround(pitch_.getValue() * 100.0));

@@ -150,7 +150,6 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
             confidence = std::min(confidence,std::min(next,ahead));
         }
         // Around 12 ms towards spectral, 65 ms back towards grains.
-        confidence *= psolaLimit;
         mix += smoothing*(confidence<mix ? 0.5 : 0.092)*(confidence-mix);
         if (confidence == 0 && mix < 1e-6) mix = 0;
         effectMix += smoothing*((shifted ? 1. : 0.)-effectMix);
@@ -178,24 +177,45 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
             // The pulse is usually due between two output samples.
             const double age = std::max(0.,-untilPulse);
             const double center = position+(radius-age)*step;
-            auto mark = std::lower_bound(wav->pulses.begin(),wav->pulses.end(),center);
-            if (mark != wav->pulses.begin() &&
-                (mark == wav->pulses.end() || center-mark[-1] < *mark-center)) --mark;
-            if (mark != wav->pulses.end() && *mark >= begin && *mark < end &&
-                std::abs(*mark-center) <= frame.period)
-                grains[used++] = {*mark+(age-radius)*step*color, step*color, age/(2*radius), 0.5/radius};
+            auto upper = std::lower_bound(wav->pulses.begin(),wav->pulses.end(),center);
+            const bool hasUpper = upper != wav->pulses.end() && *upper >= begin &&
+                                  *upper < end && *upper-center <= frame.period;
+            const bool hasLower = upper != wav->pulses.begin() && upper[-1] >= begin &&
+                                  upper[-1] < end && center-upper[-1] <= frame.period;
+            if (hasLower || hasUpper) {
+                // Morph adjacent aligned cycles instead of abruptly switching
+                // their waveform halfway between marks. Never cross a slice
+                // edge or morph across an unvoiced gap.
+                double mark = hasLower ? upper[-1] : *upper;
+                double distance = 0, blend = 0;
+                if (hasLower && hasUpper) {
+                    const double gap = *upper-mark;
+                    if (gap >= 0.7*frame.period && gap <= 1.3*frame.period) {
+                        distance = gap;
+                        blend = (center-mark)/gap;
+                    } else if (*upper-center < center-mark) {
+                        mark = *upper;
+                    }
+                }
+                grains[used++] = {mark+(age-radius)*step*color,step*color,
+                                  age/(2*radius),0.5/radius,distance,blend};
+            }
             untilPulse += spacing;
         }
         untilPulse = std::max(-1.,untilPulse-1.);
         double weight = 0, l = 0, r = 0;
         for (int g = 0; g < used;) {
             auto& grain = grains[g];
-            if (grain.source >= begin && grain.source < end) {
-                const double w = 0.5-0.5*std::cos(6.283185307179586*grain.phase);
-                weight += w;
-                l += w*read(grain.source,0);
-                r += w*read(grain.source,1);
-            }
+            const double w = 0.5-0.5*std::cos(6.283185307179586*grain.phase);
+            auto accumulate = [&](double source, double amount) {
+                if (source < begin || source >= end || amount <= 0) return;
+                weight += amount;
+                l += amount*read(source,0);
+                r += amount*read(source,1);
+            };
+            accumulate(grain.source,w*(1.-grain.cycleBlend));
+            if (grain.cycleBlend > 0)
+                accumulate(grain.source+grain.cycleDistance,w*grain.cycleBlend);
             grain.source += grain.speed;
             grain.phase += grain.increment;
             if (grain.phase >= 1.) grain = grains[--used];
@@ -231,7 +251,7 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         }
         if (spectralActive) spectralReturn += smoothing*(1.-spectralReturn);
         const double coverage = std::min(1.,weight*8.);
-        const double wet = coverage*(spectralReturn*mix + (1.-spectralReturn)*psolaLimit);
+        const double wet = coverage*(1.-spectralReturn*(1.-mix));
         const double norm = 1./std::max(1e-9,weight);
         const double grain[2] = {l*norm,r*norm};
         if (!spectralActive && process) {
