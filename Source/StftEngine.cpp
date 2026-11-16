@@ -37,7 +37,7 @@ void StftVoice::spectralFrame(int offset, double ratio, double formantScale, boo
         output.fill({});
         for (int k=0; k<=nyquist; ++k) magnitude[k] = std::abs(bins[k]);
         // Local RMS envelope provides a bounded formant correction. The
-        // local floor controls how much diffuse energy stays at source Hz.
+        // tonal confidence controls how strongly that correction is applied.
         double energy = 0;
         constexpr int width = 8;
         for (int j=0; j<width; ++j) energy += double(magnitude[j])*magnitude[j];
@@ -70,23 +70,26 @@ void StftVoice::spectralFrame(int offset, double ratio, double formantScale, boo
             state.rotation[k] = first ? 0. : std::remainder(state.rotation[k]+(ratio-1)*advance,tau);
         }
         for (int k=0; k<=nyquist; ++k) {
-            if (!count) { output[k] += bins[k]; continue; }
+            if (k==0) { output[0] += bins[0]; continue; }
             while (nearest+1<count && 2*k>peaks[nearest]+peaks[nearest+1]) ++nearest;
-            const int pk = peaks[nearest];
+            const int pk = count ? peaks[nearest] : k;
             const float contrast = magnitude[pk]/std::max(1e-8f,envelope[pk]);
             const float prominence = std::clamp((contrast-1.35f)/1.35f,0.f,1.f);
             const float persistence = std::clamp((state.stableTone[pk]-0.5f)*2.5f,0.f,1.f);
             const float tonal = std::max(prominence,persistence)*
                                 std::clamp((4.f-std::abs(k-pk))/2.f,0.f,1.f);
-            output[k] += (1-tonal)*bins[k];
-            const double dest = k+(ratio-1)*pk;
-            if (dest<1 || dest>=nyquist-1 || tonal<=0) continue;
+            // Move each component once. Diffuse regions carry pitched FX too:
+            // use confidence for envelope correction, never for a dry bypass.
+            const int anchor = std::abs(k-pk)<=3 ? pk : k;
+            const double displacement = (ratio-1)*anchor;
+            const double dest = k+displacement;
+            if (dest<0.5 || dest>=nyquist-0.5) continue;
             const int bin = int(std::round(dest));
             const int envBin = int(std::clamp(dest/formantScale,0.,double(nyquist)));
             const float gain = std::clamp(envelope[envBin]/std::max(envelope[k],1e-8f),0.24f,4.f);
             // Phase is referenced to the middle of the Hann window.
-            const double rotation = state.rotation[pk]+(pk*(ratio-1)-(bin-k))*tau*0.5;
-            output[bin] += bins[k]*std::polar(tonal*gain,float(rotation));
+            const double rotation = state.rotation[anchor]+(displacement-(bin-k))*tau*0.5;
+            output[bin] += bins[k]*std::polar(1.f+tonal*(gain-1.f),float(rotation));
         }
         for (int k=1; k<nyquist; ++k) output[size-k] = std::conj(output[k]);
         fft.perform(output.data(),input.data(),true);
