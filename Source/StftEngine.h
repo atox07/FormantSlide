@@ -19,10 +19,10 @@ public:
     void setHighNoteRelaxMax(float v) { relax = v; }
 private:
     struct Grain { double source, speed, phase, increment;
-        double cycleDistance, cycleBlend; };
+        double cycleDistance, cycleBlend, edgeFadeInverse; };
     std::shared_ptr<const WaveData> wav;
     int begin,end;
-    double step,startNote,smoothing,position,pitch=0,formant=1,color=1,untilPulse=0,mix=0;
+    double step,startNote,smoothing,position,pitch=0,formant=1,color=1,pulseCountdown=0,mix=0;
     double engineBias = 0;
     bool preferGrains = false;
     double bodyFilter, fadeStep;
@@ -36,7 +36,7 @@ private:
     juce::dsp::FFT fft{order};
     std::array<float,size> window{};
     std::array<Complex,size> input{}, bins{}, output{};
-    std::array<float,size/2+1> envelope{}, magnitude{};
+    std::array<float,size/2+1> envelope{}, magnitude{}, diffuseWeight{}, airBand{};
     std::array<int,size/2+1> peaks{};
     struct SpectralChannel {
         std::array<float,size> overlap{};

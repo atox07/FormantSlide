@@ -7,7 +7,7 @@ struct VocalFrame { float period = 0, voiced = 0; };
 struct WaveData {
     int analysisHop = 1;
     std::vector<VocalFrame> vocal;
-    std::vector<int> pulses;
+    std::vector<double> pulses; // fractional positions in source samples
     std::vector<int> cueStarts;
     std::vector<float> stereo; // interleaved stereo
     int sampleRate = 44100;

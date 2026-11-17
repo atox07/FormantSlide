@@ -10,6 +10,8 @@ StftVoice::StftVoice(std::shared_ptr<const WaveData> data,int first,int last,dou
       fadeStep(1./std::max(1.,0.008*rate)) {
     for (int j=0; j<size; ++j)
         window[j] = float(0.5-0.5*std::cos(6.283185307179586*j/size));
+    for (int k=0; k<=size/2; ++k)
+        airBand[k] = float(std::clamp((k*rate/size-3200.)/3200.,0.,1.));
 }
 float StftVoice::read(double where, int ch) const {
     if (where < begin || where >= end) return 0.f;
@@ -52,9 +54,18 @@ void StftVoice::spectralFrame(int offset, double ratio, bool first) {
             return power;
         };
         double energy = initialPower();
+        double amplitude = 0;
+        for (int j=0; j<width; ++j) amplitude += magnitude[j];
         int count = 0;
         for (int k=0; k<=nyquist; ++k) {
             envelope[k] = bandPower(k,energy);
+            if (k+width<=nyquist) amplitude += magnitude[k+width];
+            if (k>width) amplitude -= magnitude[k-width-1];
+            // Broadband breath fills neighbouring bins. A resolved harmonic
+            // concentrates the same power in fewer bins.
+            const int bands = 1+std::min(nyquist,k+width)-std::max(0,k-width);
+            const double occupancy = amplitude*amplitude/(bands*double(envelope[k])+1e-18);
+            diffuseWeight[k] = airBand[k]*float(std::clamp((occupancy-0.35)/0.40,0.,1.));
             if (k>0 && k<nyquist && magnitude[k]>magnitude[k-1] && magnitude[k]>=magnitude[k+1])
                 peaks[count++] = k;
         }
@@ -88,8 +99,9 @@ void StftVoice::spectralFrame(int offset, double ratio, bool first) {
         for (int k=0; k<=nyquist; ++k) {
             const float shiftedPower = bandPower(k,energy);
             // Limit boosts in spectral holes; never synthesise a missing harmonic.
-            const float gain = std::clamp(std::sqrt((envelope[k]+1e-12f)/
-                                                    (shiftedPower+1e-12f)),0.24f,4.f);
+            const float diffuse = diffuseWeight[k];
+            const float gain = std::clamp(std::sqrt((envelope[k]+1e-12f)/(shiftedPower+1e-12f)),
+                                          0.24f-0.18f*diffuse, 4.f-2.75f*diffuse);
             output[k] *= gain;
         }
         for (int k=1; k<nyquist; ++k) output[size-k] = std::conj(output[k]);
@@ -121,7 +133,7 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         color += smoothing*(formant*std::pow(ratio/(formant*formant),release)-color);
         const size_t index = size_t(position)/wav->analysisHop;
         VocalFrame frame = index < wav->vocal.size() ? wav->vocal[index] : VocalFrame{};
-        if (frame.period > 0 && index+1 < wav->vocal.size()) {
+        if (frame.period > 0 && index+1 <= size_t(end-1)/wav->analysisHop && index+1 < wav->vocal.size()) {
             const auto& next = wav->vocal[index+1];
             if (next.period > 0 && std::abs(next.period-frame.period) < 0.2f*frame.period) {
                 const float t = float(position/wav->analysisHop - double(index));
@@ -162,18 +174,19 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
             }
         }
         // TD-PSOLA: select a source pulse, place its waveform at the MIDI period.
-        if (untilPulse <= 0 && shifted && frame.period > 0 && used < int(grains.size())) {
-            const double spacing = std::max(1.,frame.period/(step*ratio));
+        const double pulseRate = frame.period > 0 ? std::min(1.,step*ratio/frame.period) : 0.;
+        if (pulseRate > 0 && shifted) pulseCountdown -= pulseRate;
+        else pulseCountdown = 0;
+        if (pulseCountdown <= 0 && shifted && pulseRate > 0 && used < int(grains.size())) {
+            const double spacing = 1./pulseRate;
             const double radius = std::clamp(0.8*frame.period/(step*color), std::max(1.,0.65*spacing), spacing*12.);
             // The pulse is usually due between two output samples.
-            const double age = std::max(0.,-untilPulse);
+            const double age = std::min(1.,-pulseCountdown*spacing);
             const double center = position+(radius-age)*step;
             auto upper = std::lower_bound(wav->pulses.begin(),wav->pulses.end(),center);
-            const bool hasUpper = upper != wav->pulses.end() && *upper >= begin &&
-                                  *upper < end && *upper-center <= frame.period;
-            const bool hasLower = upper != wav->pulses.begin() && upper[-1] >= begin &&
-                                  upper[-1] < end && center-upper[-1] <= frame.period;
-            if (hasLower || hasUpper) {
+            const bool hasUpper = upper != wav->pulses.end() && *upper >= begin && *upper < end;
+            const bool hasLower = upper != wav->pulses.begin() && upper[-1] >= begin && upper[-1] < end;
+            if ((hasLower && center-upper[-1] <= frame.period) || (hasUpper && *upper-center <= frame.period)) {
                 // Morph adjacent aligned cycles instead of abruptly switching
                 // their waveform halfway between marks. Never cross a slice
                 // edge or morph across an unvoiced gap.
@@ -189,17 +202,19 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
                     }
                 }
                 grains[used++] = {mark+(age-radius)*step*color,step*color,
-                                  age/(2*radius),0.5/radius,distance,blend};
+                                  age/(2*radius),0.5/radius,distance,blend,
+                                  1./std::max(1.,std::min(0.20*frame.period,0.0015*wav->sampleRate))};
             }
-            untilPulse += spacing;
+            pulseCountdown = std::max(0.,pulseCountdown+1.);
         }
-        untilPulse = std::max(-1.,untilPulse-1.);
         double weight = 0, l = 0, r = 0;
         for (int g = 0; g < used;) {
             auto& grain = grains[g];
             const double w = 0.5-0.5*std::cos(6.283185307179586*grain.phase);
             auto accumulate = [&](double source, double amount) {
                 if (source < begin || source >= end || amount <= 0) return;
+                const double edge = std::min(source-begin,end-source)*grain.edgeFadeInverse;
+                if (edge < 1.) amount *= edge*edge*(3.-2.*edge);
                 weight += amount;
                 l += amount*read(source,0);
                 r += amount*read(source,1);
@@ -234,7 +249,7 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         if (stalled(silentGrains,expectGrain,l==0 && r==0) ||
             !std::isfinite(l) || !std::isfinite(r) || !std::isfinite(weight)) {
             used = 0;
-            untilPulse = 0;
+            pulseCountdown = 0;
             silentGrains = 0;
             grainPower = crossPower = 0;
             blendGain = 1;
@@ -257,7 +272,13 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         const double upward = std::clamp(pitch*2.,0.,1.); // full sensitivity at +6 st
         const double evidence = confidence*upward*loss - engineBias;
         const bool usable = shifted && frame.period>0 && coverage>=1. && sourceBody>1e-9;
-        if (engineBias <= -1.) preferGrains = shifted;
+        // Start the handover while the final voiced grains still have window
+        // coverage. On re-entry let the grain train fill before fading it in.
+        const bool entersGap = index+1 <= lastFrame && index+1 < wav->vocal.size() &&
+            wav->vocal[index+1].period <= 0 &&
+            ((index+1)*wav->analysisHop-position)*fadeStep <= step;
+        if (entersGap) preferGrains = false;
+        else if (engineBias <= -1.) preferGrains = shifted && frame.period>0 && coverage>=1.;
         else if (!usable || engineBias >= 1.) preferGrains = false;
         else if (confidence < 0.62 || evidence < 0.24) preferGrains = false;
         else if (confidence >= 0.80 && evidence >= 0.48 && effectMix > 0.95)

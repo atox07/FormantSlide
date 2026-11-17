@@ -1,5 +1,6 @@
 #include "WaveLoader.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -9,6 +10,39 @@
 #include <limits>
 
 namespace {
+struct PeriodCandidate {
+    VocalFrame frame;
+    float evidence = 0;
+    double pathScore = 0;
+    int previous = 0;
+};
+// Index zero is an unvoiced observation. Keep several local correlation
+// maxima so a temporarily loud harmonic does not decide the pulse train.
+using PeriodChoices = std::array<PeriodCandidate,7>;
+
+void linkPeriods(PeriodChoices& current, const PeriodChoices* previous) {
+    for (size_t i=0; i<current.size(); ++i) {
+        auto& c = current[i];
+        if (i && !c.frame.period) continue;
+        const double local = i ? c.evidence : 0.56;
+        c.pathScore = local;
+        if (!previous) continue;
+        double best = -std::numeric_limits<double>::infinity();
+        for (size_t j=0; j<previous->size(); ++j) {
+            const auto& p = (*previous)[j];
+            if (j && !p.frame.period) continue;
+            double cost = (i==0) != (j==0) ? 0.22 : 0.;
+            if (i && j)
+                cost = std::min(0.58,0.90*std::abs(std::log2(double(c.frame.period)/p.frame.period)));
+            if (p.pathScore-cost > best) {
+                best = p.pathScore-cost;
+                c.previous = int(j);
+            }
+        }
+        c.pathScore += best;
+    }
+}
+
 // Estimate periodicity on a reduced-rate analysis channel. Pulse locations
 // remain in original WAV coordinates and are shared by both stereo channels.
 void analyzeVoice(WaveData& w) {
@@ -28,11 +62,13 @@ void analyzeVoice(WaveData& w) {
     w.analysisHop = std::max(1, w.sampleRate / 100);
     const int maxLag = std::max(4, int(rate / 55));
     std::vector<double> score(maxLag + 1);
+    std::vector<PeriodChoices> paths;
+    paths.reserve((w.frames()-1)/w.analysisHop+1);
     for (int at = 0; at < w.frames(); at += w.analysisHop) {
         const int first = std::clamp(at / stride - maxLag, 0,
                                      std::max(0, int(x.size()) - 2*maxLag));
         const int count = std::min(maxLag, int(x.size()) - first - maxLag);
-        VocalFrame frame;
+        PeriodChoices choices{};
         if (count >= maxLag / 2) {
             for (int lag = 1; lag <= maxLag; ++lag) {
                 double diff = 0, energy = 1e-12;
@@ -44,68 +80,97 @@ void analyzeVoice(WaveData& w) {
                 score[lag] = energy > 1e-8 ? 1-diff/energy : 0;
             }
             const int lo = std::clamp(int(rate/2200), 2, maxLag-1);
-            const double best = *std::max_element(score.begin()+lo, score.end());
             for (int lag = lo; lag < maxLag; ++lag) {
-                if (score[lag] < std::max(0.55, best*0.92) ||
+                if (score[lag] < 0.48 ||
                     score[lag] < score[lag-1] || score[lag] <= score[lag+1]) continue;
+                const float evidence = float(score[lag]-0.018*std::log2(double(lag)/lo));
+                if (evidence <= choices.back().evidence) continue;
                 const double curvature = 2*score[lag]-score[lag-1]-score[lag+1];
                 const double offset = 0.5*(score[lag+1]-score[lag-1])/std::max(curvature,1e-9);
-                frame.period = float((lag+offset)*stride);
-                frame.voiced = float(std::clamp((score[lag]-0.55)/0.30,0.0,1.0));
-                break;
+                PeriodCandidate candidate;
+                candidate.frame.period = float((lag+offset)*stride);
+                candidate.frame.voiced = float(std::clamp((score[lag]-0.55)/0.30,0.0,1.0));
+                candidate.evidence = evidence;
+                for (size_t i=1; i<choices.size(); ++i)
+                    if (candidate.evidence > choices[i].evidence) std::swap(candidate,choices[i]);
             }
         }
-        w.vocal.push_back(frame);
+        linkPeriods(choices,paths.empty() ? nullptr : &paths.back());
+        paths.push_back(choices);
     }
-    // Repair isolated period outliers only when the surrounding voiced frames
-    // agree. Keep genuine transitions and unvoiced boundaries intact.
-    float previous = 0;
-    for (size_t i = 0; i + 1 < w.vocal.size(); ++i) {
-        auto& frame = w.vocal[i];
-        const float original = frame.period;
-        const float next = w.vocal[i+1].period;
-        if (previous > 0 && original > 0 && next > 0 &&
-            std::abs(previous-next) < 0.08f*previous &&
-            std::abs(original-previous) > 0.18f*previous)
-            frame.period = 0.5f*(previous+next);
-        previous = original;
+    w.vocal.resize(paths.size());
+    int selected = 0;
+    const auto& last = paths.back();
+    for (size_t i=1; i<last.size(); ++i)
+        if (last[i].frame.period && last[i].pathScore>last[selected].pathScore) selected=int(i);
+    for (size_t i=paths.size(); i-- > 0;) {
+        const auto& choice = paths[i][selected];
+        w.vocal[i] = choice.frame;
+        selected = choice.previous;
     }
-    int lastPulse = -1;
+    double lastPulse = -1;
+    std::vector<double> reference;
     for (double pos = 0; pos < w.frames();) {
         const auto f = w.vocal[int(pos)/w.analysisHop];
         if (f.period < 2) { lastPulse = -1; pos += w.analysisHop; continue; }
         const int radius = std::max(1,int(f.period*0.15));
-        const int lo = std::max(w.pulses.empty()?0:w.pulses.back()+1,int(pos)-radius);
+        const int lo = std::max(w.pulses.empty()?0:int(w.pulses.back())+1,int(pos)-radius);
         const int hi = std::min(w.frames()-1,int(pos)+radius);
         if (lo > hi) break;
         int peak = lo;
         const int half = std::max(2, int(0.35*f.period));
+        double refinement = 0;
         if (lastPulse >= half && hi+half < w.frames() && lo >= half) {
             // Match a short waveform neighbourhood across cycles. Two nearby
             // maxima can trade amplitude while the underlying phase is stable.
-            double best = -2;
-            const int sampleStep = std::max(1,half/12);
-            for (int candidate = lo; candidate <= hi; ++candidate) {
-                double cross = 0, energyA = 0, energyB = 0;
-                for (int j = -half; j <= half; j += sampleStep) {
-                    const double a = w.stereo[2*size_t(lastPulse+j)+ch];
-                    const double b = w.stereo[2*size_t(candidate+j)+ch];
+            const int previousSample = int(lastPulse);
+            const double fraction = lastPulse-previousSample;
+            const int sampleStep = std::max(1,half/24);
+            reference.clear();
+            double sumA = 0;
+            for (int j=-half; j<=half; j+=sampleStep) {
+                const auto i = 2*size_t(previousSample+j)+ch;
+                const double a = w.stereo[i]+fraction*(w.stereo[i+2]-w.stereo[i]);
+                reference.push_back(a);
+                sumA += a;
+            }
+            const double meanA = sumA/reference.size();
+            double varianceA = 0;
+            for (double& a : reference) {
+                a -= meanA;
+                varianceA += a*a;
+            }
+            auto similarity = [&](int candidate) {
+                double cross = 0, energyB = 0, sumB = 0;
+                int j = candidate-half;
+                for (double a : reference) {
+                    const double b = w.stereo[2*size_t(j)+ch];
                     cross += a*b;
-                    energyA += a*a;
                     energyB += b*b;
+                    sumB += b;
+                    j += sampleStep;
                 }
                 const double distance = (candidate-pos)/radius;
-                const double similarity = cross/std::sqrt(energyA*energyB+1e-24)
-                                        - 0.035*distance*distance;
-                if (similarity > best) { best = similarity; peak = candidate; }
+                const double varianceB = std::max(0.,energyB-sumB*sumB/reference.size());
+                return cross/std::sqrt(varianceA*varianceB+1e-24)
+                       - 0.035*distance*distance;
+            };
+            double best = -2;
+            for (int candidate = lo; candidate <= hi; ++candidate) {
+                const double value = similarity(candidate);
+                if (value > best) { best = value; peak = candidate; }
+            }
+            if (peak > lo && peak < hi) {
+                const double left = similarity(peak-1), right = similarity(peak+1);
+                refinement = std::clamp(0.5*(right-left)/std::max(2*best-left-right,1e-9),-0.5,0.5);
             }
         } else {
             for (int i = lo+1; i <= hi; ++i)
                 if (w.stereo[2*size_t(i)+ch] > w.stereo[2*size_t(peak)+ch]) peak=i;
         }
-        lastPulse = peak;
-        w.pulses.push_back(peak);
-        pos = peak+f.period;
+        lastPulse = peak+refinement;
+        w.pulses.push_back(lastPulse);
+        pos = lastPulse+f.period;
     }
 }
 uint16_t u16(const uint8_t* p) { return uint16_t(p[0] | (p[1] << 8)); }
