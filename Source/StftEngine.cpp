@@ -126,6 +126,14 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
     const double target = std::log2(std::isfinite(scale) ? std::clamp(scale,1./64,64.) : 1.);
     if (snap) { pitch = target; snap = false; }
     int i = 0;
+    if (target == 0. && pitch == 0. && formant == 1. && color == 1. && effectMix == 0.) {
+        for (; i<count && position<end; ++i, position+=step) {
+            left[i] = read(position,0);
+            right[i] = read(position,1);
+        }
+        lastSpectralPercent = -1;
+        return i;
+    }
     for (; i < count && position < end; ++i, position += step) {
         pitch += smoothing*(target-pitch);
         const double ratio = std::exp2(pitch);
@@ -280,6 +288,7 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         if (entersGap) preferGrains = false;
         else if (engineBias <= -1.) preferGrains = shifted && frame.period>0 && coverage>=1.;
         else if (!usable || engineBias >= 1.) preferGrains = false;
+        else if (engineBias == 0.) preferGrains = confidence >= (preferGrains ? 0.62 : 0.80);
         else if (confidence < 0.62 || evidence < 0.24) preferGrains = false;
         else if (confidence >= 0.80 && evidence >= 0.48 && effectMix > 0.95)
             preferGrains = true;

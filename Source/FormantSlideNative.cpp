@@ -173,7 +173,7 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     voice.baseOffset = 60.0 + voice.startPitchCents / 100.0 - (slot.settings_.firstNote + index);
     // FL includes static tuning in the initial voice pitch. Keep small
     // offsets in sample playback, leaving subsequent native slides to DSP.
-    voice.fineTune = std::abs(voice.baseOffset) <= 0.5 ? voice.baseOffset : 0.;
+    voice.fineTune = std::clamp(voice.baseOffset, -48., 48.);
     voice.sourceStep = slot.wav_->sampleRate / sampleRate_ * std::exp2(voice.fineTune / 12.);
     slot.lastMidiNote_ = voice.note;
     voice.sliceIndex = index;
