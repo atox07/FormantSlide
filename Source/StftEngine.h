@@ -24,6 +24,7 @@ private:
     int begin,end;
     double step,startNote,smoothing,position,pitch=0,formant=1,color=1,pulseCountdown=0,mix=0;
     double engineBias = 0;
+    std::array<double,2> lastCoveredGrain{};
     bool preferGrains = false;
     double bodyFilter, fadeStep;
     std::array<double,4> bodyLow{};

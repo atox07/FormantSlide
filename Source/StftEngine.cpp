@@ -134,6 +134,12 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         lastSpectralPercent = -1;
         return i;
     }
+    const bool psolaOnly = engineBias <= -1.;
+    if (psolaOnly) {
+        spectralActive = false;
+        spectralReturn = 0;
+        spectralRetry = silentSpectrum = 0;
+    }
     for (; i < count && position < end; ++i, position += step) {
         pitch += smoothing*(target-pitch);
         const double ratio = std::exp2(pitch);
@@ -167,7 +173,7 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         const bool process = shifted || effectMix>1e-5;
         if (!process) spectralActive = false;
         if (spectralRetry > 0) --spectralRetry;
-        else if (process && (!spectralActive || spectralCursor%hop==0)) {
+        else if (!psolaOnly && process && (!spectralActive || spectralCursor%hop==0)) {
             try {
                 if (!spectralActive) {
                     for (auto& channel : spectral) channel.overlap.fill(0);
@@ -245,8 +251,8 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
             else if (audible) ++run;
             return run >= size*2;
         };
-        double sl = spectral[0].overlap[spectralCursor];
-        double sr = spectral[1].overlap[spectralCursor];
+        double sl = psolaOnly ? dry[0] : spectral[0].overlap[spectralCursor];
+        double sr = psolaOnly ? dry[1] : spectral[1].overlap[spectralCursor];
         if (!std::isfinite(sl) || !std::isfinite(sr) ||
             stalled(silentSpectrum,spectralActive,sl==0 && sr==0)) {
             recoverSpectrum();
@@ -293,9 +299,22 @@ int StftVoice::render(float* left,float* right,int count,double scale) {
         else if (confidence >= 0.80 && evidence >= 0.48 && effectMix > 0.95)
             preferGrains = true;
         mix = preferGrains ? std::min(1.,mix+fadeStep) : std::max(0.,mix-fadeStep);
-        const double wet = coverage*(1.-spectralReturn*(1.-mix));
+        const double fade = mix*mix*(3.-2.*mix);
+        const bool automatic = engineBias == 0.;
+        const double wet = psolaOnly ? coverage*fade :
+            automatic ? fade+(1.-spectralReturn)*(1.-fade)*coverage :
+                        coverage*(1.-spectralReturn*(1.-mix));
         const double norm = 1./std::max(1e-9,weight);
-        const double grain[2] = {l*norm,r*norm};
+        double grain[2] = {l*norm,r*norm};
+        for (int ch=0; ch<2; ++ch) {
+            if (coverage >= 1.) lastCoveredGrain[ch] = grain[ch];
+            else if (automatic) {
+                // Missing marks may end the grain train before the fade ends.
+                // Carry its last covered value through the tail of the ramp.
+                grain[ch] = coverage*grain[ch]+(1.-coverage)*lastCoveredGrain[ch];
+                if (mix == 0.) lastCoveredGrain[ch] = dry[ch];
+            }
+        }
         if (!spectralActive && process) {
             sl = dry[0]; sr = dry[1];
         } else if (spectralReturn<0.99999 && process) {
