@@ -1,58 +1,46 @@
 #pragma once
-#include "WaveLoader.h"
-#include <algorithm>
-#include <array>
+#include "ResidualSpectrum.h"
+#include "ExcitationReader.h"
+#include "VocalFilter.h"
 #include <memory>
-#include <juce_dsp/juce_dsp.h>
 
 class StftVoice {
 public:
-    StftVoice(std::shared_ptr<const WaveData>, int, int, double, double, double sourceStep);
-    int render(float*, float*, int, double);
+    StftVoice(std::shared_ptr<const WaveData>, int first, int end, double rate, double hz,
+              double sourceStep, ResidualSpectrum::Plans&);
+    int render(float*,float*,int,double);
     int spectralPercent() const { return lastSpectralPercent; }
-    bool retryingSpectrum() const { return spectralRetry > 0; }
-    void jumpPitch() { snap = true; }
-    void setEngineBias(int value) { engineBias = std::clamp(value, -100, 100) * 0.01; }
-    void setFormantScale(double v) { formant = std::clamp(v,1./64,64.); }
-    void setFormantGuard(float v) { guard = v; }
-    void setHighNoteLimit(float v) { limit = v; }
-    void setHighNoteRelaxMax(float v) { relax = v; }
+    bool retryingSpectrum() const { return retry>0; }
+    void setEngineBias(int value);
+    void setFormantGuard(float v) { guard=v; }
+    void setHighNoteLimit(float v) { limit=v; }
+    void setHighNoteRelaxMax(float v) { relax=v; }
+
 private:
-    struct Grain { double source, speed, phase, increment;
-        double cycleDistance, cycleBlend, edgeFadeInverse; };
+    using Stereo = ResidualSpectrum::Stereo;
     std::shared_ptr<const WaveData> wav;
     int begin,end;
-    double step,startNote,smoothing,position,pitch=0,formant=1,color=1,pulseCountdown=0,mix=0;
-    double engineBias = 0;
-    std::array<double,2> lastCoveredGrain{};
-    bool preferGrains = false;
-    double bodyFilter, fadeStep;
-    std::array<double,4> bodyLow{};
-    double sourceBody = 0, spectralBody = 0;
-    bool snap=true;
+    double step,position,startHz,pitchFollow,fadeStep,levelFollow,periodFollow;
+    double logPitch=0, wet=0, pulseMix=0, bias=0;
     float guard=0,limit=2000,relax=0.75f;
-    std::array<Grain,32> grains{};
-    static constexpr int order = 10, size = 1 << order, hop = size / 4;
-    using Complex = std::complex<float>;
-    juce::dsp::FFT fft{order};
-    std::array<float,size> window{};
-    std::array<Complex,size> input{}, bins{}, output{};
-    std::array<float,size/2+1> envelope{}, magnitude{}, diffuseWeight{}, airBand{};
-    std::array<int,size/2+1> peaks{};
-    struct SpectralChannel {
-        std::array<float,size> overlap{};
-        std::array<double,size/2+1> phase{}, rotation{};
-    };
-    std::array<SpectralChannel,2> spectral{};
-    int spectralCursor = 0;
-    bool spectralActive = false;
-    int spectralRetry = 0, silentSpectrum = 0, silentGrains = 0;
-    double spectralReturn = 1;
-    void recoverSpectrum();
-    int lastSpectralPercent = -1;
-    double effectMix = 0;
-    double spectralPower = 0, grainPower = 0, crossPower = 0, blendGain = 1;
-    void spectralFrame(int offset, double ratio, bool first);
-    int used=0;
-    float read(double where,int channel) const;
+    bool preferPulse=false, firstWetSample=false, firstRender=true;
+    int voicedRun=0, spectralZeroRun=0, switchLength, switchRemaining=0;
+    bool alignNextSample=false;
+    Stereo lastOutput{}, switchOffset{};
+    size_t upperPulse=0;
+    double mark=0,period=0,previousPeriod=0,nextPeriod=0,cycleBlend=0,phase=0,cycleRate=0;
+    int overlapAge=-1, overlapHop;
+    double olderHead=0, newerHead=0, overlapCorrelation=1;
+    int rendered=-1,retry=0,lastSpectralPercent=-1;
+    Stereo previousDelta{},currentDelta{};
+    double sourcePower=0,outputPower=0,gain=1;
+    ResidualSpectrum spectrum;
+    ExcitationReader excitationReader;
+    std::array<VocalLattice,2> lattice{};
+    Stereo read(const std::vector<float>&, double) const;
+    bool trackPulse(int at, const VocalFrame&);
+    Stereo pulse(double ratio);
+    Stereo unmarkedGrain(int at, double ratio);
+    Stereo renderNative(int at,double ratio);
+    void start(int at);
 };

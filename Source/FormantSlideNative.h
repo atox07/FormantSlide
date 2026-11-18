@@ -106,6 +106,7 @@ private:
     MidiFile midi_;
     std::wstring midiPath_;
     std::string status_ = "Load a chromatic WAV to begin";
+    ResidualSpectrum::Plans fftPlans_;
     std::vector<std::unique_ptr<Voice>> voices_;
 
     NativeEditor* editor_ = nullptr;

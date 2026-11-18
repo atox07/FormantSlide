@@ -271,9 +271,9 @@ public:
         {
             struct Def { const char* name; double lo, hi, step, reset; bool hz; };
             const Def defs[3] = {
-                {"Formant Guard",   0.0,   2.0,    0.01, 1.0,    false},
+                {"STFT Assist",   0.0,   2.0,    0.01, 1.0,    false},
                 {"High Note Limit", 500.0, 4000.0, 1.0,  2000.0, true},
-                {"High Note Relax", 0.0,   1.0,    0.01, 0.75,   false},
+                {"Assist Amount", 0.0,   1.0,    0.01, 0.75,   false},
             };
             for (int i = 0; i < 3; ++i) {
                 setLabel(guardLabel_[i], defs[i].name);
@@ -330,7 +330,7 @@ public:
 
         drawPanel(g, panelSlicer_, "SLICER");
         drawPanel(g, panelPitch_, nullptr); // its header is pitchLabel_
-        drawPanel(g, panelGuard_, "FORMANT RELEASE");
+        drawPanel(g, panelGuard_, "HIGH NOTE ROUTING");
 
         // Waveform well / drop zone.
         const auto waveF = waveBounds_.toFloat();
@@ -438,7 +438,7 @@ public:
         pitchLabel_.setBounds(panelPitch_.getX() + 12, py + 5, panelPitch_.getWidth() - 24, 16);
         pitch_.setBounds(panelPitch_.getX() + (panelPitch_.getWidth() - 80) / 2, py + 22, 80, 94);
 
-        // FORMANT RELEASE: 3 slider sotto i pannelli.
+        // High-note routing controls below the panels.
         panelGuard_ = {m, py + ph + 8, w - 2 * m, 96};
         for (int i = 0; i < 3; ++i) {
             const int ry = panelGuard_.getY() + 24 + i * 23;
@@ -660,7 +660,7 @@ private:
         repaint();
     }
 
-    // I 3 slider FORMANT RELEASE vanno direttamente al motore (StftDevParams).
+    // The three routing controls are read directly by the active voices.
     void pushGuard() {
         if (updatingControls_) return;
         auto& dp = plugin_.guardControls();

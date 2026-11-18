@@ -26,6 +26,7 @@ target_compile_options(fl_sdk PRIVATE /Zc:strictStrings-)
 
 add_library(FormantSlideNative SHARED
     Source/FormantSlideNative.h Source/FormantSlideNative.cpp
+    Source/VocalFilter.h Source/ExcitationReader.h Source/ResidualSpectrum.h Source/ResidualSpectrum.cpp
     Source/StftEngine.h Source/StftEngine.cpp
     Source/WaveLoader.h Source/WaveLoader.cpp
     Source/MidiFile.h Source/MidiFile.cpp

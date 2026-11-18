@@ -1,4 +1,6 @@
 #include "WaveLoader.h"
+#include "VocalFilter.h"
+#include "ExcitationReader.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -173,6 +175,59 @@ void analyzeVoice(WaveData& w) {
         pos = lastPulse+f.period;
     }
 }
+// Fit a broad, regularised vocal-tract envelope. Lag damping keeps the
+// predictor from modelling individual harmonics as narrow vowel resonances.
+void analyseEnvelope(WaveData& w) {
+    ExcitationReader::prepare();
+    const int order = std::clamp(w.sampleRate/700+2,12,maxVocalOrder);
+    w.filterOrder = order;
+    w.filters.resize(w.vocal.size());
+    const int half = std::max(order,w.sampleRate/80);
+    std::vector<double> windowed(2*size_t(2*half+order));
+    for (size_t frame=0; frame<w.filters.size(); ++frame) {
+        const int centre = int(frame)*w.analysisHop;
+        std::array<double,maxVocalOrder+1> correlation{}, predictor{};
+        const int last = std::min(w.frames(),centre+half);
+        const int first = std::max(0,centre-half);
+        for (int n=first; n<last; ++n) {
+            const double taper = 1.-std::abs(n-centre)/double(half);
+            for (int ch=0; ch<2; ++ch)
+                windowed[2*(n-first+order)+ch] = w.stereo[2*size_t(n)+ch]*taper;
+        }
+        const double period = w.vocal[frame].period;
+        // Do not fit the repeated glottal pulse as part of the vocal tract.
+        const int used = period>0 ? std::clamp(int(0.8*period),8,order) : order;
+        for (int j=0; j<=used; ++j) {
+            const double* a = windowed.data()+2*order;
+            const double* b = a-2*j;
+            for (int i=0; i<2*(last-first); ++i) correlation[j] += a[i]*b[i];
+        }
+        if (correlation[0]<1e-10) continue;
+        const double bandwidth = std::max(45., period>0 ? 0.3*w.sampleRate/period : 90.);
+        double error = 1.0005*correlation[0];
+        for (int m=1; m<=used; ++m) {
+            const double lag = 6.283185307179586*bandwidth*m/w.sampleRate;
+            correlation[m] *= std::exp(-0.5*lag*lag);
+            double cross = correlation[m];
+            for (int j=1; j<m; ++j) cross += predictor[j]*correlation[m-j];
+            const double reflection = std::clamp(-cross/error,-0.998,0.998);
+            const auto old = predictor;
+            for (int j=1; j<m; ++j) predictor[j] += reflection*old[m-j];
+            predictor[m] = reflection;
+            w.filters[frame][m-1] = float(reflection);
+            error = std::max(error*(1.-reflection*reflection),correlation[0]*1e-7);
+        }
+    }
+    VocalLattice lattice[2];
+    w.excitation.resize(w.stereo.size());
+    for (int n=0; n<w.frames(); ++n) {
+        const auto k = filterAt(w,n);
+        for (int ch=0; ch<2; ++ch) {
+            const size_t i = 2*size_t(n)+ch;
+            w.excitation[i] = float(lattice[ch].analyse(w.stereo[i],k,order));
+        }
+    }
+}
 uint16_t u16(const uint8_t* p) { return uint16_t(p[0] | (p[1] << 8)); }
 uint32_t u32(const uint8_t* p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
                                         (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); }
@@ -256,6 +311,7 @@ bool readWav(const std::wstring& path, WaveData& result, std::string& error) {
         tmp.stereo[i * 2 + 1] = r;
     }
     analyzeVoice(tmp);
+    analyseEnvelope(tmp);
     result = std::move(tmp);
     error.clear();
     return true;

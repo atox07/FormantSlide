@@ -173,7 +173,8 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     voice.baseOffset = 60.0 + voice.startPitchCents / 100.0 - (slot.settings_.firstNote + index);
     // FL includes static tuning in the initial voice pitch. Keep small
     // offsets in sample playback, leaving subsequent native slides to DSP.
-    voice.fineTune = std::clamp(voice.baseOffset, -48., 48.);
+    const int keyTranspose = voice.note - (slot.settings_.firstNote + index);
+    voice.fineTune = std::clamp(voice.baseOffset - keyTranspose, -48., 48.);
     voice.sourceStep = slot.wav_->sampleRate / sampleRate_ * std::exp2(voice.fineTune / 12.);
     slot.lastMidiNote_ = voice.note;
     voice.sliceIndex = index;
@@ -186,7 +187,7 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     const double startNoteHz = 440.0 * std::exp2(
         (voice.startPitchCents + slot.settings_.pitchCents - 900.0) / 1200.0);
     voice.engine_ = std::make_unique<StftVoice>(
-        slot.wav_, int(voice.playhead_), voice.sliceEnd_, sampleRate_, startNoteHz, voice.sourceStep);
+        slot.wav_, int(voice.playhead_), voice.sliceEnd_, sampleRate_, startNoteHz, voice.sourceStep, fftPlans_);
     voice.drainRemaining_ = 0;
 }
 
@@ -238,13 +239,7 @@ void _stdcall FormantSlideNative::Voice_Kill(TVoiceHandle handle) {
 void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
     if (!buffer || length <= 0 || !voice.params || !voice.engine_) return;
     const auto& slot = slots_[slotForColor(voice.color)];
-    // I parametri dev arrivano dagli slider (StftDevParams): li legge StftVoice::render().
-    // Il knob sposta pitch E formante di tutto il canale; slide e note diverse
-    // cambiano solo il pitch, quindi il formante resta fisso al valore del knob.
-    // (1.0 = il formante segue il knob per intero; 0.5 = meta', 0 = knob solo pitch)
-    constexpr double kKnobFormantAmount = 1.0;
     voice.engine_->setEngineBias(slot.settings_.engineBias);
-    voice.engine_->setFormantScale(std::exp2(kKnobFormantAmount * slot.settings_.pitchCents / 1200.0));
     {
         auto& dp = controls_;
         voice.engine_->setFormantGuard(dp.formantGuard.load());
