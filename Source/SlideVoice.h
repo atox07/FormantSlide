@@ -31,7 +31,7 @@ private:
     bool slideActive = false, snapPitch = false;
     std::array<Frame,2*latencySamples> ring{};
     Frame& frame(int64_t t) { return ring[size_t(t) % ring.size()]; }
-    Stereo read(double where) const;
+    Stereo read(double where) const noexcept;
     Stereo resample(double where, double speed) const;
     double align(double nominal, double previous, double speed, double period) const;
     void makeGrain(int64_t t);
