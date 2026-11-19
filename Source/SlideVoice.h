@@ -20,7 +20,7 @@ public:
 
 private:
     using Stereo = std::array<float, 2>;
-    static constexpr int quantum = 32, interval = 128, history = latencySamples + interval;
+    static constexpr int quantum = 32, maxInterval = 256, history = latencySamples + maxInterval;
     static constexpr int ringSize = 4096;
     struct Frame {
         Stereo dry{}, wet{};

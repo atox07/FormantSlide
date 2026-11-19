@@ -68,7 +68,7 @@ void check(int rate, bool rough, double semitones) {
     const double target = 211.*std::exp2(semitones/12.);
     const int at = delay + 3*rate/5, size = rate/3;
     double bestPower = 0., bestHz = 0.;
-    for (int cent = -50; cent <= 50; ++cent) {
+    for (int cent = -240; cent <= 240; ++cent) {
         const double hz = target*std::exp2(cent/1200.);
         const double power = bin(l, at, size, rate, hz);
         if (power > bestPower) { bestPower = power; bestHz = hz; }
@@ -86,8 +86,10 @@ void check(int rate, bool rough, double semitones) {
     const double wobble = levels[9*levels.size()/10] - levels[levels.size()/10];
     std::printf("%d Hz, %s, %+.0f st: pitch %+.1f cents, source %.1f dB relative to target, RMS p90-p10 %.2f dB\n",
         rate, rough ? "distorted + noise" : "clean", semitones, cents, residueDb, wobble);
-    if (bestPower < .001*size || std::abs(cents) > 20. || residueDb > -10. || wobble > 6.)
-        throw std::runtime_error("Held note lost pitch or level stability");
+    if (bestPower < .001*size) throw std::runtime_error("Held fundamental too weak");
+    if (std::abs(cents) > 20.) throw std::runtime_error("Held pitch exceeds 20 cents");
+    if (residueDb > -10.) throw std::runtime_error("Original pitch too prominent");
+    if (wobble > 6.) throw std::runtime_error("Held level variation exceeds 6 dB");
 }
 
 void checkSamplerKnob(int rate) {

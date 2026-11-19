@@ -54,13 +54,6 @@ jobs:
         shell: pwsh
         run: cmake --build build --config Release --target FormantSlideNative --parallel 2
 
-      - name: Check dry audio, sampler knob, slide pitch, formants and eight-voice timing
-        shell: pwsh
-        run: |
-          cmake --build build --config Release --target FormantSlideAudioCheck --parallel 2
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & ./build/Release/FormantSlideAudioCheck.exe
-
       - name: Verify distribution files
         shell: pwsh
         run: |
@@ -76,3 +69,10 @@ jobs:
             build/Release/FormantSlide_x64.dll
             build/Release/THIRD_PARTY_LICENSES.txt
           if-no-files-found: error
+
+      - name: Check dry audio, sampler knob, slide pitch, formants and eight-voice timing
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target FormantSlideAudioCheck --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/Release/FormantSlideAudioCheck.exe

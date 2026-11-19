@@ -11,7 +11,10 @@ SlideVoice::SlideVoice(std::shared_ptr<const WaveData> data, int first, int last
       position(begin), playbackFollow(-std::expm1(-1. / (0.003 * rate))),
       baseFrequency(wav->slicePitchHz(begin, end, nominalHz) / rate),
       fadeSamples(std::max(1, int(std::lround(0.020 * rate)))) {
-    stretch.configure(2, latencySamples, interval, false);
+    // With a fixed 1024-sample window the spectrum is coarser at 48 kHz.
+    // A quarter-window hop reduces the peak-smoothing bandwidth (FFT/hop).
+    const int hop = rate >= 48000. ? maxInterval : maxInterval/2;
+    stretch.configure(2, latencySamples, hop, false);
     inputDelay = stretch.inputLatency();
     wetPadding = latencySamples - inputDelay - stretch.outputLatency();
     if (wetPadding < 0 || wetPadding >= ringSize)
@@ -68,7 +71,7 @@ void SlideVoice::ToneProbe::push(double sample, double frequency, int64_t time) 
     if (previous <= 0. && value > 0.) {
         const double crossing = double(time) - value/(value-previous);
         const double interval = crossing-lastCrossing;
-        if (lastCrossing >= 0. && std::abs(interval*frequency-1.) < .09) {
+        if (lastCrossing >= 0. && std::abs(std::log2(interval*frequency)) < .20) {
             consecutive = std::abs(period-interval) < .018*interval ? std::min(consecutive+1, 100) : 1;
             period = consecutive == 1 ? interval : period + .22*(interval-period);
         } else consecutive = 0;
@@ -122,7 +125,7 @@ void SlideVoice::process(int count, int64_t start) {
         shiftedTone.push(out[0][i]+.5*out[1][i], g, t);
         if (sourceTone.consecutive >= 5 && shiftedTone.consecutive >= 5) {
             const double error = std::log2(ratio*shiftedTone.period/sourceTone.period);
-            correction = std::clamp(correction + error*std::min(.15*f,.25/latencySamples), -.075, .075);
+            correction = std::clamp(correction + error*std::min(.15*f,.25/latencySamples), -.20, .20);
         }
     }
 }
