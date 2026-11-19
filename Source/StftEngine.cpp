@@ -1,288 +1,272 @@
 #include "StftEngine.h"
 #include <cmath>
+#include <numbers>
+#include <new>
 #include <utility>
 
 namespace {
-double smooth(double t) { return t*t*(3.-2.*t); }
-double toward(double from, double to, double amount) {
-    return from+std::clamp(to-from,-amount,amount);
+constexpr double pi = std::numbers::pi;
+constexpr double tau = 2.0 * pi;
+
+double wrap(double phase) {
+    return phase - tau * std::round(phase / tau);
+}
+
+double boundedLogPitch(double ratio) {
+    return std::isfinite(ratio) ? std::log2(std::clamp(ratio, 1./16., 16.)) : 0.;
 }
 }
 
-StftVoice::StftVoice(std::shared_ptr<const WaveData> data,int first,int last,double rate,double hz,
-                     double sourceStep, ResidualSpectrum::Plans& plans)
-    : wav(std::move(data)),begin(std::clamp(first,0,wav->frames())),end(std::clamp(last,begin,wav->frames())),
-      step(sourceStep),position(begin),startHz(hz),pitchFollow(-std::expm1(-1./(0.003*rate))),
-      fadeStep(1./(0.008*wav->sampleRate)),levelFollow(-std::expm1(-1./(0.020*wav->sampleRate))),
-      periodFollow(-std::expm1(-1./(0.004*wav->sampleRate))),
-      switchLength(std::max(1,int(rate*0.003))),
-      overlapHop(std::max(8,wav->sampleRate/80)), spectrum(plans) {}
+StftVoice::StftVoice(std::shared_ptr<const WaveData> data, int first, int last,
+                     double rate, double hz)
+    : wav(std::move(data)), begin(std::clamp(first, 0, wav->frames())),
+      end(std::clamp(last, begin, wav->frames())), step(wav->sampleRate / rate),
+      startNote(hz), position(begin) {
+    initStretch(rate, wav->estimateF0(begin, end, hz));
+}
 
-void StftVoice::setEngineBias(int value) {
-    const double next=std::clamp(value,-100,100)/100.;
-    if (next!=bias && std::abs(next)==1.) {
-        // The interpolation history can contain samples from the other engine.
-        alignNextSample=wet>0.;
-        rendered=-1;
-        retry=0;
-        lastSpectralPercent=-1;
-        spectrum.reset();
+void StftVoice::initStretch(double rate, double sourceF0) {
+    fftSize = sourceF0 < 150. ? 2048 : 1024;
+    hop = fftSize / 4;
+    bins = fftSize / 2 + 1;
+    lifter = std::clamp(int(std::lround(35. * rate / 44100.)), 1, fftSize / 4);
+    fadeSamples = std::max(1, int(std::lround(0.020 * rate)));
+    playbackFollow = -std::expm1(-1. / (0.003 * rate));
+    for (int i = 0; i < fftSize; ++i)
+        window[i] = float(0.5 - 0.5 * std::cos(tau * i / fftSize));
+    for (int i = 0; i <= latencySamples; ++i) {
+        const double angle = 0.5 * pi * i / latencySamples;
+        crossfade[i] = {float(std::cos(angle)), float(std::sin(angle))};
     }
-    bias=next;
+    forward.reset(kiss_fftr_alloc(fftSize, 0, nullptr, nullptr));
+    inverse.reset(kiss_fftr_alloc(fftSize, 1, nullptr, nullptr));
+    if (!forward || !inverse) throw std::bad_alloc();
 }
 
-StftVoice::Stereo StftVoice::read(const std::vector<float>& data,double at) const {
-    if (at<begin || at>=end) return {};
-    const int i=int(at);
-    auto get=[&](int n) {
-        const size_t k=2*size_t(std::clamp(n,begin,end-1));
-        return Stereo(data[k],data[k+1]);
+StftVoice::Stereo StftVoice::read(double where) const noexcept {
+    const int frame = int(where);
+    const float fraction = float(where - frame);
+    const auto sample = [&](int offset, int channel) {
+        return wav->stereo[2 * size_t(std::clamp(frame + offset, begin, end - 1)) + channel];
     };
-    const float f=float(at-i);
-    const auto b=get(i);
-    if (f==0) return b;
-    const auto a=get(i-1), c=get(i+1), d=get(i+2);
-    return b+0.5f*f*((c-a)+f*((2.f*a-5.f*b+4.f*c-d)+f*(3.f*(b-c)+d-a)));
-}
-
-void StftVoice::start(int at) {
-    rendered=at-1;
-    previousDelta=currentDelta={};
-    upperPulse=size_t(std::upper_bound(wav->pulses.begin(),wav->pulses.end(),at)-wav->pulses.begin());
-    period=0;
-    overlapAge=-1;
-    pulseMix=0;
-    preferPulse=false;
-    firstWetSample=true;
-    voicedRun=spectralZeroRun=0;
-    spectrum.reset();
-    retry=0;
-    lattice={};
-    sourcePower=outputPower=0;
-    gain=1;
-    // The backwards errors depend only on the last filterOrder input samples.
-    // Reconstruct that state when a slide starts in the middle of a dry note.
-    for (int n=std::max(begin,at-wav->filterOrder); n<at; ++n) {
-        const auto k=filterAt(*wav,n);
-        for (int ch=0;ch<2;++ch)
-            lattice[ch].analyse(wav->stereo[2*size_t(n)+ch],k,wav->filterOrder);
+    Stereo result{sample(0, 0), sample(0, 1)};
+    if (fraction == 0.f) return result;
+    for (int channel = 0; channel < 2; ++channel) {
+        const float a = sample(-1, channel), b = result[channel];
+        const float c = sample(1, channel), d = sample(2, channel);
+        result[channel] = b + 0.5f * fraction *
+            ((c - a) + fraction * ((2.f * a - 5.f * b + 4.f * c - d)
+                                    + fraction * (3.f * (b - c) + d - a)));
     }
-}
-
-bool StftVoice::trackPulse(int at,const VocalFrame& frame) {
-    const auto& marks=wav->pulses;
-    while (upperPulse<marks.size() && marks[upperPulse]<=at) ++upperPulse;
-    if (frame.period<=0 || !upperPulse || upperPulse>=marks.size()) return false;
-    const double left=marks[upperPulse-1], right=marks[upperPulse];
-    const double length=right-left;
-    if (left<begin || right>=end || length<0.75*frame.period || length>1.3*frame.period) return false;
-    mark=left;
-    period=length;
-    previousPeriod=length;
-    nextPeriod=length;
-    if (upperPulse>=2 && marks[upperPulse-2]>=begin) {
-        const double candidate=left-marks[upperPulse-2];
-        if (candidate>=0.7*length && candidate<=1.4*length) previousPeriod=candidate;
-    }
-    if (upperPulse+1<marks.size() && marks[upperPulse+1]<end) {
-        const double candidate=marks[upperPulse+1]-right;
-        if (candidate>=0.7*length && candidate<=1.4*length) nextPeriod=candidate;
-    }
-    cycleBlend=(at-left)/length;
-    return true;
-}
-
-StftVoice::Stereo StftVoice::pulse(double ratio) {
-    // Two pitch-synchronous, raised-cosine windows overlap on the excitation.
-    // Their weights sum to one and their positions meet at each phase wrap.
-    // Moving to the next pair of source marks preserves the output clock.
-    const double offset=phase*period;
-    const float tail=float(0.5-0.5*std::cos(3.141592653589793*phase));
-    const auto middle=excitationReader.read(*wav,begin,end,mark+offset);
-    const auto earlier=excitationReader.read(*wav,begin,end,mark+(phase-1.)*previousPeriod);
-    const auto later=excitationReader.read(*wav,begin,end,mark+period+phase*nextPeriod);
-    const auto a=middle+tail*(earlier-middle);
-    const auto b=later+tail*(middle-later);
-    phase+=ratio*cycleRate;
-    phase-=std::floor(phase);
-    return a+float(smooth(cycleBlend))*(b-a);
-}
-
-// Waveform-similarity overlap-add for the temporal endpoint between marked
-// regions. Both heads read the excitation at the requested pitch throughout.
-StftVoice::Stereo StftVoice::unmarkedGrain(int at,double ratio) {
-    if (overlapAge<0) {
-        overlapAge=0;
-        olderHead=newerHead=at;
-        overlapCorrelation=1.;
-    } else if (overlapAge==overlapHop) {
-        overlapAge=0;
-        olderHead=newerHead;
-        const double nominal=std::clamp(at+(1.-ratio)*overlapHop,double(begin),double(end-1));
-        const int radius=std::max(2,wav->sampleRate/300);
-        const int stride=std::max(1,radius/48);
-        constexpr int probes=24;
-        std::array<Stereo,probes> reference{};
-        double referencePower=0.;
-        for (int j=0;j<probes;++j) {
-            reference[j]=read(wav->excitation,olderHead+ratio*overlapHop*(j+0.5)/probes);
-            referencePower+=std::norm(reference[j]);
-        }
-        newerHead=nominal;
-        overlapCorrelation=0.;
-        double best=-2.;
-        for (int d=-radius;d<=radius;d+=stride) {
-            const double candidate=nominal+d;
-            if (candidate<begin || candidate>=end) continue;
-            double dot=0., power=0.;
-            for (int j=0;j<probes;++j) {
-                const auto sample=read(wav->excitation,candidate+ratio*overlapHop*(j+0.5)/probes);
-                dot+=reference[j].real()*sample.real()+reference[j].imag()*sample.imag();
-                power+=std::norm(sample);
-            }
-            const double correlation=dot/std::sqrt(referencePower*power+1e-18);
-            const double distance=double(d)/radius;
-            const double score=correlation-0.12*distance*distance;
-            if (score>best) {
-                best=score;
-                newerHead=candidate;
-                overlapCorrelation=std::clamp(correlation,0.,1.);
-            }
-        }
-    }
-    const double t=smooth(double(overlapAge)/overlapHop);
-    const double power=1.-2.*t*(1.-t)*(1.-overlapCorrelation);
-    const auto result=(float(1.-t)*excitationReader.read(*wav,begin,end,olderHead)
-                      +float(t)*excitationReader.read(*wav,begin,end,newerHead))/float(std::sqrt(power));
-    olderHead+=ratio;
-    newerHead+=ratio;
-    ++overlapAge;
     return result;
 }
 
-StftVoice::Stereo StftVoice::renderNative(int at,double ratio) {
-    const auto dry=read(wav->stereo,at);
-    const auto raw=read(wav->excitation,at);
-    const size_t index=size_t(at/wav->analysisHop);
-    const auto& frame=wav->vocal[index];
-    const bool hadCycle=period>0;
-    const bool onlyPulse=bias<=-1., onlySpectrum=bias>=1.;
-    const bool valid=!onlySpectrum && trackPulse(at,frame);
-    if (valid && !hadCycle) phase=cycleBlend;
-    // Begin leaving a marked region before the last usable cycle. Confidence
-    // moves the decision thresholds; it never sets a sustained audio mix.
-    const size_t next=std::min(index+1,size_t((end-1)/wav->analysisHop));
-    const double t=double(at%wav->analysisHop)/wav->analysisHop;
-    const auto& upcoming=wav->vocal[next];
-    if (valid) {
-        // Epoch spacing locates the waveform. Interpolated F0 drives the
-        // synthesis clock, so small landmark errors do not become pitch jitter.
-        double targetPeriod=frame.period;
-        if (upcoming.period>0.8*targetPeriod && upcoming.period<1.25*targetPeriod)
-            targetPeriod+=t*(upcoming.period-targetPeriod);
-        const double targetRate=1./targetPeriod;
-        if (hadCycle) cycleRate+=periodFollow*(targetRate-cycleRate);
-        else cycleRate=targetRate;
+bool StftVoice::detectTransient(float flux, float magnitudeSum) noexcept {
+    const float mean = fluxCount > 0 ? std::max(0.f, fluxSum) / fluxCount : 0.f;
+    // A relative floor stops tiny spectral changes in a steady vowel from
+    // repeatedly resetting its phase when the flux history is near zero.
+    const bool onset = haveSpectrum && !transientHold && fluxCount >= 2
+                    && flux > std::max(2.f * mean, 0.04f * magnitudeSum) + 1.e-6f;
+    if (onset || (transientHold > 0 && flux > std::max(mean, 0.02f * magnitudeSum) + 1.e-6f)) transientHold = 2;
+    else if (transientHold > 0) --transientHold;
+    if (haveSpectrum) {
+        fluxSum += flux - fluxHistory[fluxIndex];
+        fluxHistory[fluxIndex] = flux;
+        fluxIndex = (fluxIndex + 1) % int(fluxHistory.size());
+        fluxCount = std::min(fluxCount + 1, int(fluxHistory.size()));
     }
-    const double confidence=frame.voiced+t*(std::min(frame.voiced,upcoming.voiced)-frame.voiced);
-    const double highAssist=startHz>=limit ? 0.10*std::clamp(double(guard*relax),0.,1.) : 0.;
-    const double threshold=std::clamp((preferPulse ? 0.57 : 0.76)+0.45*bias+highAssist,0.05,1.);
-    const bool usable=valid && (onlyPulse || confidence>=threshold);
-    const int settle=std::max(1,wav->sampleRate/100);
-    voicedRun=usable ? std::min(settle,voicedRun+1) : 0;
-    preferPulse=usable && (onlyPulse || preferPulse || firstWetSample || voicedRun>=settle);
-    const double desired=preferPulse ? 1. : 0.;
-    pulseMix=firstWetSample ? desired : toward(pulseMix,desired,fadeStep);
-    firstWetSample=false;
-    const double amount=smooth(pulseMix);
-    Stereo temporal=raw;
-    if (onlyPulse || pulseMix>0) excitationReader.setSpeed(ratio);
-    if (period>0 && pulseMix>0) temporal=pulse(ratio);
-    else if (valid) phase=cycleBlend;
-    if (!valid && pulseMix==0) period=0;
-
-    Stereo alternate=raw;
-    bool spectralOutput=false;
-    if (onlyPulse && amount<1.) alternate=unmarkedGrain(at,ratio);
-    else overlapAge=-1;
-    if (onlyPulse || amount==1.) {
-        spectrum.reset();
-        spectralZeroRun=0;
-    } else if (retry>0) {
-        --retry;
-    } else {
-        try {
-            alternate=spectrum.next(*wav,begin,end,at,ratio);
-            spectralOutput=std::isfinite(alternate.real()) && std::isfinite(alternate.imag());
-            if (alternate!=Stereo{}) spectralZeroRun=0;
-            else if (std::norm(raw)>1e-10f) ++spectralZeroRun;
-            if (spectralZeroRun>std::max(2048,wav->sampleRate/12)) spectralOutput=false;
-        } catch (...) { spectralOutput=false; }
-        if (!spectralOutput) {
-            spectrum.reset();
-            spectralZeroRun=0;
-            retry=std::max(1,wav->sampleRate/100);
-            alternate=raw;
-        }
-    }
-    const auto excitation=alternate+float(amount)*(temporal-alternate);
-    const auto k=filterAt(*wav,at);
-    Stereo result{float(lattice[0].synthesise(excitation.real(),k,wav->filterOrder)),
-                  float(lattice[1].synthesise(excitation.imag(),k,wav->filterOrder))};
-    if (!std::isfinite(result.real()) || !std::isfinite(result.imag())) {
-        lattice={};
-        result=dry;
-    }
-    sourcePower+=levelFollow*(std::norm(dry)-sourcePower);
-    outputPower+=levelFollow*(std::norm(result)-outputPower);
-    const double gainLimit=1.15+0.45*frame.voiced;
-    const double targetGain=std::clamp(std::sqrt((sourcePower+1e-8)/(outputPower+1e-8)),0.7,gainLimit);
-    gain+=levelFollow*(targetGain-gain);
-    lastSpectralPercent=spectralOutput ? int(std::lround(100*smooth(wet)*(1.-amount))) : 0;
-    return float(gain)*result-dry;
+    return onset;
 }
 
-int StftVoice::render(float* left,float* right,int count,double scale) {
-    const double target=std::log2(std::isfinite(scale) ? std::clamp(scale,1./64.,64.) : 1.);
-    if (firstRender && count>0) {
-        logPitch=target;
-        wet=target==0. ? 0. : 1.;
-        firstRender=false;
+void StftVoice::estimateEnvelope() noexcept {
+    const float floor = std::max(1.e-12f, *std::max_element(magnitude.begin(),
+                                                           magnitude.begin() + bins) * 1.e-4f);
+    for (int k = 0; k < bins; ++k)
+        cepstrumSpectrum[k] = {std::log(std::max(floor, magnitude[k])), 0.f};
+    kiss_fftri(inverse.get(), cepstrumSpectrum.data(), time.data());
+    // Taper the last quarter of the lifter to avoid ripple in the envelope.
+    const int taperStart = 3 * lifter / 4;
+    for (int q = 0; q <= lifter; ++q) {
+        const float weight = float(std::min(1., double(lifter + 1 - q) / (lifter + 1 - taperStart)));
+        time[q] *= weight / fftSize;
+        if (q != 0) time[fftSize - q] *= weight / fftSize;
     }
-    const double hostFade=fadeStep*step;
-    int i=0;
-    for (; i<count && position<end; ++i,position+=step) {
-        logPitch+=pitchFollow*(target-logPitch);
-        if (std::abs(target-logPitch)<1e-9) logPitch=target;
-        wet=toward(wet,(target!=0. || std::abs(logPitch)>1e-5) ? 1. : 0.,hostFade);
-        auto sample=read(wav->stereo,position);
-        if (wet>0.) {
-            int n=int(position);
-            if (rendered<0) start(n);
-            const double ratio=std::exp2(logPitch);
-            while (rendered<std::min(n+1,end-1)) {
-                previousDelta=currentDelta;
-                currentDelta=renderNative(++rendered,ratio);
+    std::fill(time.begin() + lifter + 1, time.begin() + fftSize - lifter, 0.f);
+    kiss_fftr(forward.get(), time.data(), cepstrumSpectrum.data());
+    for (int k = 0; k < bins; ++k)
+        envelope[k] = cepstrumSpectrum[k].r;
+}
+
+void StftVoice::processFrame() noexcept {
+    const int half = fftSize / 2;
+    const int64_t first = clock - fftSize + 1;
+    const auto& control = input[ringIndex(first + half)];
+    const double ratio = std::exp2(control.pitch);
+    for (int channel = 0; channel < 2; ++channel) {
+        // Zero-phase FFT. The bin remap rotates lobes about the window center.
+        for (int n = 0; n < fftSize; ++n)
+            time[(n + half) & (fftSize - 1)] = window[n] *
+                (first + n >= 0 ? std::clamp(input[ringIndex(first + n)].sample[channel], -8.f, 8.f) : 0.f);
+        kiss_fftr(forward.get(), time.data(), spectrum[channel].data());
+        std::fill_n(shifted[channel].begin(), bins, kiss_fft_cpx{});
+    }
+    float maxPeak = 0.f, flux = 0.f, magnitudeSum = 0.f, inputPower = 0.f;
+    // Use mid for the peak map. Side energy supplies the reference in bins
+    // where a wide or anti-phase source cancels in mid.
+    const auto power = [](kiss_fft_cpx z) { return z.r*z.r + z.i*z.i; };
+    for (int k = 0; k < bins; ++k) {
+        const auto l = spectrum[0][k], r = spectrum[1][k];
+        const float binPower = power(l) + power(r);
+        inputPower += binPower;
+        magnitude[k] = std::sqrt(binPower);
+        magnitudeSum += magnitude[k];
+        const float midPower = power({l.r + r.r, l.i + r.i});
+        const float sidePower = power({l.r - r.r, l.i - r.i});
+        cepstrumSpectrum[k].i = std::max(midPower, 0.0625f * sidePower);
+        maxPeak = std::max(maxPeak, cepstrumSpectrum[k].i);
+        flux += std::max(0.f, magnitude[k] - previousMagnitude[k]);
+    }
+    const bool reset = detectTransient(flux, magnitudeSum) || !haveSpectrum;
+    int peakCount = 0, strongest = 0;
+    for (int k = 1; k < half; ++k) {
+        const float candidate = cepstrumSpectrum[k].i;
+        if (candidate > cepstrumSpectrum[strongest].i) strongest = k;
+        if (candidate > 0.0001f * maxPeak && candidate > cepstrumSpectrum[k-1].i &&
+            candidate > cepstrumSpectrum[k+1].i)
+            peaks[peakCount++] = k;
+    }
+    if (peakCount == 0) peaks[peakCount++] = strongest;
+    const bool sameEnvelope = ratio == 1. && control.formantScale == 1.f;
+    if (!sameEnvelope) estimateEnvelope();
+    const double frameRatio = 0.5 * (ratio + previousRatio);
+    const auto angularStep = [&](int k) { return tau * hop * k / fftSize; };
+    int start = 0;
+    for (int p = 0; p < peakCount; ++p) {
+        const int peak = peaks[p];
+        const int last = p + 1 == peakCount ? half : (peak + peaks[p+1]) / 2;
+        double phase = 0.;
+        if (!reset) {
+            // Advance the shared phase with the phase difference summed over
+            // L/R. This is defined even for fully anti-phase stereo material.
+            float re = 0.f, im = 0.f;
+            for (int ch = 0; ch < 2; ++ch) {
+                const auto a = spectrum[ch][peak], b = previous[ch][peak];
+                re += a.r*b.r + a.i*b.i;
+                im += a.i*b.r - a.r*b.i;
             }
-            const auto delta=rendered==n ? currentDelta :
-                previousDelta+float(position-n)*(currentDelta-previousDelta);
-            sample+=float(smooth(wet))*delta;
-        } else {
-            rendered=-1;
-            lastSpectralPercent=-1;
+            const double expected = angularStep(peak);
+            const double advance = expected + wrap(std::atan2(im, re) - expected);
+            phase = wrap(rotation[peak] + (frameRatio - 1.) * advance);
+            if (ratio == 1.) phase *= 0.5;
         }
-        if (alignNextSample) {
-            switchOffset=lastOutput-sample;
-            switchRemaining=switchLength;
-            alignNextSample=false;
+        const float c = float(std::cos(phase)), s = float(std::sin(phase));
+        for (int k = start; k <= last; ++k) {
+            nextRotation[k] = float(phase);
+            const int dest = int(std::lround(k * ratio));
+            if (dest > half) continue;
+            float gain = 1.f;
+            if (!sameEnvelope) {
+                const float envBin = std::min(float(half), dest / control.formantScale);
+                const int low = int(envBin), high = std::min(low + 1, half);
+                const float target = std::lerp(envelope[low], envelope[high], envBin - low);
+                gain = std::exp(std::clamp(target - envelope[k], -1.6f, 1.6f));
+            }
+            for (int ch = 0; ch < 2; ++ch) {
+                const auto src = spectrum[ch][k];
+                auto& out = shifted[ch][dest];
+                out.r += gain * (c * src.r - s * src.i);
+                out.i += gain * (s * src.r + c * src.i);
+            }
         }
-        if (switchRemaining>0) {
-            sample+=float(smooth(double(switchRemaining)/switchLength))*switchOffset;
-            --switchRemaining;
-        }
-        lastOutput=sample;
-        left[i]=sample.real();
-        right[i]=sample.imag();
+        start = last + 1;
     }
+    rotation.swap(nextRotation);
+    spectrum.swap(previous);
+    magnitude.swap(previousMagnitude);
+    haveSpectrum = true;
+    previousRatio = ratio;
+    float outputPower = 0.f;
+    for (int ch = 0; ch < 2; ++ch) {
+        shifted[ch][0].i = shifted[ch][half].i = 0.f;
+        for (int k = 0; k < bins; ++k) outputPower += power(shifted[ch][k]);
+    }
+    // A common gain preserves the stereo balance and softens level losses
+    // when a shifted harmonic lands between two formants.
+    const float level = std::clamp(std::sqrt(inputPower / std::max(outputPower, 1.e-20f)), 0.5f, 4.f);
+    const float synthesisGain = level / (1.5f * fftSize);
+    for (int ch = 0; ch < 2; ++ch) {
+        kiss_fftri(inverse.get(), shifted[ch].data(), time.data());
+        for (int n = 0; n < fftSize; ++n)
+            ola[ringIndex(first + latencySamples + n)][ch] +=
+                time[(n + half) & (fftSize - 1)] * window[n] * synthesisGain;
+    }
+}
+
+int StftVoice::render(float* left, float* right, int count, double scale) noexcept {
+    const double targetPitch = boundedLogPitch(scale);
+    if (clock == 0) playback = playbackTarget;
+    if (snapPitch) previousPitch = targetPitch;
+    snapPitch = false;
+    const double pitchStep = count > 0 ? (targetPitch - previousPitch) / count : 0.;
+    const double formantFollow = startNote >= limit ? std::clamp(double(guard * relax), 0., 1.) : 0.;
+    int i = 0;
+    for (; i < count; ++i, ++clock) {
+        const bool releasing = releaseAt >= 0;
+        const int64_t releaseAge = releasing ? clock - releaseAt : 0;
+        if (sourceEnd < 0 && (position >= end || (releasing && releaseAge >= fadeSamples)))
+            sourceEnd = clock;
+        if (sourceEnd >= 0 && clock >= sourceEnd + latencySamples) break;
+
+        const float gain = releasing ? std::max(0.f, 1.f - float(releaseAge) / fadeSamples) : 1.f;
+        const auto dry = sourceEnd < 0 ? read(position) : Stereo{};
+        playback += playbackFollow * (playbackTarget - playback);
+        if (std::abs(playbackTarget - playback) < 1.e-9) playback = playbackTarget;
+        if (sourceEnd < 0) position += step * playback;
+
+        const double pitch = previousPitch + pitchStep * (i + 1);
+        const bool active = sourceEnd < 0 && (slideActive || pitch != 0.);
+        mixStep = active ? std::min(fadeSamples, mixStep + 1) : std::max(0, mixStep - 1);
+        const float envelopeScale = float(formantFollow == 0. ? formant : formant * std::exp2(formantFollow * pitch));
+        input[ringIndex(clock)] = {dry, float(pitch), envelopeScale, float(mixStep) / fadeSamples, gain};
+        if (mixStep > 0 && sourceEnd < 0) {
+            if (clock > processThrough) {
+                haveSpectrum = false;
+                fluxSum = 0.f;
+                fluxIndex = fluxCount = transientHold = 0;
+                fluxHistory.fill(0.f);
+                nextFrame = clock;
+            }
+            processThrough = clock + fftSize - 1;
+        }
+        if (clock == nextFrame && clock <= processThrough) {
+            processFrame();
+            nextFrame += hop;
+        }
+
+        auto& wet = ola[ringIndex(clock)];
+        Stereo output{};
+        if (clock >= latencySamples) {
+            const auto& delayed = input[ringIndex(clock - latencySamples)];
+            output = delayed.sample;
+            if (delayed.mix > 0.f) {
+                if (delayed.mix >= 1.f) output = wet;
+                else {
+                    const auto gains = crossfade[int(delayed.mix * latencySamples + 0.5f)];
+                    // Near unity the two paths are correlated. Compensate the
+                    // equal-power curve there to avoid a 3 dB level bump.
+                    const float ratio = std::clamp(std::abs(delayed.pitch) * 24.f, 0.f, 1.f);
+                    const float norm = 1.f + (1.f - ratio) * (gains[0] + gains[1] - 1.f);
+                    for (int ch = 0; ch < 2; ++ch)
+                        output[ch] = (output[ch] * gains[0] + wet[ch] * gains[1]) / norm;
+                }
+            }
+            if (delayed.gain != 1.f)
+                for (float& sample : output) sample *= delayed.gain;
+        }
+        left[i] = output[0];
+        right[i] = output[1];
+        wet = {};
+    }
+    previousPitch = targetPitch;
     return i;
 }

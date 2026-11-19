@@ -44,21 +44,13 @@ Distribuisci build/Release/FormantSlide_x64.dll insieme a
 build/Release/THIRD_PARTY_LICENSES.txt. Chiudi FL prima di sostituire la DLL.
 Non distribuire vecchie DLL o usare vecchie build/cache per questa versione.
 
-stftPitchShift e incluso in third_party/stftPitchShift, con licenza MIT.
-Richiede C++20. Il WAV viene letto e diviso in slice senza preanalisi vocale.
-Le note ad altezza originale leggono il WAV stereo direttamente.
-Il pitch variabile usa il core STFT con preservazione cepstrale dei formanti,
-finestre di 1024 campioni e aggiornamenti ogni 64 campioni.
-La prima trasposizione prepara brevemente le finestre della voce corrente.
-Il lookahead sul WAV evita di attendere audio in ingresso, ma le finestre
-possono smussare gli slide molto rapidi. Qualita e CPU vanno provate in FL.
-
-JUCE resta fissato a 8.0.10. Si prevede l'uso secondo l'EULA JUCE 8,
-piano Starter, anziche la licenza alternativa AGPLv3. Starter e gratuito
-entro i requisiti dell'EULA (limite applicabile 20.000 USD nei 12 mesi
-precedenti e requisiti sulle licenze degli sviluppatori).
-I due flag splash/usage a 1 sono impostazioni richieste, non una licenza.
-L'ammissibilita Starter e i diritti di distribuzione dell'SDK FL devono essere
-verificati dal titolare: il solo CMake non puo certificarli.
+Il motore degli slide usa la FFT reale di KISS FFT (BSD-3-Clause).
+La finestra Hann viene scelta all'attacco della nota, in base alla F0
+stimata dal WAV: 1024 campioni da 150 Hz in su, 2048 sotto i 150 Hz.
+La latenza dichiarata a FL Studio e di 2048 campioni per entrambi i percorsi.
+Con knob neutro, frequenza di campionamento del WAV uguale a quella del
+progetto e nota alla sua intonazione originale, il dry e una copia del WAV
+ritardata di 2048 campioni. Il knob Pitch trasporta intonazione e formanti
+insieme e varia la durata della slice, come la velocita di un sampler.
 Riferimenti: https://juce.com/legal/juce-8-licence/
-             https://github.com/jurihock/stftPitchShift/blob/main/LICENSE
+             https://github.com/mborgerding/kissfft
