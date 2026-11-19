@@ -27,6 +27,7 @@ std::shared_ptr<WaveData> makeWave(int rate, bool rough) {
         wave->stereo[2*i] = v;
         wave->stereo[2*i+1] = -.75f*v;
     }
+    wave->prepareSlide();
     return wave;
 }
 
@@ -110,9 +111,9 @@ void checkSamplerKnob(int rate) {
     }
 }
 
-void checkVowelFormants(int rate) {
+void checkVowelFormants(int rate, double semitones) {
     constexpr double f0 = 110.;
-    const double ratio = std::exp2(7./12.);
+    const double ratio = std::exp2(semitones/12.);
     constexpr std::array<double, 2> centres{720., 2300.};
     constexpr std::array<double, 2> widths{160., 260.};
     auto wave = std::make_shared<WaveData>();
@@ -128,6 +129,7 @@ void checkVowelFormants(int rate) {
             wave->stereo[2*i] += float(amplitude*std::sin(tau*h*f0*i/rate));
     }
     for (int i = 0; i < rate; ++i) wave->stereo[2*i+1] = wave->stereo[2*i];
+    wave->prepareSlide();
     SlideVoice voice(wave, 0, wave->frames(), rate, f0);
     voice.setSlideActive(true);
     std::vector<float> left(rate), right(rate);
@@ -147,8 +149,8 @@ void checkVowelFormants(int rate) {
             const double magnitude = bin(left, rate/2, rate/4, rate, hz);
             if (magnitude > strongest) { strongest = magnitude; measured = hz; }
         }
-        std::printf("%d Hz vowel +7 st, F%zu: nominal %.0f Hz, strongest harmonic %.0f Hz\n",
-                    rate, j+1, centres[j], measured);
+        std::printf("%d Hz vowel %+.0f st, F%zu: nominal %.0f Hz, strongest harmonic %.0f Hz\n",
+                    rate, semitones, j+1, centres[j], measured);
         if (strongest < .001 || std::abs(measured-centres[j]) > std::max(f0*ratio, .12*centres[j]))
             throw std::runtime_error("Vowel resonance moved outside tolerance");
     }
@@ -173,6 +175,42 @@ void measureEightVoices(int rate) {
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
     std::printf("%d Hz, 8 concurrent voices: %.1f ms per second of audio, %.2f%% of one core per voice (wall time)\n",
                 rate, 1000.*seconds, 100.*seconds/voices.size());
+    if (seconds/voices.size() >= .10)
+        throw std::runtime_error("Eight-voice render exceeded the per-voice timing budget");
+}
+
+void checkAttackAndDryReturn(int rate) {
+    auto wave=std::make_shared<WaveData>();
+    wave->sampleRate=rate;
+    wave->stereo.assign(2*rate,0.f);
+    const int attack=rate/3;
+    wave->stereo[2*attack]=1.f;
+    wave->stereo[2*attack+1]=-.5f;
+    for (int t=3*rate/4; t<rate; ++t) {
+        wave->stereo[2*t]=float(.12*std::cos(.013*t));
+        wave->stereo[2*t+1]=float(.08*std::sin(.017*t));
+    }
+    wave->prepareSlide();
+    SlideVoice voice(wave,0,rate,rate,220.);
+    constexpr int delay=SlideVoice::latencySamples;
+    std::vector<float> left(rate+delay),right(rate+delay);
+    for (int t=0; t<int(left.size()); t+=block) {
+        const bool active=t>=rate/8 && t<rate/2;
+        voice.setSlideActive(active);
+        const int n=std::min(block,int(left.size())-t);
+        if (voice.render(left.data()+t,right.data()+t,n,active ? 2. : 1.)!=n)
+            throw std::runtime_error("Short transient render");
+    }
+    const int centre=attack+delay;
+    if (std::abs(left[centre])<.2f || std::abs(right[centre]+.5f*left[centre])>.0001f)
+        throw std::runtime_error("Transient timing or stereo image changed");
+    for (int t=centre-rate/20; t<centre+rate/20; ++t)
+        if (std::abs(t-centre)>16 && std::abs(left[t])>.08f)
+            throw std::runtime_error("Transient repeated");
+    for (int t=3*rate/4; t<rate; ++t)
+        if (std::memcmp(&left[t+delay],&wave->stereo[2*t],sizeof(float)) ||
+            std::memcmp(&right[t+delay],&wave->stereo[2*t+1],sizeof(float)))
+            throw std::runtime_error("Return to dry failed null test");
 }
 }
 
@@ -181,10 +219,12 @@ int main() {
         for (int rate : {44100, 48000}) {
             check(rate, false, 0.);
             check(rate, false, 12.);
+            check(rate, false, -12.);
             check(rate, true, 7.);
             check(rate, true, -7.);
             checkSamplerKnob(rate);
-            checkVowelFormants(rate);
+            checkAttackAndDryReturn(rate);
+            for (double shift : {-12., 7., 12.}) checkVowelFormants(rate, shift);
             measureEightVoices(rate);
         }
     } catch (const std::exception& e) {

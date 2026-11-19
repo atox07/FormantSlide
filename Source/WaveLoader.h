@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <string>
 #include <vector>
 
@@ -7,6 +8,11 @@ struct VocalFrame {
 };
 
 struct WaveData {
+    using Envelope = std::array<float,513>;
+    std::vector<Envelope> envelopes;
+    std::vector<int> attacks;
+    int envelopeHop = 1;
+    void prepareSlide();
     int analysisHop = 1;
     std::vector<VocalFrame> vocal;
     std::vector<int> cueStarts;

@@ -349,7 +349,7 @@ bool FormantSlideNative::loadWav(const std::wstring& path, std::string& error) {
     slicesManuallyEdited_ = false;
     lastMidiNote_ = lastSlice_ = -1;
     stopVoices();
-    status_ = "WAV loaded (Signalsmith Stretch ready)";
+    status_ = "WAV loaded (waveform alignment ready)";
     return true;
 }
 bool FormantSlideNative::loadMidi(const std::wstring& path, std::string& error) {

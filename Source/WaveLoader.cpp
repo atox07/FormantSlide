@@ -1,4 +1,5 @@
 #include "WaveLoader.h"
+#include "VocalSpectrum.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -52,7 +53,7 @@ void analyzeVoice(WaveData& wav) {
 
     wav.analysisHop = std::max(1, int(std::lround(wav.sampleRate * 0.005)));
     const int frames = (wav.frames() + wav.analysisHop - 1) / wav.analysisHop;
-    wav.vocal.resize(frames);
+    wav.vocal.assign(frames, {});
     std::vector<PitchPath> path(frames);
     const int minLag = std::max(2, int(rate / 2200.));
     const int maxLag = int(std::ceil(rate / 55.));
@@ -164,6 +165,85 @@ double WaveData::slicePitchHz(int begin, int end, double fallback) const noexcep
     return sampleRate / double(periods[used / 2]);
 }
 
+void WaveData::prepareSlide() {
+    if (!frames()) return;
+    analyzeVoice(*this);
+    constexpr int n = 2048, bins = n/2+1;
+    const auto& fft = vocal::Fourier<n>::plan();
+    envelopeHop = std::max(1, sampleRate/100);
+    envelopes.resize(1+(frames()-1)/envelopeHop);
+    std::array<std::complex<float>,n> spectrum;
+    std::array<float,n> window;
+    for (int i=0; i<n; ++i)
+        window[i] = float(.5-.5*std::cos(2.*std::numbers::pi*i/n));
+    std::array<double,bins+1> power{}, moment{};
+    std::array<double,bins> previousMagnitude{};
+    double meanFlux=0.;
+    attacks.clear();
+    for (size_t j=0; j<envelopes.size(); ++j) {
+        const int mid = int(j)*envelopeHop;
+        for (int i=0; i<n; ++i) {
+            const int t=std::clamp(mid+i-n/2,0,frames()-1);
+            spectrum[i] = std::complex<float>(stereo[2*t],stereo[2*t+1])*window[i];
+        }
+        fft.transform(spectrum);
+        // Packing L+iR gives the stereo energy from a pair of mirrored bins.
+        double flux=0., total=0.;
+        for (int k=0; k<bins; ++k) {
+            const double energy=std::norm(spectrum[k])+std::norm(spectrum[(n-k)%n]);
+            power[k+1]=power[k]+energy;
+            moment[k+1]=moment[k]+k*energy;
+            const double mag=std::sqrt(energy);
+            flux+=std::max(0.,mag-previousMagnitude[k]);
+            total+=mag;
+            previousMagnitude[k]=mag;
+        }
+        // Find the physical edge, since the centered analysis window can see
+        // an attack before the control timeline has actually reached it.
+        if (flux>.22*total && flux>2.8*meanFlux && total>.02) {
+            const int width=std::max(2,sampleRate/1000);
+            const int first=std::max(width,mid-n/2);
+            const int last=std::min(frames()-width,mid+n/2);
+            double strongest=0.;
+            int attack=first;
+            for (int t=first; t<last; t+=width) {
+                double rise=0.;
+                for (int i=0; i<width; ++i) {
+                    const int a=2*(t+i), b=a-2*width;
+                    rise+=std::abs(stereo[a])+std::abs(stereo[a+1])-std::abs(stereo[b])-std::abs(stereo[b+1]);
+                }
+                if (rise>strongest) { strongest=rise; attack=t; }
+            }
+            if (strongest>1.e-5*width && (attacks.empty() || attack-attacks.back()>sampleRate/40)) {
+                int edge=attack;
+                double maxRise=0.;
+                for (int t=attack; t<attack+width; ++t) {
+                    const int a=2*t;
+                    const double rise=std::abs(stereo[a])+std::abs(stereo[a+1])
+                                     -std::abs(stereo[a-2])-std::abs(stereo[a-1]);
+                    if (rise>maxRise) { maxRise=rise; edge=t; }
+                }
+                attacks.push_back(edge);
+            }
+        }
+        meanFlux+=.15*(flux-meanFlux);
+        const auto& voice=vocal[size_t(mid/analysisHop)];
+        const double hz=voice.period>0 ? sampleRate/voice.period : 160.;
+        auto& env=envelopes[j];
+        const double floor=std::max(1.e-24, power[bins]*1.e-9/bins);
+        for (int b=0; b<int(env.size()); ++b) {
+            const int k=2*b;
+            const int radius=std::clamp(int(std::ceil(std::max({90.,1.4*hz,.04*k*sampleRate/n})*n/sampleRate)),2,bins);
+            const int lo=std::max(0,k-radius+1), hi=std::min(bins,k+radius);
+            const double sum=moment[k+1]-moment[lo]+(radius-k)*(power[k+1]-power[lo])
+                +(radius+k)*(power[hi]-power[k+1])-(moment[hi]-moment[k+1]);
+            const int a=k+1-lo, c=hi-k-1;
+            const double weight=(a+c)*radius-.5*(a*(a-1)+c*(c+1));
+            env[b]=float(.5*std::log2(std::max(floor,sum/weight)));
+        }
+    }
+}
+
 bool readWav(const std::wstring& path, WaveData& result, std::string& error) {
     std::ifstream input(std::filesystem::path(path), std::ios::binary);
     if (!input) { error = "Cannot open WAV"; return false; }
@@ -224,7 +304,7 @@ bool readWav(const std::wstring& path, WaveData& result, std::string& error) {
         tmp.stereo[i * 2] = l;
         tmp.stereo[i * 2 + 1] = r;
     }
-    analyzeVoice(tmp);
+    tmp.prepareSlide();
     result = std::move(tmp);
     error.clear();
     return true;

@@ -20,19 +20,13 @@ FetchContent_Declare(juce
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(juce)
 
-FetchContent_Declare(signalsmith_stretch
-    GIT_REPOSITORY https://github.com/Signalsmith-Audio/signalsmith-stretch.git
-    GIT_TAG 222093b4cc13ddb4d07c826bc3c1559326091731
-    GIT_SUBMODULES "")
-FetchContent_MakeAvailable(signalsmith_stretch)
-
 add_subdirectory("${FL_SDK_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/fl_sdk")
 # Legacy SDK hint tables assign literals to char*. Scope compatibility to its .cpp files.
 target_compile_options(fl_sdk PRIVATE /Zc:strictStrings-)
 
 add_library(FormantSlideNative SHARED
     Source/FormantSlideNative.h Source/FormantSlideNative.cpp
-    Source/SlideVoice.h Source/SlideVoice.cpp
+    Source/SlideVoice.h Source/SlideVoice.cpp Source/VocalSpectrum.h
     Source/WaveLoader.h Source/WaveLoader.cpp
     Source/MidiFile.h Source/MidiFile.cpp
     Source/WinEditor.h Source/WinEditor.cpp)
@@ -40,7 +34,6 @@ add_library(FormantSlideNative SHARED
 add_executable(FormantSlideAudioCheck EXCLUDE_FROM_ALL
     Tests/SlideAudio.cpp Source/SlideVoice.cpp Source/WaveLoader.cpp)
 target_include_directories(FormantSlideAudioCheck PRIVATE Source)
-target_link_libraries(FormantSlideAudioCheck PRIVATE signalsmith-stretch)
 target_compile_options(FormantSlideAudioCheck PRIVATE /bigobj)
 target_compile_options(FormantSlideNative PRIVATE /bigobj)
 
@@ -54,7 +47,7 @@ target_compile_definitions(FormantSlideNative PRIVATE
     JUCE_PLUGINHOST_LV2=0 JUCE_PLUGINHOST_ARA=0 JUCE_USE_LAME_AUDIO_FORMAT=0)
 
 target_link_libraries(FormantSlideNative PRIVATE
-    fl_sdk signalsmith-stretch
+    fl_sdk
     juce::juce_audio_utils
     juce::juce_recommended_config_flags
     user32 gdi32 comdlg32 shell32 ole32)
@@ -66,12 +59,7 @@ set_target_properties(FormantSlideNative PROPERTIES
 
 # Licence selection is governed by the JUCE 8 EULA, not by preprocessor flags.
 # Starter is free only while its eligibility conditions are met.
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_LICENSES.txt" project_notices)
-file(READ "${signalsmith_stretch_SOURCE_DIR}/LICENSE.txt" stretch_license)
-get_target_property(linear_source signalsmith-linear SOURCE_DIR)
-file(READ "${linear_source}/LICENSE.txt" linear_license)
-set(notices "${CMAKE_CURRENT_BINARY_DIR}/THIRD_PARTY_LICENSES.txt")
-file(WRITE "${notices}" "${project_notices}\nSignalsmith Stretch\n${stretch_license}\nSignalsmith Linear\n${linear_license}\n")
+set(notices "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_LICENSES.txt")
 add_custom_command(TARGET FormantSlideNative POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${notices}"

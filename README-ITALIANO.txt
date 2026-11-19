@@ -44,9 +44,9 @@ Distribuisci build/Release/FormantSlide_x64.dll insieme a
 build/Release/THIRD_PARTY_LICENSES.txt. Chiudi FL prima di sostituire la DLL.
 Non distribuire vecchie DLL o usare vecchie build/cache per questa versione.
 
-Gli slide usano Signalsmith Stretch con compensazione delle formanti.
-Il pitch dello slide si applica all'intera slice, comprese le parti distorte.
+Gli slide ricampionano la forma d'onda e ne allineano segmenti stereo tramite
+correlazione. Un equalizzatore ricavato dal WAV ripristina le risonanze vocali.
 Il knob regola la velocita del sampler prima dello slide e sposta anche i formanti.
 A velocita unitaria e sample rate coincidenti, la nota ferma riproduce i campioni
 originali con 1024 campioni di ritardo, dichiarati a FL Studio.
-Le licenze MIT di Signalsmith Stretch e Linear sono incluse nella distribuzione.
+Il motore di slide e implementato nel progetto senza dipendenze DSP esterne.
