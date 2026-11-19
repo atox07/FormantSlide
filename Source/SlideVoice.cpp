@@ -43,6 +43,8 @@ SlideVoice::Stereo SlideVoice::read(double where) const noexcept {
 }
 
 void SlideVoice::prime(int64_t start) {
+    sourceTone = shiftedTone = {};
+    correction = 0.;
     stretch.reset();
     for (int i = 0; i < history; ++i) {
         const int64_t t = start - history + i;
@@ -50,6 +52,32 @@ void SlideVoice::prime(int64_t start) {
         for (int ch = 0; ch < 2; ++ch) past[ch][i] = sample[ch];
     }
     stretch.seek(past, history, 1.);
+}
+
+void SlideVoice::ToneProbe::push(double sample, double frequency, int64_t time) {
+    // Narrow resonator isolates the fundamental before interpolating its crossings.
+    if (std::abs(tuned-frequency) > .0001*frequency) {
+        tuned = frequency;
+        const double angle = 2.*std::numbers::pi*frequency;
+        const double radius = std::exp(-0.15*angle);
+        drive = (1.-radius)*std::sin(angle);
+        feedback = 2.*radius*std::cos(angle);
+        decay = radius*radius;
+    }
+    const double value = drive*sample + feedback*previous - decay*older;
+    if (previous <= 0. && value > 0.) {
+        const double crossing = double(time) - value/(value-previous);
+        const double interval = crossing-lastCrossing;
+        if (lastCrossing >= 0. && std::abs(interval*frequency-1.) < .09) {
+            consecutive = std::abs(period-interval) < .018*interval ? std::min(consecutive+1, 100) : 1;
+            period = consecutive == 1 ? interval : period + .22*(interval-period);
+        } else consecutive = 0;
+        lastCrossing = crossing;
+    }
+    older = previous;
+    previous = value;
+    if (time-lastCrossing > 1.5/frequency || std::max(std::abs(value),std::abs(older)) < 1.e-9)
+        consecutive = 0;
 }
 
 void SlideVoice::process(int count, int64_t start) {
@@ -68,11 +96,35 @@ void SlideVoice::process(int count, int64_t start) {
     // The library centres its automation at its analysis time. Read the
     // slide control at that time, just as we delay the audio for the mixer.
     const auto& control = frame(std::max<int64_t>(0, start + count/2 - inputDelay));
-    stretch.setTransposeFactor(std::exp2(control.pitch));
+    const double ratio = std::exp2(double(control.pitch));
+    if (control.pitch == 0.f) correction = 0.;
+    stretch.setTransposeFactor(float(ratio*std::exp2(correction)));
     stretch.setFormantBase(control.baseFrequency);
     stretch.process(in, count, out, count);
-    for (int i = 0; i < count; ++i)
+    for (int i = 0; i < count; ++i) {
         frame(start + i).wet = {out[0][i], out[1][i]};
+        const int64_t t = start+i;
+        const int64_t aligned = t - (latencySamples-wetPadding);
+        if (aligned < 0) continue;
+        const auto& src = frame(aligned);
+        const double f = src.baseFrequency, g = f*std::exp2(double(src.pitch));
+        if (g < .0002 || g > .4 || src.pitch == 0.f ||
+            std::abs(src.pitch-control.pitch) > .002 ||
+            std::abs(src.pitch-trackedPitch) > .001 || std::abs(f-trackedBase) > .001*f) {
+            sourceTone = shiftedTone = {};
+            trackedPitch = src.pitch;
+            trackedBase = f;
+            correction *= 1.-.25/latencySamples;
+            continue;
+        }
+        // Unequal channel weights retain anti-phase stereo as well as mono.
+        sourceTone.push(src.dry[0]+.5*src.dry[1], f, t);
+        shiftedTone.push(out[0][i]+.5*out[1][i], g, t);
+        if (sourceTone.consecutive >= 5 && shiftedTone.consecutive >= 5) {
+            const double error = std::log2(ratio*shiftedTone.period/sourceTone.period);
+            correction = std::clamp(correction + error*std::min(.15*f,.25/latencySamples), -.075, .075);
+        }
+    }
 }
 
 SlideVoice::Stereo SlideVoice::mix(const Stereo& dry, const Stereo& wet, float amount) {

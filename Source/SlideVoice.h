@@ -30,6 +30,14 @@ private:
     Stereo read(double where) const noexcept;
     void prime(int64_t start);
     void process(int count, int64_t start);
+    struct ToneProbe {
+        double previous = 0., older = 0., lastCrossing = -1., period = 0.;
+        double tuned = 0., drive = 0., feedback = 0., decay = 0.;
+        int consecutive = 0;
+        void push(double sample, double frequency, int64_t time);
+    };
+    ToneProbe sourceTone{}, shiftedTone{};
+    double correction = 0., trackedPitch = 0., trackedBase = 0.;
     Stereo mix(const Stereo& dry, const Stereo& wet, float amount);
 
     std::shared_ptr<const WaveData> wav;
