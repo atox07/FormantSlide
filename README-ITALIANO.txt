@@ -44,12 +44,9 @@ Distribuisci build/Release/FormantSlide_x64.dll insieme a
 build/Release/THIRD_PARTY_LICENSES.txt. Chiudi FL prima di sostituire la DLL.
 Non distribuire vecchie DLL o usare vecchie build/cache per questa versione.
 
-Il motore degli slide usa grani adattivi nel dominio del tempo.
-YIN e Viterbi analizzano la voce al caricamento del WAV. I grani si
-allineano alle epoche glottali sulle parti periodiche. Sulle zone
-aperiodiche e sui transienti riproducono il WAV senza trasposizione.
-La latenza dichiarata a FL Studio e di 1024 campioni per entrambi i percorsi.
-Alla frequenza di campionamento del WAV, con knob neutro e nota originale,
-il dry e una copia del WAV ritardata di 1024 campioni. Il knob Pitch regola
-la velocita del sampler, spostando intonazione e formanti insieme.
-Riferimento: https://juce.com/legal/juce-8-licence/
+Gli slide usano Signalsmith Stretch con compensazione delle formanti.
+Il pitch dello slide si applica all'intera slice, comprese le parti distorte.
+Il knob regola la velocita del sampler prima dello slide e sposta anche i formanti.
+A velocita unitaria e sample rate coincidenti, la nota ferma riproduce i campioni
+originali con 1024 campioni di ritardo, dichiarati a FL Studio.
+Le licenze MIT di Signalsmith Stretch e Linear sono incluse nella distribuzione.

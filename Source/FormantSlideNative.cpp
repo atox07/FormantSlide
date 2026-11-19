@@ -59,7 +59,7 @@ CreatePlugInstance(TFruityPlugHost* host, TPluginTag tag) {
 FormantSlideNative::FormantSlideNative(intptr_t tag, TFruityPlugHost* host)
     : TCPPFruityPlug(tag, host, nullptr) {
     Info = &kInfo;
-    PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, PsolaVoice::latencySamples);
+    PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, SlideVoice::latencySamples);
 }
 FormantSlideNative::~FormantSlideNative() {}
 
@@ -95,7 +95,7 @@ intptr_t _stdcall FormantSlideNative::Dispatcher(intptr_t id, intptr_t index, in
             AudioRenderer.setSmpRate(int(value));
             stopVoices();
         }
-        PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, PsolaVoice::latencySamples);
+        PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, SlideVoice::latencySamples);
         return 0;
     }
     if (id == FPD_SetSamplesPerTick) {
@@ -175,8 +175,9 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     lastPitchCents_ = voice.startPitchCents;
     const auto slice = slices_[size_t(index)];
     voice.samplePlaying_ = true;
-    voice.engine_ = std::make_unique<PsolaVoice>(
-        wav_, slice.begin, slice.end, sampleRate_);
+    const double sliceHz = 440. * std::exp2((settings_.firstNote + index - 69.) / 12.);
+    voice.engine_ = std::make_unique<SlideVoice>(
+        wav_, slice.begin, slice.end, sampleRate_, sliceHz);
 }
 
 void FormantSlideNative::beginSlide(const Voice& slide, int sdkLength, double hostTick) {
@@ -272,7 +273,7 @@ void _stdcall FormantSlideNative::Voice_Kill(TVoiceHandle handle) {
 
 void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
     if (!buffer || length <= 0 || !voice.params || !voice.engine_) return;
-    // The knob controls sampler playback speed. Notes in a slide relocate grains.
+    // The knob controls sampler playback speed. The slide ratio is applied independently.
     const double basePitch = voice.baseOffset + settings_.pitchCents / 100.0;
     voice.engine_->setPlaybackScale(std::exp2(std::clamp(basePitch, -48., 48.) / 12.));
     const double nextHostSlide = std::isfinite(voice.params->FinalLevels.Pitch)
@@ -348,7 +349,7 @@ bool FormantSlideNative::loadWav(const std::wstring& path, std::string& error) {
     slicesManuallyEdited_ = false;
     lastMidiNote_ = lastSlice_ = -1;
     stopVoices();
-    status_ = "WAV loaded (PSOLA ready)";
+    status_ = "WAV loaded (Signalsmith Stretch ready)";
     return true;
 }
 bool FormantSlideNative::loadMidi(const std::wstring& path, std::string& error) {
