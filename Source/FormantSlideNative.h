@@ -2,7 +2,7 @@
 #include "fp_cplug.h"
 #include "MidiFile.h"
 #include "WaveLoader.h"
-#include "StftEngine.h"
+#include "PsolaEngine.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -69,7 +69,7 @@ private:
         double customPitch_ = 0, customTarget_ = 0, customStep_ = 0;
         double previousHostSlide_ = 0;
         int customRemaining_ = 0;
-        std::unique_ptr<StftVoice> engine_;
+        std::unique_ptr<PsolaVoice> engine_;
 
     };
     mutable std::mutex mutex_;

@@ -44,13 +44,12 @@ Distribuisci build/Release/FormantSlide_x64.dll insieme a
 build/Release/THIRD_PARTY_LICENSES.txt. Chiudi FL prima di sostituire la DLL.
 Non distribuire vecchie DLL o usare vecchie build/cache per questa versione.
 
-Il motore degli slide usa la FFT reale di KISS FFT (BSD-3-Clause).
-La finestra Hann viene scelta all'attacco della nota, in base alla F0
-stimata dal WAV: 1024 campioni da 150 Hz in su, 2048 sotto i 150 Hz.
-La latenza dichiarata a FL Studio e di 2048 campioni per entrambi i percorsi.
-Con knob neutro, frequenza di campionamento del WAV uguale a quella del
-progetto e nota alla sua intonazione originale, il dry e una copia del WAV
-ritardata di 2048 campioni. Il knob Pitch trasporta intonazione e formanti
-insieme e varia la durata della slice, come la velocita di un sampler.
-Riferimenti: https://juce.com/legal/juce-8-licence/
-             https://github.com/mborgerding/kissfft
+Il motore degli slide usa grani adattivi nel dominio del tempo.
+YIN e Viterbi analizzano la voce al caricamento del WAV. I grani si
+allineano alle epoche glottali sulle parti periodiche. Sulle zone
+aperiodiche e sui transienti riproducono il WAV senza trasposizione.
+La latenza dichiarata a FL Studio e di 1024 campioni per entrambi i percorsi.
+Alla frequenza di campionamento del WAV, con knob neutro e nota originale,
+il dry e una copia del WAV ritardata di 1024 campioni. Il knob Pitch regola
+la velocita del sampler, spostando intonazione e formanti insieme.
+Riferimento: https://juce.com/legal/juce-8-licence/

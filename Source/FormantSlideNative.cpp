@@ -1,5 +1,4 @@
 #include "FormantSlideNative.h"
-#include "StftDevParams.h"
 #include "WinEditor.h"
 #include <algorithm>
 #include <cmath>
@@ -37,10 +36,6 @@ struct SavedState {
     wchar_t midi[512]{};
     int32_t pitchOrLegacyOffset = 0; // v2: key calibration in semitones; v4: audio transpose in cents
 };
-struct SavedFormantGuard {
-    uint32_t magic = 0x46474431; // FGD1
-    float guard = 1.0f, limitHz = 2000.0f, relaxMax = 0.75f;
-};
 struct SavedSliceMarkerHeader {
     uint32_t magic = 0x534c4335; // SLC5
     uint32_t count = 0;
@@ -64,7 +59,7 @@ CreatePlugInstance(TFruityPlugHost* host, TPluginTag tag) {
 FormantSlideNative::FormantSlideNative(intptr_t tag, TFruityPlugHost* host)
     : TCPPFruityPlug(tag, host, nullptr) {
     Info = &kInfo;
-    PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, StftVoice::latencySamples);
+    PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, PsolaVoice::latencySamples);
 }
 FormantSlideNative::~FormantSlideNative() {}
 
@@ -100,7 +95,7 @@ intptr_t _stdcall FormantSlideNative::Dispatcher(intptr_t id, intptr_t index, in
             AudioRenderer.setSmpRate(int(value));
             stopVoices();
         }
-        PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, StftVoice::latencySamples);
+        PlugHost->Dispatcher(HostTag, FHD_SetLatency, 0, PsolaVoice::latencySamples);
         return 0;
     }
     if (id == FPD_SetSamplesPerTick) {
@@ -180,11 +175,8 @@ void FormantSlideNative::beginVocal(Voice& voice) {
     lastPitchCents_ = voice.startPitchCents;
     const auto slice = slices_[size_t(index)];
     voice.samplePlaying_ = true;
-    // FL reports cents relative to middle C (900 cents below A4).
-    const double startNoteHz = 440.0 * std::exp2(
-        (voice.startPitchCents + settings_.pitchCents - 900.0) / 1200.0);
-    voice.engine_ = std::make_unique<StftVoice>(
-        wav_, slice.begin, slice.end, sampleRate_, startNoteHz);
+    voice.engine_ = std::make_unique<PsolaVoice>(
+        wav_, slice.begin, slice.end, sampleRate_);
 }
 
 void FormantSlideNative::beginSlide(const Voice& slide, int sdkLength, double hostTick) {
@@ -280,15 +272,9 @@ void _stdcall FormantSlideNative::Voice_Kill(TVoiceHandle handle) {
 
 void FormantSlideNative::render(Voice& voice, PWAV32FS buffer, int length) {
     if (!buffer || length <= 0 || !voice.params || !voice.engine_) return;
-    // Sampler transposition moves pitch and formants together. The independent
-    // slide goes through STFT with the formant envelope of that tuned signal.
+    // The knob controls sampler playback speed. Notes in a slide relocate grains.
     const double basePitch = voice.baseOffset + settings_.pitchCents / 100.0;
     voice.engine_->setPlaybackScale(std::exp2(std::clamp(basePitch, -48., 48.) / 12.));
-    const auto& dp = StftDevParams::instance();
-    voice.engine_->setFormantGuard(dp.formantGuard.load());
-    voice.engine_->setHighNoteLimit(dp.highNoteLimitHz.load());
-    voice.engine_->setHighNoteRelaxMax(dp.highNoteRelaxMax.load());
-
     const double nextHostSlide = std::isfinite(voice.params->FinalLevels.Pitch)
         ? (double(voice.params->FinalLevels.Pitch) - voice.startPitchCents) / 100.0 : 0.0;
     const double hostStart = voice.previousHostSlide_;
@@ -362,7 +348,7 @@ bool FormantSlideNative::loadWav(const std::wstring& path, std::string& error) {
     slicesManuallyEdited_ = false;
     lastMidiNote_ = lastSlice_ = -1;
     stopVoices();
-    status_ = "WAV loaded (STFT ready)";
+    status_ = "WAV loaded (PSOLA ready)";
     return true;
 }
 bool FormantSlideNative::loadMidi(const std::wstring& path, std::string& error) {
@@ -469,11 +455,6 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
                 stream->Write(frames, sizeof(frames), nullptr);
             }
         }
-        SavedFormantGuard guardBlock;
-        guardBlock.guard = StftDevParams::instance().formantGuard.load();
-        guardBlock.limitHz = StftDevParams::instance().highNoteLimitHz.load();
-        guardBlock.relaxMax = StftDevParams::instance().highNoteRelaxMax.load();
-        stream->Write(&guardBlock, sizeof(guardBlock), nullptr);
     } else {
         ULONG read = 0;
         if (FAILED(stream->Read(&s, sizeof(s), &read)) ||
@@ -518,19 +499,6 @@ void _stdcall FormantSlideNative::SaveRestoreState(IStream* stream, BOOL save) {
                 if (i > 0) valid = valid && restoredSlices[i-1].end <= restoredSlices[i].begin;
             }
             if (valid) { slices_ = std::move(restoredSlices); slicesManuallyEdited_ = true; }
-        }
-        // Blocco opzionale (assente nei progetti vecchi: restano i default).
-        SavedFormantGuard guardBlock{};
-        ULONG guardRead = 0;
-        if (SUCCEEDED(stream->Read(&guardBlock, sizeof(guardBlock), &guardRead)) &&
-            guardRead == sizeof(guardBlock) && guardBlock.magic == 0x46474431) {
-            auto& dp = StftDevParams::instance();
-            if (std::isfinite(guardBlock.guard))
-                dp.formantGuard.store(std::clamp(guardBlock.guard, 0.0f, 2.0f));
-            if (std::isfinite(guardBlock.limitHz))
-                dp.highNoteLimitHz.store(std::clamp(guardBlock.limitHz, 500.0f, 4000.0f));
-            if (std::isfinite(guardBlock.relaxMax))
-                dp.highNoteRelaxMax.store(std::clamp(guardBlock.relaxMax, 0.0f, 1.0f));
         }
     }
 }

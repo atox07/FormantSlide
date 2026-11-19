@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FormantSlideNative VERSION 0.9.0 LANGUAGES C CXX)
+project(FormantSlideNative VERSION 0.9.0 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "FormantSlide native target requires Windows + MSVC.")
@@ -20,24 +20,13 @@ FetchContent_Declare(juce
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(juce)
 
-set(KISSFFT_STATIC ON CACHE BOOL "KISS FFT setting for FormantSlide" FORCE)
-set(KISSFFT_DATATYPE float CACHE STRING "KISS FFT setting for FormantSlide" FORCE)
-set(KISSFFT_TEST OFF CACHE BOOL "KISS FFT setting for FormantSlide" FORCE)
-set(KISSFFT_TOOLS OFF CACHE BOOL "KISS FFT setting for FormantSlide" FORCE)
-set(KISSFFT_PKGCONFIG OFF CACHE BOOL "KISS FFT setting for FormantSlide" FORCE)
-FetchContent_Declare(kissfft
-    GIT_REPOSITORY https://github.com/mborgerding/kissfft.git
-    GIT_TAG 131.1.0
-    GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(kissfft)
-
 add_subdirectory("${FL_SDK_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/fl_sdk")
 # Legacy SDK hint tables assign literals to char*. Scope compatibility to its .cpp files.
 target_compile_options(fl_sdk PRIVATE /Zc:strictStrings-)
 
 add_library(FormantSlideNative SHARED
     Source/FormantSlideNative.h Source/FormantSlideNative.cpp
-    Source/StftEngine.h Source/StftEngine.cpp
+    Source/PsolaEngine.h Source/PsolaEngine.cpp
     Source/WaveLoader.h Source/WaveLoader.cpp
     Source/MidiFile.h Source/MidiFile.cpp
     Source/WinEditor.h Source/WinEditor.cpp)
@@ -54,7 +43,6 @@ target_compile_definitions(FormantSlideNative PRIVATE
 
 target_link_libraries(FormantSlideNative PRIVATE
     fl_sdk
-    kissfft::kissfft
     juce::juce_audio_utils
     juce::juce_recommended_config_flags
     user32 gdi32 comdlg32 shell32 ole32)
@@ -66,16 +54,10 @@ set_target_properties(FormantSlideNative PROPERTIES
 
 # Licence selection is governed by the JUCE 8 EULA, not by preprocessor flags.
 # Starter is free only while its eligibility conditions are met.
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_LICENSES.txt" FORMANT_NOTICES)
-file(READ "${kissfft_SOURCE_DIR}/COPYING" KISSFFT_NOTICE)
-file(READ "${kissfft_SOURCE_DIR}/LICENSES/BSD-3-Clause" KISSFFT_LICENSE)
-set(FORMANT_NOTICE_FILE "${CMAKE_CURRENT_BINARY_DIR}/THIRD_PARTY_LICENSES.txt")
-file(GENERATE OUTPUT "${FORMANT_NOTICE_FILE}"
-    CONTENT "${FORMANT_NOTICES}\n\nKISS FFT 131.1.0\n================\n${KISSFFT_NOTICE}\n${KISSFFT_LICENSE}\n")
 add_custom_command(TARGET FormantSlideNative POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${FORMANT_NOTICE_FILE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_LICENSES.txt"
         "$<TARGET_FILE_DIR:FormantSlideNative>/THIRD_PARTY_LICENSES.txt"
     VERBATIM)
 install(TARGETS FormantSlideNative RUNTIME DESTINATION . LIBRARY DESTINATION .)
-install(FILES "${FORMANT_NOTICE_FILE}" DESTINATION .)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_LICENSES.txt" DESTINATION .)

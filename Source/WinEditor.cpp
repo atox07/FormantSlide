@@ -1,6 +1,5 @@
 #include "WinEditor.h"
 #include "FormantSlideNative.h"
-#include "StftDevParams.h"
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <algorithm>
 #include <cmath>
@@ -9,7 +8,7 @@
 
 namespace {
 constexpr int editorWidth = 680;
-constexpr int editorHeight = 490;
+constexpr int editorHeight = 390;
 
 // ---------------------------------------------------------------------------
 // Palette (FL-like: charcoal greys + orange accent). Tweak here to retune
@@ -200,7 +199,6 @@ public:
         addAndMakeVisible(count_);
         addAndMakeVisible(root_);
         addAndMakeVisible(pitchLabel_);
-        for (int i = 0; i < 3; ++i) { addAndMakeVisible(guardLabel_[i]); addAndMakeVisible(guardSlider_[i]); }
         addAndMakeVisible(pitch_);
 
         for (auto* label : { &wavLabel_, &sliceModeLabel_, &countLabel_, &rootLabel_,
@@ -244,33 +242,6 @@ public:
         count_.onValueChange = [this] { pushSettings(); };
         root_.onValueChange = [this] { pushSettings(); };
 
-        {
-            struct Def { const char* name; double lo, hi, step, reset; bool hz; };
-            const Def defs[3] = {
-                {"Formant Guard",   0.0,   2.0,    0.01, 1.0,    false},
-                {"High Note Limit", 500.0, 4000.0, 1.0,  2000.0, true},
-                {"High Note Relax", 0.0,   1.0,    0.01, 0.75,   false},
-            };
-            for (int i = 0; i < 3; ++i) {
-                setLabel(guardLabel_[i], defs[i].name);
-                guardLabel_[i].setColour(juce::Label::textColourId, ui::dim);
-                auto& s = guardSlider_[i];
-                s.setSliderStyle(juce::Slider::LinearHorizontal);
-                s.setTextBoxStyle(juce::Slider::TextBoxRight, false, 70, 22);
-                s.setRange(defs[i].lo, defs[i].hi, defs[i].step);
-                s.setDoubleClickReturnValue(true, defs[i].reset);
-                if (defs[i].hz) {
-                    s.setTextValueSuffix(" Hz");
-                } else {
-                    s.textFromValueFunction = [](double v) { return juce::String(juce::roundToInt(v * 100.0)) + " %"; };
-                    s.valueFromTextFunction = [](const juce::String& t) {
-                        return t.retainCharacters("0123456789.,-").replaceCharacter(',', '.').getDoubleValue() / 100.0;
-                    };
-                }
-                s.onValueChange = [this] { pushGuard(); };
-            }
-        }
-
         pullSettings();
         refreshFilePreview();
         const auto saved = plugin_.display();
@@ -293,7 +264,6 @@ public:
 
         drawPanel(g, panelSlicer_, "SLICER");
         drawPanel(g, panelPitch_, nullptr); // its header is pitchLabel_
-        drawPanel(g, panelGuard_, "FORMANT RELEASE");
 
         // Waveform well / drop zone.
         const auto waveF = waveBounds_.toFloat();
@@ -393,15 +363,7 @@ public:
         pitchLabel_.setBounds(panelPitch_.getX() + 12, py + 5, panelPitch_.getWidth() - 24, 16);
         pitch_.setBounds(panelPitch_.getX() + (panelPitch_.getWidth() - 80) / 2, py + 22, 80, 94);
 
-        // FORMANT RELEASE: 3 slider sotto i pannelli.
-        panelGuard_ = {m, py + ph + 8, w - 2 * m, 96};
-        for (int i = 0; i < 3; ++i) {
-            const int ry = panelGuard_.getY() + 24 + i * 23;
-            guardLabel_[i].setBounds(panelGuard_.getX() + 12, ry, 124, 22);
-            guardSlider_[i].setBounds(panelGuard_.getX() + 136, ry, panelGuard_.getWidth() - 136 - 12, 22);
-        }
-
-        warningLabel_.setBounds(m, panelGuard_.getBottom() + 6, w - 2 * m, 20);
+        warningLabel_.setBounds(m, panelPitch_.getBottom() + 6, w - 2 * m, 20);
     }
 
     void mouseDown(const juce::MouseEvent& event) override {
@@ -506,9 +468,7 @@ private:
     juce::AudioThumbnailCache cache_{5};
     juce::AudioThumbnail thumbnail_;
     juce::Rectangle<int> waveBounds_;
-    juce::Rectangle<int> panelSlicer_, panelPitch_, panelGuard_;
-    juce::Label guardLabel_[3];
-    juce::Slider guardSlider_[3];
+    juce::Rectangle<int> panelSlicer_, panelPitch_;
     double viewStart_ = 0, viewSpan_ = 1;
     std::vector<int> active_;
     int rootNote_ = 60;        // cached copy of the first-slice note, so paint() never takes the plugin lock
@@ -552,12 +512,6 @@ private:
         sliceMode_.setSelectedId(s.equalSlices ? 2 : 1, juce::dontSendNotification);
         count_.setValue(s.sliceCount, juce::dontSendNotification);
         pitch_.setValue(s.pitchCents / 100.0, juce::dontSendNotification);
-        {
-            auto& dp = StftDevParams::instance();
-            guardSlider_[0].setValue(dp.formantGuard.load(), juce::dontSendNotification);
-            guardSlider_[1].setValue(dp.highNoteLimitHz.load(), juce::dontSendNotification);
-            guardSlider_[2].setValue(dp.highNoteRelaxMax.load(), juce::dontSendNotification);
-        }
         root_.setValue(s.firstNote, juce::dontSendNotification);
         rootNote_ = s.firstNote;
         updatingControls_ = false;
@@ -576,15 +530,6 @@ private:
         selectedSlice_ = -1;
         refreshStatus();
         repaint();
-    }
-
-    // I 3 slider FORMANT RELEASE vanno direttamente al motore (StftDevParams).
-    void pushGuard() {
-        if (updatingControls_) return;
-        auto& dp = StftDevParams::instance();
-        dp.formantGuard.store(float(guardSlider_[0].getValue()));
-        dp.highNoteLimitHz.store(float(guardSlider_[1].getValue()));
-        dp.highNoteRelaxMax.store(float(guardSlider_[2].getValue()));
     }
 
     void refreshFilePreview() {

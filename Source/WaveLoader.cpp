@@ -8,55 +8,212 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <numbers>
 
 namespace {
-// Estimate F0 once at load time to choose a stable STFT window for each note.
-void analyzeVoice(WaveData& w) {
-    const int stride = std::max(1, w.sampleRate / 12000);
-    const double rate = double(w.sampleRate) / stride;
-    std::vector<float> x;
-    double power[2]{};
-    for (size_t i = 0; i < w.stereo.size(); ++i)
-        power[i % 2] += double(w.stereo[i]) * w.stereo[i];
-    const int ch = power[1] > power[0];
-    for (int i = 0; i < w.frames(); i += stride) {
-        float sum = 0;
-        const int count = std::min(stride, w.frames() - i);
-        for (int j = 0; j < count; ++j) sum += w.stereo[2 * size_t(i+j) + ch];
-        x.push_back(sum / count);
+// Pitch analysis runs once, while loading the WAV.
+constexpr int pitchStates = 8;
+constexpr float aperiodicLimit = 0.30f;
+struct PitchCandidate {
+    float period = 0;
+    float cost = 0;
+    float aperiodicity = 1;
+};
+struct PitchPath {
+    std::array<PitchCandidate, pitchStates> candidates{};
+    std::array<uint8_t, pitchStates> previous{};
+    int count = 1; // State zero is unvoiced.
+};
+
+float pitchTransition(float before, float after) {
+    if (before == 0.f || after == 0.f) return before == after ? 0.f : 0.16f;
+    const float octaves = std::abs(std::log2(after / before));
+    return 0.18f * octaves + 0.65f * std::max(0.f, octaves - 0.2f);
+}
+
+void markTransients(WaveData& wav, const std::vector<float>& signal, int stride) {
+    const double rate = double(wav.sampleRate) / stride;
+    // Positive multiband energy flux, equivalent to a coarse spectral flux.
+    const std::array<double, 3> frequencies{250., 1000., 2700.};
+    std::array<double, 3> low{}, coefficient{};
+    for (int band = 0; band < 3; ++band)
+        coefficient[band] = -std::expm1(-2. * std::numbers::pi * frequencies[band] / rate);
+    std::array<double, 4> previous{};
+    std::array<double, 8> history{};
+    size_t next = 0;
+    double fluxSum = 0.;
+    int hold = 0;
+    for (size_t frame = 0; frame < wav.vocal.size(); ++frame) {
+        std::array<double, 4> power{};
+        const size_t stop = std::min(signal.size(), (frame + 1) * wav.analysisHop / stride);
+        for (; next < stop; ++next) {
+            const double value = signal[next];
+            for (int band = 0; band < 3; ++band)
+                low[band] += coefficient[band] * (value - low[band]);
+            const std::array<double, 4> bands{low[0], low[1] - low[0], low[2] - low[1], value - low[2]};
+            for (int band = 0; band < 4; ++band) power[band] += bands[band] * bands[band];
+        }
+        double flux = 0., energy = 0.;
+        for (int band = 0; band < 4; ++band) {
+            const double level = std::sqrt(power[band]);
+            flux += std::max(0., level - previous[band]);
+            energy += level;
+            previous[band] = level;
+        }
+        flux /= std::max(0.03, energy);
+        const size_t slot = frame % history.size();
+        if (flux > std::max(0.34, 2. * fluxSum / history.size()) && energy > 0.03)
+            hold = std::max(1, int(std::lround(0.015 * wav.sampleRate / wav.analysisHop)));
+        fluxSum += flux - history[slot];
+        history[slot] = flux;
+        wav.vocal[frame].transient = hold > 0;
+        hold = std::max(0, hold - 1);
     }
-    w.analysisHop = std::max(1, w.sampleRate / 100);
-    const int maxLag = std::max(4, int(rate / 55));
-    std::vector<double> score(maxLag + 1);
-    for (int at = 0; at < w.frames(); at += w.analysisHop) {
-        const int first = std::clamp(at / stride - maxLag, 0,
-                                     std::max(0, int(x.size()) - 2*maxLag));
-        const int count = std::min(maxLag, int(x.size()) - first - maxLag);
-        VocalFrame frame;
-        if (count >= maxLag / 2) {
-            for (int lag = 1; lag <= maxLag; ++lag) {
-                double diff = 0, energy = 1e-12;
-                for (int j = first; j < first + count; j += 2) {
-                    const double a = x[j], b = x[j+lag];
-                    diff += (a-b)*(a-b);
-                    energy += a*a+b*b;
+}
+
+void findEpochs(WaveData& wav, int channel) {
+    const auto x = [&](int at) {
+        return std::clamp(wav.stereo[2 * size_t(std::clamp(at, 0, wav.frames() - 1)) + channel], -8.f, 8.f);
+    };
+    const auto excitation = [&](int at) {
+        // De-emphasize smooth low frequencies while keeping a consistent polarity.
+        const int offset = std::max(1, wav.sampleRate / 8000);
+        return x(at) - 0.80f * x(at - offset);
+    };
+    for (size_t frame = 0; frame < wav.vocal.size();) {
+        if (wav.vocal[frame].voiced <= 0.5f) { ++frame; continue; }
+        const int start = int(frame) * wav.analysisHop;
+        do { ++frame; } while (frame < wav.vocal.size() && wav.vocal[frame].voiced > 0.5f);
+        const int end = std::min(wav.frames(), int(frame) * wav.analysisHop);
+        double predicted = start, previousEpoch = start - 1.;
+        bool seeded = false;
+        float polarity = 1.f;
+        while (predicted < end) {
+            const VocalFrame pitch = wav.voiceAt(predicted);
+            if (pitch.period <= 0.f) break;
+            const double radius = seeded ? 0.2 * pitch.period : pitch.period;
+            const int low = std::max(int(std::floor(previousEpoch)) + 1, int(std::ceil(predicted - radius)));
+            const int high = std::min(end - 1, int(std::floor(predicted + radius)));
+            if (low > high) break;
+            const auto score = [&](int at) {
+                const float feature = excitation(at);
+                return seeded ? polarity * feature : std::abs(feature);
+            };
+            int peak = low;
+            for (int at = low + 1; at <= high; ++at)
+                if (score(at) > score(peak)) peak = at;
+            if (!seeded) polarity = excitation(peak) < 0.f ? -1.f : 1.f;
+            const double left = polarity * excitation(peak - 1), mid = polarity * excitation(peak);
+            const double right = polarity * excitation(peak + 1);
+            const double curve = 2. * mid - left - right;
+            const double delta = curve > 1.e-9 && peak > low && peak < high
+                ? std::clamp(0.5 * (right - left) / curve, -0.5, 0.5) : 0.;
+            const double position = peak + delta;
+            const double error = seeded ? std::abs(position - predicted) / radius : 0.;
+            wav.epochs.push_back({position, pitch.confidence * float(1. - 0.5 * std::min(1., error))});
+            previousEpoch = position;
+            const float localPeriod = wav.voiceAt(position).period;
+            predicted = position + (localPeriod > 0.f ? localPeriod : pitch.period);
+            seeded = true;
+        }
+    }
+}
+
+void analyzeVoice(WaveData& wav) {
+    const int stride = std::max(1, wav.sampleRate / 8000);
+    const double rate = double(wav.sampleRate) / stride;
+    double power[2]{};
+    for (size_t i = 0; i < wav.stereo.size(); ++i) {
+        const double sample = std::clamp(wav.stereo[i], -8.f, 8.f);
+        power[i % 2] += sample * sample;
+    }
+    const int channel = power[1] > power[0];
+    std::vector<float> signal;
+    signal.reserve((wav.frames() + stride - 1) / stride);
+    for (int at = 0; at < wav.frames(); at += stride) {
+        const int count = std::min(stride, wav.frames() - at);
+        float sum = 0.f;
+        for (int i = 0; i < count; ++i)
+            sum += std::clamp(wav.stereo[2 * size_t(at + i) + channel], -8.f, 8.f);
+        signal.push_back(sum / count);
+    }
+
+    wav.analysisHop = std::max(1, int(std::lround(wav.sampleRate * 0.005)));
+    const int frames = (wav.frames() + wav.analysisHop - 1) / wav.analysisHop;
+    wav.vocal.resize(frames);
+    std::vector<PitchPath> path(frames);
+    const int minLag = std::max(2, int(rate / 2200.));
+    const int maxLag = int(std::ceil(rate / 55.));
+    const int width = std::max(maxLag, int(rate * 0.022));
+    std::vector<float> difference(maxLag + 2);
+    std::array<float, pitchStates> last{}, next{};
+    PitchPath empty;
+    for (int frame = 0; frame < frames; ++frame) {
+        auto& current = path[frame];
+        const int mid = int(int64_t(frame) * wav.analysisHop / stride);
+        const int start = std::clamp(mid - width / 2 - maxLag / 4, 0,
+                                     std::max(0, int(signal.size()) - width - maxLag - 1));
+        const int count = std::min(width, int(signal.size()) - start - maxLag - 1);
+        if (count >= width / 2) {
+            double rms = 0.;
+            for (int i = 0; i < count; ++i) rms += signal[start + i] * signal[start + i];
+            if (rms > count * 1.e-8) {
+                double sum = 0.;
+                difference[0] = 1.f;
+                for (int lag = 1; lag <= maxLag + 1; ++lag) {
+                    double delta = 0.;
+                    for (int i = 0; i < count; ++i) {
+                        const double d = signal[start + i] - signal[start + i + lag];
+                        delta += d * d;
+                    }
+                    sum += delta;
+                    difference[lag] = sum > 1.e-12 ? float(delta * lag / sum) : 1.f;
                 }
-                score[lag] = energy > 1e-8 ? 1-diff/energy : 0;
-            }
-            const int lo = std::clamp(int(rate/2200), 2, maxLag-1);
-            const double best = *std::max_element(score.begin()+lo, score.end());
-            for (int lag = lo; lag < maxLag; ++lag) {
-                if (score[lag] < std::max(0.55, best*0.92) ||
-                    score[lag] < score[lag-1] || score[lag] <= score[lag+1]) continue;
-                const double curvature = 2*score[lag]-score[lag-1]-score[lag+1];
-                const double offset = 0.5*(score[lag+1]-score[lag-1])/std::max(curvature,1e-9);
-                frame.period = float((lag+offset)*stride);
-                frame.voiced = float(std::clamp((score[lag]-0.55)/0.30,0.0,1.0));
-                break;
+                int firstValley = 0;
+                for (int lag = minLag; lag <= maxLag; ++lag) {
+                    const float a = difference[lag - 1], b = difference[lag], c = difference[lag + 1];
+                    if (b >= aperiodicLimit || b >= a || b > c) continue;
+                    const float fraction = std::clamp(0.5f * (a - c) / std::max(1.e-8f, a + c - 2.f*b), -0.5f, 0.5f);
+                    const float period = (lag + fraction) * stride;
+                    if (!firstValley) firstValley = lag;
+                    const float cost = b + 0.055f * std::log2(float(lag) / firstValley);
+                    PitchCandidate candidate{period, cost, b};
+                    if (current.count < pitchStates) current.candidates[current.count++] = candidate;
+                    else {
+                        auto worst = std::max_element(current.candidates.begin() + 1, current.candidates.end(),
+                                                      [](const auto& l, const auto& r) { return l.cost < r.cost; });
+                        if (cost < worst->cost) *worst = candidate;
+                    }
+                }
+                current.candidates[0].cost = current.count > 1 ? 0.33f : 0.f;
             }
         }
-        w.vocal.push_back(frame);
+        const auto& prior = frame > 0 ? path[frame - 1] : empty;
+        for (int j = 0; j < current.count; ++j) {
+            float best = std::numeric_limits<float>::infinity();
+            for (int i = 0; i < prior.count; ++i) {
+                const float cost = last[i] + pitchTransition(prior.candidates[i].period, current.candidates[j].period);
+                if (cost < best) {
+                    best = cost;
+                    current.previous[j] = uint8_t(i);
+                }
+            }
+            next[j] = best + current.candidates[j].cost;
+        }
+        const float base = *std::min_element(next.begin(), next.begin() + current.count);
+        for (int j = 0; j < current.count; ++j) last[j] = next[j] - base;
     }
+    int selected = int(std::min_element(last.begin(), last.begin() + path.back().count) - last.begin());
+    for (int frame = frames - 1; frame >= 0; --frame) {
+        const auto& candidate = path[frame].candidates[selected];
+        if (candidate.period > 0.f) {
+            const float voiced = std::clamp(1.f - candidate.aperiodicity / aperiodicLimit, 0.f, 1.f);
+            wav.vocal[frame] = {candidate.period, voiced, 1.f - candidate.aperiodicity, false};
+        }
+        selected = path[frame].previous[selected];
+    }
+    markTransients(wav, signal, stride);
+    findEpochs(wav, channel);
 }
 uint16_t u16(const uint8_t* p) { return uint16_t(p[0] | (p[1] << 8)); }
 uint32_t u32(const uint8_t* p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
@@ -80,20 +237,27 @@ float sampleAt(const uint8_t* p, int bits, int format) {
 }
 }
 
-double WaveData::estimateF0(int begin, int end, double fallback) const {
-    std::array<float, 12> candidates{};
-    int count = 0;
-    const int first = begin / analysisHop;
-    const int last = std::min({first + int(candidates.size()), (end - 1) / analysisHop + 1,
-                               int(vocal.size())});
-    for (int i = first; i < last; ++i) {
-        const auto& frame = vocal[size_t(i)];
-        if (frame.period > 0.f && frame.voiced >= 0.25f)
-            candidates[count++] = frame.period;
+VocalFrame WaveData::voiceAt(double position) const noexcept {
+    if (vocal.empty()) return {};
+    const double frame = std::max(0., position / analysisHop);
+    const size_t lo = std::min(size_t(frame), vocal.size() - 1);
+    const auto& a = vocal[lo];
+    const auto& b = vocal[std::min(lo + 1, vocal.size() - 1)];
+    const float t = float(std::clamp(frame - lo, 0., 1.));
+    float period = a.period > 0.f ? a.period : b.period;
+    if (a.period > 0.f && b.period > 0.f)
+        period = std::lerp(a.period, b.period, t);
+    // Taper into and out of the hard transient hold. Analysis is offline,
+    // so we can begin the taper before the consonant.
+    float gate = 1.f;
+    if (a.transient) gate = 0.f;
+    else {
+        if (lo > 0 && vocal[lo - 1].transient) gate = std::min(gate, t);
+        if (b.transient) gate = std::min(gate, 1.f - t);
+        gate *= gate * (3.f - 2.f * gate);
     }
-    if (count == 0) return fallback;
-    std::nth_element(candidates.begin(), candidates.begin() + count / 2, candidates.begin() + count);
-    return sampleRate / double(candidates[count / 2]);
+    return {period, std::lerp(a.voiced, b.voiced, t),
+            std::lerp(a.confidence, b.confidence, t), a.transient, gate};
 }
 
 bool readWav(const std::wstring& path, WaveData& result, std::string& error) {
